@@ -2,10 +2,11 @@
 
 ## daemon command
 
-  docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其核心代码为newDaemonCommand函数。注意任何以new开头的函数都是一个工厂函数，返回一个封装好的工厂产品。
-  进入函数内，可以看到使用了[cobra库](https://github.com/spf13/cobra)进行命令行的封装。
-  ```go
-opts := newDaemonOptions(config.New())
+docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其核心代码为newDaemonCommand函数。注意任何以new开头的函数都是一个工厂函数，返回一个封装好的工厂产品。
+进入函数内，可以看到使用了[cobra库](https://github.com/spf13/cobra)进行命令行的封装。
+  
+```go
+	opts := newDaemonOptions(config.New())
 
 	cmd := &cobra.Command{
 		Use:           "dockerd [OPTIONS]",
@@ -21,19 +22,21 @@ opts := newDaemonOptions(config.New())
 		Version:               fmt.Sprintf("%s, build %s", dockerversion.Version, dockerversion.GitCommit),
 	}
 ```
+
 其中opts是docker命令后的参数封装，类型为ademonOptions，包括了flag/param/配置文件等等，daemon的真正启动位于runDaemon函数的实现内。
 
 ## run daemon
 
-  进入runDaemon函数，通过创建一个daemonCli,调用了后者的start函数，这里面主要分为了以下几步：
+进入runDaemon函数，通过创建一个daemonCli,调用了后者的start函数，这里面主要分为了以下几步
 
-  * 设置默认的opts项，opts.SetDefaultOptions(opts.flags)
+- 设置默认的opts项,opts.SetDefaultOptions(opts.flags)  
+	
+- loadDaemonCliConfig,并进行一些conf的检查，包括root相关权限的检查CreateDaemonRoot(cli.Config)
+	
+- 加载apiserver,入口为loadListeners(cli, serverConfig)，其中serverConfig为cli中的服务相关配置。进入loadListener，可以看到主要做了：
 
-  * loadDaemonCliConfig,并进行一些conf的检查，包括root相关权限的检查CreateDaemonRoot(cli.Config)
-
-  * 加载apiserver,入口为loadListeners(cli, serverConfig)，其中serverConfig为cli中的服务相关配置。进入loadListener，可以看到主要做了：
-``` golang 
-for i := 0; i < len(cli.Config.Hosts); i++ {
+```golang 
+    for i := 0; i < len(cli.Config.Hosts); i++ {
 		...
 		seen[cli.Config.Hosts[i]] = struct{}{}
 		protoAddr := cli.Config.Hosts[i]
@@ -54,67 +57,96 @@ for i := 0; i < len(cli.Config.Hosts); i++ {
 		cli.api.Accept(addr, ls...)
 	}
 ```
-
-   即根据docker conf的host配置，创建不同Listener，最终调用cli.api.Accept函数，加入apiServer的HttpServer列表。  
-   * 创建daemon核心进程，其函数入口为daemon.NewDaemon(ctx, cli.Config, pluginStore)。进入函数内部，主要工作包括了：
-
+   
+即根据docker conf的host配置，创建不同Listener，最终调用cli.api.Accept函数，加入apiServer的HttpServer列表。
+   
+- 创建daemon,加载[docker daemon的配置](https://docs.docker.com/engine/reference/commandline/dockerd/#daemon)，其函数入口为daemon.NewDaemon(ctx, cli.Config, pluginStore)。进入函数内部，主要工作包括了：
+	
+1. 设置MTU,这个mtu和docker的网络相关,对应mtu配置项。
 ``` go
-    //设置mtu
-       setDefaultMtu(config)
-    //registry Service
+    setDefaultMtu(config)
+```
+2. 创建registryService对象，这个registry即docker的镜像仓库相关服务，我们在配置docker的http时，在daemon.json填写过相关内容。这里根据serviceOptions的配置，封装了serviceConfig对象，并做了3个Load操作，分别对应了daemon.json中的allow-nondistributable-artifacts(目前还不知道)、镜像加速器mirror(比如aliyun)以及insucre-registry(http配置)。
+```go
 	registryService, err := registry.NewService(config.ServiceOptions)
-	if err != nil {
+	...
+	if err := config.LoadAllowNondistributableArtifacts(options.AllowNondistributableArtifacts)
+	if err := config.LoadMirrors(options.Mirrors)
+	if err := config.LoadInsecureRegistries(options.InsecureRegistries)
+	...
+```
+3. 验证rootkey/daemon的配置/网桥/创建dns配置, 需要注意的是，这些方法都是空实现，用以docker扩展？
+```go
+	if err := ModifyRootKeyLimit()
+	if err := verifyDaemonSettings(config)
+	config.DisableBridge = isBridgeNetworkDisabled(config)
+	setupResolvConf(config)
+```
+4. 验证docker的宿主os环境验证
+```go
+	if err := checkSystem(); err != nil {
 		return nil, err
 	}
-    //各种配置和环境验证，包括了网桥、RemappedRoot、root权限验证、以及uid的remap映射，remap用于将容器内的root用户
-	//映射为host的非root用户（安全问题）
+```
+5. 创建docker的remap，并根据config配置的uid/gid创建临时目录，并将路径写入环境变量。docker的[ns-remap](https://docs-stage.docker.com/engine/security/userns-remap/)原因在于，容器内操作以root进行，并且直接对应宿主机的root(比如挂在文件后，容器内操作文件同样会以root在宿主同步)这对于宿主机的安全性是一个威胁，所以使用remap，将容器内的root映射为宿主机上的一个非root用户。
+```go
+	idMapping, err := setupRemappedRoot(config)
 	rootIDs := idMapping.RootPair()
-	//docker userns-remap 设置
-        tmp, err := prepareTempDir(config.Root, rootIDs)
+	err := setupDaemonProcess(config)
+	tmp, err := prepareTempDir(config.Root, rootIDs)
 	realTmp, err := fileutils.ReadSymlinkedDirectory(tmp)
-	...
-	//daemon的主要数据结构
+	if isWindows {
+		...
+		os.Setenv("TEMP", realTmp)
+		os.Setenv("TMP", realTmp)
+	} else {
+		os.Setenv("TMPDIR", realTmp)
+	}
+```
+6. 创建daemon核心数据结构，这个数据结构封装了config内容，以及核心的服务对象
+```go
 	d := &Daemon{
 		configStore: config,
 		PluginStore: pluginStore,
 		startupDone: make(chan struct{}),
 	}
-	
+```
+7. 对应docker的 --node-generic-resources配置项，用于通知在docker swarm cluster中用户自定义的资源，这里只是将config里配置的资源列表封装为GenericResource对象，并赋值给daemon的field。
+```go
 	if err := d.setGenericResources(config); err != nil {
 		return nil, err
 	}
-	//根据rootID 创建各种临时目录，这些目录最后位于/var/lib/docker
-	stackDumpDir := config.Root
-	if execRoot := config.GetExecRoot(); execRoot != "" {
-		stackDumpDir = execRoot
-	}
+```
+8. 设置调用栈dump
+```go
 	d.setupDumpStackTrap(stackDumpDir)
-
+```go
+9. 待研究
+```go
 	if err := d.setupSeccompProfile(); err != nil {
 		return nil, err
 	}
-
 	// Set the default isolation mode (only applicable on Windows)
 	if err := d.setDefaultIsolation(); err != nil {
 		return nil, fmt.Errorf("error setting default isolation mode: %v", err)
 	}
-
+```
+10. 根据宿主机配置，设置Go runtime max threads
+```go
 	if err := configureMaxThreads(config); err != nil {
 		logrus.Warnf("Failed to configure golang's threads limit: %v", err)
 	}
-
+```
+11. [apparmor策略](https://docs-stage.docker.com/engine/security/apparmor/)
+```go	
 	// ensureDefaultAppArmorProfile does nothing if apparmor is disabled
 	if err := ensureDefaultAppArmorProfile(); err != nil {
 		logrus.Errorf(err.Error())
 	}
-
+```
+12. 创建各种目录，如containers，默认在/var/lib/docker
+```go	
 	daemonRepo := filepath.Join(config.Root, "containers")
-	if err := idtools.MkdirAllAndChown(daemonRepo, 0700, rootIDs); err != nil {
-		return nil, err
-	}
-    
-	// Create the directory where we'll store the runtime scripts (i.e. in
-	// order to support runtimeArgs)
 	daemonRuntimes := filepath.Join(config.Root, "runtimes")
 	if err := system.MkdirAll(daemonRuntimes, 0700); err != nil {
 		return nil, err
@@ -128,7 +160,9 @@ for i := 0; i < len(cli.Config.Hosts); i++ {
 			return nil, err
 		}
 	}
-    //从env读取GragphDriver
+```
+13. 从env读取GragphDriver，
+
 	d.graphDrivers = make(map[string]string)
 	layerStores := make(map[string]layer.Store)
 	if isWindows {

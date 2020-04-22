@@ -12,6 +12,7 @@ kong ingress controller 由2部分组成
 
 * kong 流量转发的核心组件,类比于nginx
 * controller 监听k8s api,根据ingress配置or Plugin配置，更新kong状态
+
 整体的流程就是，controller监k8s api server，当出现更新，则通知kong，kong对更新自身状态，包括增加路由/激活plugin等.
 
 在这里补充一下nginx ingress controller 的流程，nginx ingress controller是k8s官方推荐的ingress controller的一种，用以支持k8s ingress 策略。它由两部分组成：
@@ -41,7 +42,9 @@ OK,刚才我们知道了kong ingress controller的主要作用，就是监听k8s
 
 一个 router 表示当请求到达kong后如何转发给service，一个service可以对应多个router。
 例如： http :8001/services/example_service/routes paths:='["/mock"]' name=mocking
+
 request-->routers[]-->service
+
 注意这个router是kong里的概念，位于service之前。这时，当访问kong proxy + /mock的时候，将直接转发至http://mockbin.org。
 
 ## plugin
@@ -58,10 +61,13 @@ http -f :8001/plugins name=proxy-cache config.strategy=memory config.content_typ
 
 第三个例子，添加一个apikey用来验证api消费者的身份，注意这个plugins添加给了name为mock的route： 
 http :8001/routes/mock/plugins name=key-auth
+
 这时访问/mock，将返回401码，提示未通过认证。因此，我们需要创建一个apikey，首先，调用admin api的consumer接口创建一个consumer：
 http :8001/consumers username=consumer1 custom_id=consumer1
+
 然后，将创建的key添加到这个consumer：
 http :8001/consumers/consumer1/key-auth key=apikey1
+
 最后，再访问/mock时，带上这个apikey：
 http :8000/mock/request apikey:apikey
 
@@ -69,10 +75,13 @@ http :8000/mock/request apikey:apikey
 
 kong实现负载均衡的模块是upstream，upstream指的是service对象后的虚拟对象，主要用于和真正的host连接，并提供LB、熔断等。
 request-->router-->service-->具体upstream(虚概念)-->targer(host)
+
 首先，创建一个upstream，名为upstream1:
 http POST :8001/upstreams name=upstream
+
 将之前创建的example_service的host属性，指定为这个upstream，而不是之前的那个http地址，注意使用了PATCH方法：
 http PATCH :8001/services/example_service host='upstream'
+
 最后，将不同的实际targert地址添加至upstream的targets
 http POST :8001/upstreams/upstream/targets target=mockbin.org:80
 http POST :8001/upstreams/upstream/targets target=httpbin.org:80
@@ -81,4 +90,27 @@ http POST :8001/upstreams/upstream/targets target=httpbin.org:80
 
 security并不是kong的组件，是kong通过RBAC所支持的安全策略，详细信息[待完善](https://docs.konghq.com/getting-started-guide/latest/manage-teams/)
 
+# kong in k8s
+
+由上文已经知道了kong的内部组件以及大致功能，那么，kong在k8s中如何进行k8s插件的部署安装。
+
+##  CustomResourceDefinition
+
+[CRD](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/)用于自定义k8s的资源对象。在kong中，定义了以下CRD资源:
+
+* KongIngress: k8s的ingress只是提供了一个host/path路由的功能，因此，作为ingress的补充，kongIngress在原有k8s中ingress的基础上提供了对在kong中定义的upstream、service、router实体进行维护的功能。在使用时，通过在ingress中加入kongIngress的annotations进行扩展。
+
+* KongPlugin: kong插件资源，kong本身提供了一些plugins，详见上文。这些插件可以应用于k8s的资源ingress/service以及kongConsumer，用来在不同的层（4/7）进行限流等功能。在使用时，同样将在k8s的annotations中加入plugin。
+
+* KongClusterPlugin: 和kongPlugin类似，只是cluster级的资源对象（kongPlugin是namespace）。当插件的安装和部署需要进行集中化处理时，选用cluster级。
+
+* KongConsumer：用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。
+
+* TCPIngress: 向外部暴露非http/grpc的k8s中的服务，
+
+* KongCredential (Deprecated): 废弃
+
 ## 
+
+
+

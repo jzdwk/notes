@@ -69,32 +69,41 @@ kong除了可以作为反向代理(通过配置route+service)，也可以通过p
 ### 例子
 
 第一个例，添加一个流量限速的plugins操作：
-```http -f post :8001/plugins name=rate-limiting config.minute=5 config.policy=local```
+```
+http -f post :8001/plugins name=rate-limiting config.minute=5 config.policy=local
+```
 例子中通过api添加了一个限速的plugin，此时，当继续访问上文中的/mock，高于频次限制将返回提示信息。(这是一个global的配置)
 
 第二个例子，添加一个内存的cache：
-```http -f :8001/plugins name=proxy-cache config.strategy=memory config.content_type="application/json"```
+```
+http -f :8001/plugins name=proxy-cache config.strategy=memory config.content_type="application/json"
+```
 此时，访问/mock时，将被缓存。
 
 第三个例子，添加一个apikey用来验证api消费者的身份，注意这个plugins添加给了name为mock的route： 
-```http :8001/routes/mock/plugins name=key-auth```
-
+```
+http :8001/routes/mock/plugins name=key-auth
+```
 这时访问/mock，将返回401码，提示未通过认证。因此，我们需要创建一个apikey，首先，调用admin api的consumer接口创建一个consumer：
-```http :8001/consumers username=consumer1 custom_id=consumer1```
-
+```
+http :8001/consumers username=consumer1 custom_id=consumer1
+```
 然后，将创建的key添加到这个consumer：
-```http :8001/consumers/consumer1/key-auth key=apikey1```
-
+```
+http :8001/consumers/consumer1/key-auth key=apikey1
+```
 最后，再访问/mock时，带上这个apikey：
-```http :8000/mock/request apikey:apikey```
-
+```
+http :8000/mock/request apikey:apikey
+```
 ### 注意
+
 plugin在整个请求响应中，只会运行一次。但是，plugin可以定义在多个资源上，比如service,route以及consumer，不同资源的配置属性可能不同，换句话说，一个http请求可能会经历多个资源，举个例子：
 
 1. curl -i -X GET http://www.test.com/req1 这个请求，我们定义了一个url是`http://http://www.test.com/req1`的service，当然，我们还需要定义一个path是req1的route。
 2. 我们new了一个plugin，同时应用于service和route，在add进service是使用了配置A，route时，使用了配置B。
 
-这个plugin如何工作？另外，还有一个场景是，如果我们想让多数请求都使用某一个plugin，如key-auth，但是，针对某些不同的请求，又有个性化配置，如何做到？因此，plugin的配置存在一个*优先级*，这个优先级的定义是：*plugin所指定的资源对象越具体越详细，它的优先级就越高*。因此，存在了以下的优先级顺序：
+这个plugin如何工作？另外，还有一个场景是，如果我们想让多数请求都使用某一个plugin，如key-auth，但是，针对某些不同的请求，又有个性化配置，如何做到？因此，plugin的配置存在一个**优先级**，这个优先级的定义是：**plugin所指定的资源对象越具体越详细，它的优先级就越高**。因此，存在了以下的优先级顺序：
 
 1. Plugins configured on a combination of: a Route, a Service, and a Consumer. (Consumer means the request must be authenticated).
 2. Plugins configured on a combination of a Route and a Consumer. (Consumer means the request must be authenticated).
@@ -133,11 +142,13 @@ upstream表示一个虚拟主机名，可用于在多个service(targets)上对�
 ### 例子
 
 首先，创建一个upstream，名为upstream1:
-```http POST :8001/upstreams name=upstream```
-
+```
+http POST :8001/upstreams name=upstream
+```
 将之前创建的example_service的host属性，指定为这个upstream，而不是之前的那个http地址，注意使用了PATCH方法：
-```http PATCH :8001/services/example_service host='upstream'```
-
+```
+http PATCH :8001/services/example_service host='upstream'
+```
 最后，将不同的实际targert地址添加至upstream的targets
 ```http POST :8001/upstreams/upstream/targets target=mockbin.org:80
 http POST :8001/upstreams/upstream/targets target=httpbin.org:80

@@ -35,17 +35,17 @@ nginx ingress controller的部署方式有:
 
 [CRD](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/)用于自定义k8s的资源对象。在kong中，定义了以下CRD资源:
 
-1. *KongIngress*: k8s的ingress只是提供了一个host/path路由的功能，因此，作为ingress的补充，kongIngress在原有k8s中ingress的基础上提供了对在kong中定义的upstream、service、router实体进行维护的功能。在使用时，通过在ingress中加入kongIngress的annotations进行扩展。
+1. **KongIngress**: k8s的ingress只是提供了一个host/path路由的功能，因此，作为ingress的补充，kongIngress在原有k8s中ingress的基础上提供了对在kong中定义的upstream、service、router实体进行维护的功能。在使用时，通过在ingress中加入kongIngress的annotations进行扩展。
 
-2. *KongPlugin*:  kong插件资源，kong本身提供了一些plugins，详见上文。这些插件可以应用于k8s的资源ingress/service以及kongConsumer，用来在不同的层（4/7）进行限流等功能。在使用时，同样将在k8s的annotations中加入plugin。
+2. **KongPlugin**:  kong插件资源，kong本身提供了一些plugins，详见上文。这些插件可以应用于k8s的资源ingress/service以及kongConsumer，用来在不同的层（4/7）进行限流等功能。在使用时，同样将在k8s的annotations中加入plugin。
 
-3. *KongClusterPlugin*: 和kongPlugin类似，只是cluster级的资源对象（kongPlugin是namespace）。当插件的安装和部署需要进行集中化处理时，选用cluster级。
+3. **KongClusterPlugin**: 和kongPlugin类似，只是cluster级的资源对象（kongPlugin是namespace）。当插件的安装和部署需要进行集中化处理时，选用cluster级。
 
-4. *KongConsumer*：用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。
+4. **KongConsumer**：用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。
 
-5. *TCPIngress*: 向外部暴露非http/grpc的k8s中的服务，
+5. **TCPIngress**: 向外部暴露非http/grpc的k8s中的服务，
 
-6. *KongCredential* (Deprecated): 废弃
+6. **KongCredential** (Deprecated): 废弃
 
 ## conjecture
 

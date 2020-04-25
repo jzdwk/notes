@@ -27,15 +27,28 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 
 ## run daemon
 
-进入runDaemon函数，通过创建一个daemonCli,调用了后者的start函数，这里面主要分为了以下几步
+进入runDaemon函数，通过创建一个daemonCli,调用了后者的start函数：
 
-- 设置默认的opts项,opts.SetDefaultOptions(opts.flags)  
-	
-- loadDaemonCliConfig,并进行一些conf的检查，包括root相关权限的检查CreateDaemonRoot(cli.Config)
-	
-- 加载apiserver,入口为loadListeners(cli, serverConfig)，其中serverConfig为cli中的服务相关配置。进入loadListener，可以看到主要做了：
+```go
+func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
+...}
+```
 
-```golang 
+这里便是daemon的主要实现逻辑。
+
+### opts
+
+设置默认的opts项,opts.SetDefaultOptions(opts.flags)  
+	
+### load conf
+
+loadDaemonCliConfig,并进行一些conf的检查，包括root相关权限的检查CreateDaemonRoot(cli.Config)
+	
+### api server
+
+加载apiserver,入口为```go 	hosts, err := loadListeners(cli, serverConfig) ```，其中serverConfig为cli中的服务相关配置。进入loadListener，可以看到主要做了：
+
+```go 
     for i := 0; i < len(cli.Config.Hosts); i++ {
 		...
 		seen[cli.Config.Hosts[i]] = struct{}{}
@@ -59,8 +72,14 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 ```
    
 即根据docker conf的host配置，创建不同Listener，最终调用cli.api.Accept函数，加入apiServer的HttpServer列表。
+
+### init middleware
+
+待了解
+
+### new daemon
    
-- 创建daemon,加载[docker daemon的配置](https://docs.docker.com/engine/reference/commandline/dockerd/#daemon)，其函数入口为daemon.NewDaemon(ctx, cli.Config, pluginStore)。进入函数内部，主要工作包括了：
+创建daemon,加载[docker daemon的配置](https://docs.docker.com/engine/reference/commandline/dockerd/#daemon)，其函数入口为daemon.NewDaemon(ctx, cli.Config, pluginStore)。进入函数内部，主要工作包括了：
 	
 1. 设置MTU,这个mtu和docker的网络相关,对应mtu配置项。
 ``` go
@@ -425,3 +444,52 @@ docker的数据都存在于/var/lib/docker中，此处的config.Root即/var/lib/
 ```
 
 总的来说，newDaemon里面两个重要的数据结构，一个是conf，另一个就是daemon，前者维护了docker启动时的参数/配置，后者的field里保存了daemon的各个模块struct，在代码中，执行init/new去初始化配置后，返回一个对象给field中。
+
+### auth plugin 
+
+OK了，从NewDaemon函数返回后，接下来就是拉起几个通过daemon初始化好的服务或组件：
+
+```go
+	if err := validateAuthzPlugins(cli.Config.AuthorizationPlugins, pluginStore); err != nil {
+		return errors.Wrap(err, "failed to validate authorization plugin")
+	}
+```
+### metrics 
+
+拉起metric server，通过调用http包下的serverMux实现，通过tcp监听，http路径为metrics，代码如下：
+
+```go
+	...
+	if err := allocateDaemonPort(addr); err != nil {
+		return err
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler())
+	go func() {
+		if err := http.Serve(l, mux); err != nil {
+			logrus.Errorf("serve metrics api: %s", err)
+		}
+	}()
+	return nil
+```
+
+### docker cluster
+
+docker 集群的相关服务，有待详细了解：
+
+```go
+	c, err := createAndStartCluster(cli, d)
+	d.RestartSwarmContainers()
+```
+
+### init router
+
+在之前的步骤中，已经初始化了listener，这一步将进行router的初始化，使api真正route成功：
+
+```go
+	initRouter(routerOptions)
+```

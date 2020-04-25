@@ -161,8 +161,9 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 		}
 	}
 ```
-13. 从env读取GragphDriver，
+13. 从env读取GraphDriver，如果没有读到，则从conf中读。graph Driver主要用于管理和维护镜像，包括把镜像从仓库下载下来，到运行时把镜像挂载起来可以被容器访问等。
 
+```go
 	d.graphDrivers = make(map[string]string)
 	layerStores := make(map[string]layer.Store)
 	if isWindows {
@@ -179,12 +180,20 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 		}
 		d.graphDrivers[runtime.GOOS] = driverName // May still be empty. Layerstore init determines instead.
 	}
-    
+```
+
+14. 处理插件，包括metric，metric用于度量docker容器的cpu
+ 
+```go
 	d.RegistryService = registryService
 	metricsSockPath, err := d.listenMetricsSock()
     //处理插件，包括metric，metric用于度量docker容器的cpu memory等 
 	registerMetricsPluginCallback(d.PluginStore, metricsSockPath)
-    //grpc初始化
+```
+
+15. containerd的客户端初始化，该客户端用于和contarinerd进行grpc连接。containerd是容器技术标准化之后的产物，为了能够兼容[OCI标准](https://www.opencontainers.org/)，将容器运行时及其管理功能从docker daemon剥离,containerd主要职责是镜像管理（镜像、元信息等）、容器执行（调用最终运行时组件执行）。containerd向上为docker daemon提供了gRPC接口，使得docker daemon屏蔽下面的结构变化，确保原有接口向下兼容。向下通过containerd-shim结合runC，使得引擎可以独立升级，避免之前docker daemon升级会导致所有容器不可用的问题。
+
+```go
 	gopts := []grpc.DialOption{
 		grpc.WithInsecure(),
 		grpc.WithBackoffMaxDelay(3 * time.Second),
@@ -194,13 +203,18 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
 	}
+
 	if config.ContainerdAddr != "" {
 		d.containerdCli, err = containerd.New(config.ContainerdAddr, containerd.WithDefaultNamespace(config.ContainerdNamespace), containerd.WithDialOpts(gopts), containerd.WithTimeout(60*time.Second))
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to dial %q", config.ContainerdAddr)
 		}
 	}
+```
 
+17. 初始化[docker plugin](https://docs.docker.com/engine/extend/)对象，插件位于/run/docker/plugin目录。docker支持多种plugin，如访问控制类、network类、volume类等，通过docker plugin install 命令进行安装。实现上首先初始化了一个exec对象，主要用于创建一个containerd客户端，原因在于plugin也需要从docker hub or registry上拉取。
+
+```go
 	createPluginExec := func(m *plugin.Manager) (plugin.Executor, error) {
 		var pluginCli *containerd.Client
 
@@ -216,7 +230,7 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 		return pluginexec.New(ctx, getPluginExecRoot(config.Root), pluginCli, config.ContainerdPluginNamespace, m)
 	}
 
-	//插件管理 位于/run/docker/plugin
+	
 	// Plugin system initialization should happen before restore. Do not change order.
 	d.pluginManager, err = plugin.NewManager(plugin.ManagerConfig{
 		Root:               filepath.Join(config.Root, "plugins"),
@@ -228,6 +242,10 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 		LogPluginEvent:     d.LogPluginEvent, // todo: make private
 		AuthzMiddleware:    config.AuthzMiddleware,
 	})
+```
+18. 这一步对应于第13步，在从环境变量or config中读取graph driver后，遍历graph driver，使用layerStores进行封装。docker daemon在初始化过程中，会初始化一个layerStore用来存储layer，docker镜像的一层称为一个layer。
+
+```go
 	//配置image存储
 	for operatingSystem, gd := range d.graphDrivers {
 		layerStores[operatingSystem], err = layer.NewStoreFromOptions(layer.StoreOptions{
@@ -247,56 +265,60 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 		// As layerstore initialization may set the driver
 		d.graphDrivers[operatingSystem] = layerStores[operatingSystem].DriverName()
 	}
+```
 
-	// Configure and validate the kernels security support. Note this is a Linux/FreeBSD
-	// operation only, so it is safe to pass *just* the runtime OS graphdriver.
-	if err := configureKernelSecuritySupport(config, d.graphDrivers[runtime.GOOS]); err != nil {
-		return nil, err
-	}
-    //docker的数据都存在于/var/lib/docker中，此处的config.Root即/var/lib/docker
+layerStore相关的内容，请参考[docker image]的分析。并参考了[这篇文章](https://blog.csdn.net/xuguokun1986/article/details/79516233)
+
+19.  创建imageStore，存储的目录位于/var/lib/docker/image/{driver}/imagedb，该目录下主要包含content和metadata两个目录。
+
+- content目录：content下面的sha256目录下存放了每个docker  image的元数据文件，除了制定了这个image由那些roLayer构成，还包含了部分配置信息，如volume、port、workdir等，这部分信息就存放在这个目录下面，docker启动时会读取镜像配置信息，反序列化出image对象
+
+- metadata目录：metadata目录存放了docker image的parent信息。 
+
+docker的数据都存在于/var/lib/docker中，此处的config.Root即/var/lib/docker。在newImageStore函数中，调用了restore，这个restore加载了当前docker的image层、配置并建立层级关系：
+ 
+```go   
 	imageRoot := filepath.Join(config.Root, "image", d.graphDrivers[runtime.GOOS])
-	//创建存储镜像的路径，imagedb/content imagedb/metadata,在image下，包括了imagedb和layerdb，注意其上层目录为graphdriver的名称（overlay2）
 	ifs, err := image.NewFSStoreBackend(filepath.Join(imageRoot, "imagedb"))
-    
 	lgrMap := make(map[string]image.LayerGetReleaser)
 	for os, ls := range layerStores {
 		lgrMap[os] = ls
 	}
 	imageStore, err := image.NewImageStore(ifs, lgrMap)
-	if err != nil {
-		return nil, err
-	}
-	//docker volumes 服务
+```
+
+20. volume服务初始化，在NewVolumeService中，对已经声明了个volume进行了挂载：
+
+```go
 	d.volumes, err = volumesservice.NewVolumeService(config.Root, d.PluginStore, rootIDs, d)
 	if err != nil {
 		return nil, err
 	}
+```
+
+21. 创建[trust key](https://docs.docker.com/engine/security/trust/trust_key_mng/)
+
+```go
     //trust key的路径创建
 	trustKey, err := loadOrCreateTrustKey(config.TrustKeyPath)
-	if err != nil {
-		return nil, err
-	}
 	trustDir := filepath.Join(config.Root, "trust")
 	if err := system.MkdirAll(trustDir, 0700); err != nil {
 		return nil, err
 	}
+```
+22. image的image/tag相关信息，以一个ubunu镜像为例，ubuntu镜像的名字就叫ubuntu，一个完成的镜像还包括tag，于是就有了ubuntu:latest、ubuntu:14.04等。这部分信息保存在/var/lib/docker/image/{driver}/repositories.json这个文件中，即refStoreLocation
 
-	// We have a single tag/reference store for the daemon globally. However, it's
-	// stored under the graphdriver. On host platforms which only support a single
-	// container OS, but multiple selectable graphdrivers, this means depending on which
-	// graphdriver is chosen, the global reference store is under there. For
-	// platforms which support multiple container operating systems, this is slightly
-	// more problematic as where does the global ref store get located? Fortunately,
-	// for Windows, which is currently the only daemon supporting multiple container
-	// operating systems, the list of graphdrivers available isn't user configurable.
-	// For backwards compatibility, we just put it under the windowsfilter
-	// directory regardless.
+```go
 	refStoreLocation := filepath.Join(imageRoot, `repositories.json`)
 	rs, err := refstore.NewReferenceStore(refStoreLocation)
 	if err != nil {
 		return nil, fmt.Errorf("Couldn't create reference store repository: %s", err)
 	}
+```
 
+23. 这部分感觉像是docker cluster要做的工作，去发现其他节点？
+
+```go
 	distributionMetadataStore, err := dmetadata.NewFSMetadataStore(filepath.Join(imageRoot, "distribution"))
 	if err != nil {
 		return nil, err
@@ -314,7 +336,11 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 	if runtime.GOOS == "linux" && !sysInfo.CgroupDevicesEnabled {
 		return nil, errors.New("Devices cgroup isn't mounted")
 	}
-    //好了，前期的一通New操作后，对daemon进行赋值
+```
+
+23. 好了，前期的一通New操作后，对daemon进行赋值，New操作中，通过New对象的函数，进行了一些服务的初始化、dir的创建，并将最终的配置信息返回New后的Service对象，并将这些对象封装进daemon中，这个解耦技巧值得学习。
+
+```go
 	d.ID = trustKey.PublicKey().KeyID()
 	d.repository = daemonRepo
 	d.containers = container.NewMemoryStore()
@@ -397,4 +423,5 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 
 	return d, nil
 ```
+
 总的来说，newDaemon里面两个重要的数据结构，一个是conf，另一个就是daemon，前者维护了docker启动时的参数/配置，后者的field里保存了daemon的各个模块struct，在代码中，执行init/new去初始化配置后，返回一个对象给field中。

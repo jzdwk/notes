@@ -35,17 +35,148 @@ nginx ingress controller的部署方式有:
 
 [CRD](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/)用于自定义k8s的资源对象。在kong中，定义了以下CRD资源:
 
-1. **KongIngress**: k8s的ingress只是提供了一个host/path路由的功能，因此，作为ingress的补充，kongIngress在原有k8s中ingress的基础上提供了对在kong中定义的upstream、service、router实体进行维护的功能。在使用时，通过在ingress中加入kongIngress的annotations进行扩展。
+## kong and k8s
 
-2. **KongPlugin**:  kong插件资源，kong本身提供了一些plugins，详见上文。这些插件可以应用于k8s的资源ingress/service以及kongConsumer，用来在不同的层（4/7）进行限流等功能。在使用时，同样将在k8s的annotations中加入plugin。
+在详细说明CRD资源对象之前，需要将Kong与K8S中的资源做一个映射关系:
 
-3. **KongClusterPlugin**: 和kongPlugin类似，只是cluster级的资源对象（kongPlugin是namespace）。当插件的安装和部署需要进行集中化处理时，选用cluster级。
+- k8s ingress ==> kong route
+- k8s service ==> kong service/upstream
+- k8s pod ==> kong target
 
-4. **KongConsumer**：用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。
+### KongIngress
 
-5. **TCPIngress**: 向外部暴露非http/grpc的k8s中的服务，
+k8s的ingress只是提供了一个host/path路由的功能。作为ingress的补充，kongIngress在原有k8s中ingress的基础上，通过更改kong upstream/service/route的属性，提供了对其k8s ingress/service描述规则进行更改的功能，比如配置path的匹配规则。其**作用对象为k8s的service和ingress**.
 
-6. **KongCredential** (Deprecated): 废弃
+在使用时，通过在k8s的ingress/service中加入kongIngress的annotations进行扩展。具体用法为：
+```configuration.konghq.com: kong-ingress-resource-name```
+比如，在ingress资源上增加一个名叫sample-custom-resource的kongIngress:
+```kubectl patch ingress demo -p '{"metadata":{"annotations":{"configuration.konghq.com":"sample-customization"}}}'```
+
+另外需要注意，根据上文提到的k8s对象与kong的对应关系：
+
+- 当涉及到health-checking, load-balancing等和service相关的配置，将annotation加入k8s的service对象。
+- 当涉及到路由，协议配置时，将annotation加入k8s的ingress对象。
+
+完整的kongIngress 模板如下：
+
+```
+apiVersion: configuration.konghq.com/v1
+kind: KongIngress
+metadata:
+  name: configuration-demo
+upstream:
+  slots: 10
+  hash_on: none
+  hash_fallback: none
+  healthchecks:
+    threshold: 25
+    active:
+      concurrency: 10
+      healthy:
+        http_statuses:
+        - 200
+        - 302
+        interval: 0
+        successes: 0
+      http_path: "/"
+      timeout: 1
+      unhealthy:
+        http_failures: 0
+        http_statuses:
+        - 429
+        interval: 0
+        tcp_failures: 0
+        timeouts: 0
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        successes: 0
+      unhealthy:
+        http_failures: 0
+        http_statuses:
+        - 429
+        - 503
+        tcp_failures: 0
+        timeouts: 0
+proxy:
+  protocol: http
+  path: /
+  connect_timeout: 10000
+  retries: 10
+  read_timeout: 10000
+  write_timeout: 10000
+route:
+  methods:
+  - POST
+  - GET
+  regex_priority: 0
+  strip_path: false
+  preserve_host: true
+  protocols:
+  - http
+  - https
+```
+
+### KongPlugin
+
+kong插件资源，kong本身提供了一些plugins，详见kong concept。这些插件可以**应用于k8s的资源ingress/service以及kongConsumer（CRD）**，用来在不同的层（4/7）进行限流等功能。在使用时，同样将在k8s的annotations中加入plugin。完整的kongPlugin定义如下：
+
+```
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: <object name>
+  namespace: <object namespace>
+  labels:
+    global: "true"   # optional, if set, then the plugin will be executed
+                     # for every request that Kong proxies
+                     # please note the quotes around true
+disabled: <boolean>  # optionally disable the plugin in Kong
+config:              # configuration for the plugin
+    key: value
+plugin: <name-of-plugin> # like key-auth, rate-limiting etc
+```
+
+其中config项下，用于配置plugin的key-value段。通过```plugins.konghq.com```段，可将其作用在k8s的service、ingress对象上，例如，创建一个response-transformer的plugin:
+```
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: add-response-header
+config:
+  add:
+    headers:
+    - "demo: injected-by-kong"
+plugin: response-transformer
+```
+并将其应用到ingress上：```kubectl patch ingress demo -p '{"metadata":{"annotations":{"konghq.com/plugins":"add-response-header"}}}'```
+
+### KongClusterPlugin
+
+和kongPlugin类似，只是cluster级的资源对象（kongPlugin是namespace）。当插件的安装和部署需要进行集中化处理时，选用cluster级。比如下例：
+
+```
+apiVersion: configuration.konghq.com/v1
+kind: KongClusterPlugin
+metadata:
+  name: request-id
+config:
+  header_name: my-request-id
+plugin: correlation-id
+```
+
+### KongConsumer
+
+用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。
+
+### TCPIngress
+
+向外部暴露非http/grpc的k8s中的服务，
+
+### KongCredential
+
+**拟废弃**
 
 ## conjecture
 

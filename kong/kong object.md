@@ -31,7 +31,7 @@ tag的检索使用“,”表示“与关系”，使用“/”表示“或关系
 
 ## service
 
-一个service代表一个微服务实体，可以简单理解为一个网站的根地址www.test.com, 对于k8s场景来说，就是应用的svc，或者说是ingress中描述的host，service中最重要的属性是url(protocol,hsot,port,path)。service定义后，通过不同的route进行访问。
+一个service代表一个微服务实体，可以简单理解为一个网站的根地址www.test.com, 对于k8s场景来说，就是应用的svc，或者说是ingress中描述的host，service中最重要的属性是url(protocol,host,port,path)。service定义后，通过不同的route进行访问。
 service创建例子如下：
 ```http POST :8001/services name=example_service url='http://mockbin.org'```
 
@@ -103,7 +103,7 @@ route的tls配置，以及对grpc等的代理，请[参考文档](https://docs.k
 
 ## consumer
 
-consumer定义了对于一个service的使用者者。这个使用者既可以使用kong来管理，也可以将user列表映射到外部DB，以保持Kong与现有主数据存储之间的一致性。*具体应用场景待了解*
+consumer定义了对于一个service的使用者。这个使用者既可以使用kong来管理，也可以将user列表映射到外部DB，以保持Kong与现有主数据存储之间的一致性。*具体应用场景待了解*
 
 ## plugin
 

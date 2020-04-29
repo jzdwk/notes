@@ -1,8 +1,10 @@
 # docker daemon启动
 
+docker分为了client端和daemon端，daemon端的执行通过dockerd完成。
+
 ## daemon command
 
-docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其核心代码为newDaemonCommand函数。注意任何以new开头的函数都是一个工厂函数，返回一个封装好的工厂产品。
+docker daemon的入口函数位于docker-ce/components/engine/cmd/dockerd/docker.go的main函数。其核心代码为newDaemonCommand函数。注意任何以new开头的函数都是一个工厂函数，返回一个封装好的工厂产品。
 进入函数内，可以看到使用了[cobra库](https://github.com/spf13/cobra)进行命令行的封装。
   
 ```go
@@ -23,7 +25,7 @@ docker daemon的入口函数位于moby/cmd/dockerd/docker.go的main函数。其�
 	}
 ```
 
-其中opts是docker命令后的参数封装，类型为ademonOptions，包括了flag/param/配置文件等等，daemon的真正启动位于runDaemon函数的实现内。
+由Use项可以看到docker daemon的命令为 dockerd \[Options\]其中opts是docker命令后的参数封装，类型为ademonOptions，包括了flag/param/配置文件等等，daemon的真正启动位于runDaemon函数的实现内。
 
 ## run daemon
 

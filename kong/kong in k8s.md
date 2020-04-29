@@ -34,6 +34,12 @@ nginx ingress controller的部署方式有:
 ##  CustomResourceDefinition
 
 [CRD](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/)用于自定义k8s的资源对象。在kong中，定义了以下CRD资源:
+- KongIngress
+- KongPlugin
+- KongConsumer
+- KongCredential
+- KongClusterPlugin
+- TCPIngress
 
 ## kong and k8s
 
@@ -168,15 +174,63 @@ plugin: correlation-id
 
 ### KongConsumer
 
-用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。
+用于配置kong consumer，每一个kongConsumer资源对象对应一个kong中的consumer实体。其模板如下：
+
+```
+apiVersion: configuration.konghq.com/v1
+kind: KongConsumer
+metadata:
+  name: <object name>
+  namespace: <object namespace>
+username: <user name>
+custom_id: <custom ID>
+```
+
 
 ### TCPIngress
 
-向外部暴露非http/grpc的k8s中的服务，
+k8s的ingress只用于暴露http服务，使用tcpIngress则可以进行基于tcp和tls sni的路由，tcpIngress的模板如下：
 
-### KongCredential
+```
+apiVersion: configuration.konghq.com/v1beta1
+kind: TCPIngress
+metadata:
+  name: <object name>
+  namespace: <object namespace>
+spec:
+  rules:
+  - host: <SNI, optional>
+    port: <port on which to expose this service, required>
+    backend:
+      serviceName: <name of the kubernetes service, required>
+      servicePort: <port number to forward on the service, required>
+```
 
-**拟废弃**
+如果没有指定host，则直接对流量进行转发，如果指定了host，则根据host的配置，将流量进行ssl加密处理。
+
+### KongCredential(Deprecated)
+
+kongCredential和kongConsumer是配合使用的，它可以向consumer上添加key来进行认证，两者通过consumerRef建立关联，其模板如下：
+
+```
+apiVersion: configuration.konghq.com/v1
+kind: KongCredential
+metadata:
+  name: credential-team-x
+consumerRef: consumer-team-x
+type: key-auth
+config:
+  key: 62eb165c070a41d5c1b58d9d3d725ca1
+```
+
+其中，type的种类包括了：
+
+- key-auth for Key authentication
+- basic-auth for Basic authenticaiton
+- hmac-auth for HMAC authentication
+- jwt for JWT based authentication
+- oauth2 for Oauth2 Client credentials
+- acl for ACL group associations
 
 ## conjecture
 

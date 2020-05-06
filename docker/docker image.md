@@ -86,33 +86,168 @@ Docker容器中每一层只读的image 以及最上层可读写的文件系统�
 
 ## pull image
 
-Docker Daemon在执行这条命令时，会将Docker Image从Docker Registry下载至本地，并保存在本地Docker Daemon管理的Graph中。从docker daemon的启动过程可以看到，通过initRouter启动了api的handler。因此，可以将其作为入口点分析。下面深入代码，看下pull的详细实现。
+镜像pull首先是要执行docker pull命令。从命令可以看出，是docker client首先发送pull请求至docker daemon. Docker Daemon在执行这条命令时，会将Docker Image从Docker Registry下载至本地，并保存在本地Docker Daemon管理的Graph中。其流程总结为：
+
+1. 用户通过Docker Client发送pull请求，用于让Docker Daemon下载指定名称的镜像
+2. Docker Server接收Docker镜像的pull请求，创建下载镜像任务并触发执行
+3. Docker Daemon执行镜像下载任务，从Docker Registry中下载指定镜像，并将其存储于本地的Graph中。
 
 ### docker client
 
-首先，在docker.go的main函数里，我们看到，docker daemon启动后，会得到标准输入/输出，然后通过cmd去执行std的命令，并将结果返回stdout:
+在docker client的笔记中，讲解了client的整体工作机制，镜像下载使用了docker image pull，就以`docker image pull test/hello-world:1.0`举例说明，其实发送http请求的套路和所有命令都一致，就看下后面的参数（args）怎么解析。
+
+1. 在3级命令NewPullCommand中，首先取到了args\[0\],即`test/hello-world:1.0`这个值，并将其赋值给了remote域，然后进入RunPull函数：
+
 ```
-	_, stdout, stderr := term.StdStreams()
-	...
-	cmd, err := newDaemonCommand()
-	cmd.SetOutput(stdout)
-	if err := cmd.Execute(); err != nil {
-		onError(err)
-	}
-```
-其中cmd.Execute则最终调用了cobra库中，cmd结构体生命的RUNE变量，比如：
-```
-cmd := &cobra.Command{
-		Use:           "dockerd [OPTIONS]",
-		Short:         "A self-sufficient runtime for containers.",
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		Args:          cli.NoArgs,
+	cmd := &cobra.Command{
+		Use:   "pull [OPTIONS] NAME[:TAG|@DIGEST]",
+		Short: "Pull an image or a repository from a registry",
+		Args:  cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts.flags = cmd.Flags()
-			return runDaemon(opts)
+			opts.remote = args[0]
+			return RunPull(dockerCli, opts)
 		},
-		DisableFlagsInUseLine: true,
-		Version:               fmt.Sprintf("%s, build %s", dockerversion.Version, dockerversion.GitCommit),
 	}
 ```
+
+2. 进入RunPull，主要关注opts参数，在第一句就对这个remote做了解析,`distributionRef, err := reference.ParseNormalizedNamed(opts.remote)`,进入这个prase函数，可以看到其主要工作是解析remote后将其封装为一个Named接口，这个接口的实现有。代码的大致逻辑为：
+
+```
+	//合法性检查
+	...
+	//根据test/hello-world:1.0 解析中其中的仓库地址domamin，以及repo镜像/tag
+	//其中splictDockerDomain对应3中情况:
+	//1.address/repo/image:tag  2.repo/image:tag 3.image:tag 4.image
+	//对于3,4,domain = defaultDomain(docker.io);对于1,domain为address;对于3,4 将默认使用library作为repo
+	domain, remainder := splitDockerDomain(s)
+	var remoteName string
+	if tagSep := strings.IndexRune(remainder, ':'); tagSep > -1 {
+		remoteName = remainder[:tagSep]
+	} else {
+		remoteName = remainder
+	}
+	...
+	//返回具体的Named实现，包括了digestReference canonicalReference  taggedReference
+	ref, err := Parse(domain + "/" + remainder)
+    ...
+	named, isNamed := ref.(Named)
+	if !isNamed {
+		return nil, fmt.Errorf("reference %s has no name", ref.String())
+	}
+	return named, nil
+```
+
+3. 解析完成后，将对registry的信息，以及认证信息做进一步的封装，封装的结构体如下：
+
+```
+type ImageRefAndAuth struct {
+	original   string
+	authConfig *types.AuthConfig
+	reference  reference.Named
+	repoInfo   *registry.RepositoryInfo
+	tag        string
+	digest     digest.Digest
+}
+```
+
+其具体实现的函数为`imgRefAndAuth, err := trust.GetImageReferencesAndAuth(ctx, nil, AuthResolver(cli), distributionRef.String())`,其中AuthResolver返回了一个函数func变量`func(ctx context.Context, index *registrytypes.IndexInfo) types.AuthConfig`,如下所示：
+
+```
+func AuthResolver(cli command.Cli) func(ctx context.Context, index *registrytypes.IndexInfo) types.AuthConfig {
+	return func(ctx context.Context, index *registrytypes.IndexInfo) types.AuthConfig {
+		return command.ResolveAuthConfig(ctx, cli, index)
+	}
+}
+```
+
+因此，当AuthResolver被调用时，将根据传入的实际参数，调用command.ResolveAuthConfig(ctx, cli, index)，这个函数的大致逻辑为读取**docker的config.json**里内容，获取认证信息。(*思考？为何在GetImageReferencesAndAuth中使用函数变量，而不是在函数中直接调用呢？答：这样实现了认证信息的解耦，在GetImageReferencesAndAuth的形参中，只需要定义一个函数变量，规定其入参和返回值，而调用者根据实际情况，可选择传入AuthResolver的实现或者Othersolver，对于GetImageReferencesAndAuth内部，则不用关心。否则，其内部的调用逻辑将随着不同认证信息的获取方式改变而难以维护*)
+
+4. 之后，根据cli以及ImageRefAndAuthde的信息，调用`imagePullPrivileged`执行pull操作。在这个函数中，主要是对镜像信息ref和认证信息encodeAuth做了进一步的封装，即options：
+```
+	options := types.ImagePullOptions{
+		RegistryAuth:  encodedAuth,
+		PrivilegeFunc: requestPrivilege,
+		All:           opts.all,
+		Platform:      opts.platform,
+	}
+```
+最后调用client的`ImagePull`函数进行请求的发送，核心的逻辑为首先向daemon的api请求`cli.post(ctx, "/images/create"`，如果需要认证，则调用注册的认证func PrivilegeFunc处理认证信息后重新发送请求：
+```
+	resp, err := cli.tryImageCreate(ctx, query, options.RegistryAuth)
+	if errdefs.IsUnauthorized(err) && options.PrivilegeFunc != nil {
+		newAuthHeader, privilegeErr := options.PrivilegeFunc()
+		if privilegeErr != nil {
+			return nil, privilegeErr
+		}
+		resp, err = cli.tryImageCreate(ctx, query, newAuthHeader)
+	}
+```
+
+### docker daemon
+
+docker daemon的api相关代码位于docker-ce/engine/api/server/router/\*，并根据不同的模块分为了container，network，image等包。根据client端的pull请求，定位到以下path定义：
+```
+func (r *imageRouter) initRoutes() {
+	r.routes = []router.Route{
+		// GET
+		router.NewGetRoute("/images/json", r.getImagesJSON),
+		router.NewGetRoute("/images/search", r.getImagesSearch),
+		router.NewGetRoute("/images/get", r.getImagesGet),
+		router.NewGetRoute("/images/{name:.*}/get", r.getImagesGet),
+		router.NewGetRoute("/images/{name:.*}/history", r.getImagesHistory),
+		router.NewGetRoute("/images/{name:.*}/json", r.getImagesByName),
+		// POST
+		router.NewPostRoute("/images/load", r.postImagesLoad),
+		router.NewPostRoute("/images/create", r.postImagesCreate),
+		router.NewPostRoute("/images/{name:.*}/push", r.postImagesPush),
+		router.NewPostRoute("/images/{name:.*}/tag", r.postImagesTag),
+		router.NewPostRoute("/images/prune", r.postImagesPrune),
+		// DELETE
+		router.NewDeleteRoute("/images/{name:.*}", r.deleteImages),
+	}
+}
+```
+进入对应的postImageCreate函数，这里主要进行了一些参数的解析，包括请求的image信息和auth信息，解析后直接调用后端的PullImage函数：
+```
+	//解析请求参数
+	var (
+		image    = r.Form.Get("fromImage")  //hello-world
+		repo     = r.Form.Get("repo") //test
+		tag      = r.Form.Get("tag") //1.0
+		message  = r.Form.Get("message")
+		err      error
+		output   = ioutils.NewWriteFlusher(w)
+		platform *specs.Platform
+	)
+	...
+	if image != "" { // pull
+		metaHeaders := map[string][]string{}
+		for k, v := range r.Header {
+			if strings.HasPrefix(k, "X-Meta-") {
+				metaHeaders[k] = v
+			}
+		}
+
+		authEncoded := r.Header.Get("X-Registry-Auth")
+		authConfig := &types.AuthConfig{}
+		//解析auth
+		if authEncoded != "" {
+			authJSON := base64.NewDecoder(base64.URLEncoding, strings.NewReader(authEncoded))
+			if err := json.NewDecoder(authJSON).Decode(authConfig); err != nil {
+				authConfig = &types.AuthConfig{}
+			}
+		}
+		//核心函数，image=hello-word tag=1.0 platform= metaHeaders=X-Meta相关 authConfig认证 output为stdout输出
+		err = s.backend.PullImage(ctx, image, tag, platform, metaHeaders, authConfig, output)
+	} else {
+		//import
+	}
+	if err != nil {
+		...
+		_, _ = output.Write(streamformatter.FormatError(err))
+	}
+
+	return nil
+```
+
+

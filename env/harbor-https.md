@@ -1,19 +1,19 @@
 see https://github.com/goharbor/harbor/blob/master/docs/configure_https.md
 
-1.  选择一个工作目录，生成 CA的 rsa私钥：
+1.  选择一个工作目录，生成 CA的 rsa私钥ca.key：
 	`openssl genrsa -out ca.key 4096`
-2. 生成CA证书：
+2. 生成CA证书ca.crt：
    ` openssl req -x509 -new -nodes -sha512 -days 3650  -subj 
     "/C=CN/ST=Beijing/L=Beijing/O=example/OU=Personal/CN=yourdomain.com"   -key ca.key  - 
     out ca.crt`
     其中yourdomain.com为CA主体鉴别信息
-3. 生成服务器rsa私钥，其中yourdomain.com为服务器主体信息，我设置成了harbor，便于区别：
+3. 生成服务器rsa私钥yourdoamin.com.key，其中yourdomain.com为服务器主体信息，我设置成了harbor，便于区别：
 	`openssl genrsa -out yourdomain.com.key 4096`
 4. 创建服务器的crs 证书请求信息，基于自身rsa私钥，其中CN域为服务器主体信息，后面的key文件命名为了harbor，下同：
     `openssl req -sha512 -new  -subj 
     "/C=CN/ST=Beijing/L=Beijing/O=example/OU=Personal/CN=yourdomain.com"  -key 
     yourdomain.com.key  -out yourdomain.com.csr`
-5. 基于crs请求信息和CA私钥，创建服务器证书,注意分2步，第一步在当前工作目录创建一个v3.ext文 
+5. 基于crs请求信息和CA私钥，创建服务器证书yourdomain.com.crt,注意分2步，第一步在当前工作目录创建一个v3.ext文 
     件并填充以下内容，标注按X509v3版本生成证书。其中[alt_names]我指定了Harbor的ip：
 	
 	`cat > v3.ext <<-EOF
@@ -31,7 +31,7 @@ see https://github.com/goharbor/harbor/blob/master/docs/configure_https.md
         in yourdomain.com.csr -out yourdomain.com.crt`
 
  	将服务器证书以Key 拷贝至服务器的/data/cert目录 cp yourdomain.com.crt /data/cert/  & cp yourdomain.com.key /data/cert/
-6. 配置docker，将服务端的crt转换成客户端用的cert：
+6. 配置docker，将服务端的crt转换成**docker客户端用的cert**yourdomain.com.cert：
 	`openssl x509 -inform PEM -in yourdomain.com.crt -out yourdomain.com.cert`
 7. 将证书信息放在docker的配置目录下
 	`cp yourdomain.com.cert /etc/docker/certs.d/yourdomain.com/

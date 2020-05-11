@@ -51,7 +51,9 @@ nginx ingress controller的部署方式有:
 
 ### KongIngress
 
-k8s的ingress只是提供了一个host/path路由的功能。作为ingress的补充，kongIngress在原有k8s中ingress的基础上，通过更改kong upstream/service/route的属性，提供了对其k8s ingress/service描述规则进行更改的功能，比如配置path的匹配规则。其**作用对象为k8s的service和ingress**.
+k8s的ingress只是提供了一个host/path路由的功能，并且只是一个简单的映射，没有描述api的全部功能，换句话说，在kong中，描述一个api对应于route对象，但如果以k8s部署kong,route对应于ingress，所以当需要在k8s中描述具体api时，需要额外功能。
+
+作为ingress的补充，kongIngress在原有k8s中ingress的基础上，通过更改kong upstream/service/route的属性，提供了对其k8s ingress/service描述规则的补充，比如配置path的匹配规则。其**作用对象为k8s的service和ingress**.
 
 在使用时，通过在k8s的ingress/service中加入kongIngress的annotations进行扩展。具体用法为：
 ```configuration.konghq.com: kong-ingress-resource-name```
@@ -70,7 +72,7 @@ apiVersion: configuration.konghq.com/v1
 kind: KongIngress
 metadata:
   name: configuration-demo
-upstream:
+upstream: #upstream 涉及的属性，如loadbalance策略
   slots: 10
   hash_on: none
   hash_fallback: none
@@ -105,14 +107,14 @@ upstream:
         - 503
         tcp_failures: 0
         timeouts: 0
-proxy:
+proxy: #代理策略
   protocol: http
   path: /
   connect_timeout: 10000
   retries: 10
   read_timeout: 10000
   write_timeout: 10000
-route:
+route: #路由策略
   methods:
   - POST
   - GET

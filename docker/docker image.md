@@ -250,4 +250,233 @@ func (r *imageRouter) initRoutes() {
 	return nil
 ```
 
+PullImage函数在registryBackend接口中定义，由ImageService实现。在函数内部，经过解析image/tag以及auth信息，调用pullImageWithReference来进行,这个函数的主要作用是定义了两个chan,progressChan用于打印pull进度，writesDone是个无缓冲chan，用于标识完成pull。cancelFunc则定义了一组资源清理的逻辑，当使用goroutine读取进度progress过程中出错，则进行资源清理。最后，在进行了进一步的封装后，调用distribution.Pull函数。
+
+```
+	progressChan := make(chan progress.Progress, 100)
+	writesDone := make(chan struct{})
+	ctx, cancelFunc := context.WithCancel(ctx)
+
+	go func() {
+		progressutils.WriteDistributionProgress(cancelFunc, outStream, progressChan)
+		...
+	}()
+
+	imagePullConfig := &distribution.ImagePullConfig{
+		Config: distribution.Config{
+			MetaHeaders:      metaHeaders,
+			AuthConfig:       authConfig,
+			ProgressOutput:   progress.ChanOutput(progressChan),
+			RegistryService:  i.registryService,
+			ImageEventLogger: i.LogImageEvent,
+			MetadataStore:    i.distributionMetadataStore,
+			ImageStore:       distribution.NewImageConfigStoreFromStore(i.imageStore),
+			ReferenceStore:   i.referenceStore,
+		},
+		DownloadManager: i.downloadManager,
+		Schema2Types:    distribution.ImageTypes,
+		Platform:        platform,
+	}
+
+	err := distribution.Pull(ctx, ref, imagePullConfig)
+	<-writesDone
+```
+
+进入distribution.Pull函数，其中是一个解析过程，获取repo和endpoints，并根据解析的endpoints信息，得到一个v2Puller对象*（注意这个v2puller是在new中写死的？是否可以解耦）*,这个对象实现了Puller接口，代码如下：
+
+```
+	//根据ref信息解析出test/hello-world
+	repoInfo, err := imagePullConfig.RegistryService.ResolveRepository(ref)
+	....
+	//解析出test， 注意此时的endpoints为一个切片，原因为docker pull 后可跟多个镜像参数 so 多endpoint？
+	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
+	...
+	for _, endpoint := range endpoints {
+		//根据api版本初始不同配置信息
+		...
+		puller, err := newPuller(endpoint, repoInfo, imagePullConfig)
+		...
+		if err := puller.Pull(ctx, ref, imagePullConfig.Platform); err != nil {
+			...error handler
+		}
+```
+
+再看v2puller对于pull的实现，首先根据之前的配置和参数，New了一个Repository对象，这个对象里主要是创建http client，并加入认证信息，以及根据endpoint进行了ping操作：
+
+```
+	p.repo, p.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "pull")
+
+	if err = p.pullV2Repository(ctx, ref, platform); err != nil {
+		...
+	}
+	return err
+```
+
+进入pullV2Repository,根据在image参数中是否含有tag走了不同的分支，不再赘述，这个函数最终又调用了pullV2Tag。这是pull过程的核心逻辑。
+
+在分析下面的代码前，先了解下docker对于image的存储，一般默认安装启动Docker，所有相关的文件都会存储在/var/lib/docker下面，与Image相关的目录主要是image，再下一层是驱动目录名称，Ubuntu 18.04/Docker19.03 为[overlay2](https://docs.docker.com/storage/storagedriver/select-storage-driver/)
+
+定位到/image/overlay2/后，使用`tree`查看目录结构，可以看到：
+
+```
+.
+├── distribution
+│   ├── diffid-by-digest
+│   │   └── sha256
+│   └── v2metadata-by-diffid
+│       └── sha256
+├── imagedb
+│   ├── content
+│   │   └── sha256
+│   └── metadata
+│       └── sha256
+├── layerdb
+│   ├── mounts
+│   │   ├── 1d61dd1a08616425fea6a39dd8b9f0f5d710555bb0a5a3ae51348501f5a57e2a
+...
+│   ├── sha256
+│   │   ├── 0232ab5d1efed0e8864d830b4179ac3aa3132d83852b41b3e36c92496115320a、
+...
+│   └── tmp
+└── repositories.json
+```
+
+1. **repositories.json**文件中存储了本地的所有镜像，里面主要涉及了image的name/tag以及image的sha256值，大致内容如下：
+
+```
+{"Repositories":{"goharbor/chartmuseum-photon":{"goharbor/chartmuseum-photon:v0.9.0-v1.8.2":"sha256:e72f3e685a37b15a15a0ae1fe1570c4a2e3630df776c48e82e4ef15a3d7c9cba"...
+```
+
+2. **imagedb**目录中存放了镜像信息，每个镜像目录名为sha256值。在imagedb下有两个子目录，**metadata**目录保存每个镜像的parent镜像ID。另一个是**content**目录，该目录下存储了镜像的JSON格式描述信息，比如cat一个具体的content下镜像文件，可以看到：
+
+3. **layerdb**根据命名即可理解该目录主要用来存储Docker的Layer信息
+
+4. **distribution**目录包含了Layer层diif id和digest之间的对应关系，其中digest描述了layer层在docker仓库的id,可以通过Layer的diff id找到对应的digest，并且包含了生成该digest的源仓库。
+
+
+```
+manSvc, err := p.repo.Manifests(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	var (
+		manifest    distribution.Manifest
+		tagOrDigest string // Used for logging/progress only
+	)
+	if digested, isDigested := ref.(reference.Canonical); isDigested {
+		manifest, err = manSvc.Get(ctx, digested.Digest())
+		if err != nil {
+			return false, err
+		}
+		tagOrDigest = digested.Digest().String()
+	} else if tagged, isTagged := ref.(reference.NamedTagged); isTagged {
+		manifest, err = manSvc.Get(ctx, "", distribution.WithTag(tagged.Tag()))
+		if err != nil {
+			return false, allowV1Fallback(err)
+		}
+		tagOrDigest = tagged.Tag()
+	} else {
+		return false, fmt.Errorf("internal error: reference has neither a tag nor a digest: %s", reference.FamiliarString(ref))
+	}
+
+	if manifest == nil {
+		return false, fmt.Errorf("image manifest does not exist for tag or digest %q", tagOrDigest)
+	}
+
+	if m, ok := manifest.(*schema2.DeserializedManifest); ok {
+		var allowedMediatype bool
+		for _, t := range p.config.Schema2Types {
+			if m.Manifest.Config.MediaType == t {
+				allowedMediatype = true
+				break
+			}
+		}
+		if !allowedMediatype {
+			configClass := mediaTypeClasses[m.Manifest.Config.MediaType]
+			if configClass == "" {
+				configClass = "unknown"
+			}
+			return false, invalidManifestClassError{m.Manifest.Config.MediaType, configClass}
+		}
+	}
+
+	// If manSvc.Get succeeded, we can be confident that the registry on
+	// the other side speaks the v2 protocol.
+	p.confirmedV2 = true
+
+	logrus.Debugf("Pulling ref from V2 registry: %s", reference.FamiliarString(ref))
+	progress.Message(p.config.ProgressOutput, tagOrDigest, "Pulling from "+reference.FamiliarName(p.repo.Named()))
+
+	var (
+		id             digest.Digest
+		manifestDigest digest.Digest
+	)
+
+	switch v := manifest.(type) {
+	case *schema1.SignedManifest:
+		if p.config.RequireSchema2 {
+			return false, fmt.Errorf("invalid manifest: not schema2")
+		}
+
+		// give registries time to upgrade to schema2 and only warn if we know a registry has been upgraded long time ago
+		// TODO: condition to be removed
+		if reference.Domain(ref) == "docker.io" {
+			msg := fmt.Sprintf("Image %s uses outdated schema1 manifest format. Please upgrade to a schema2 image for better future compatibility. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", ref)
+			logrus.Warn(msg)
+			progress.Message(p.config.ProgressOutput, "", msg)
+		}
+
+		id, manifestDigest, err = p.pullSchema1(ctx, ref, v, platform)
+		if err != nil {
+			return false, err
+		}
+	case *schema2.DeserializedManifest:
+		id, manifestDigest, err = p.pullSchema2(ctx, ref, v, platform)
+		if err != nil {
+			return false, err
+		}
+	case *ocischema.DeserializedManifest:
+		id, manifestDigest, err = p.pullOCI(ctx, ref, v, platform)
+		if err != nil {
+			return false, err
+		}
+	case *manifestlist.DeserializedManifestList:
+		id, manifestDigest, err = p.pullManifestList(ctx, ref, v, platform)
+		if err != nil {
+			return false, err
+		}
+	default:
+		return false, invalidManifestFormatError{}
+	}
+
+	progress.Message(p.config.ProgressOutput, "", "Digest: "+manifestDigest.String())
+
+	if p.config.ReferenceStore != nil {
+		oldTagID, err := p.config.ReferenceStore.Get(ref)
+		if err == nil {
+			if oldTagID == id {
+				return false, addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id)
+			}
+		} else if err != refstore.ErrDoesNotExist {
+			return false, err
+		}
+
+		if canonical, ok := ref.(reference.Canonical); ok {
+			if err = p.config.ReferenceStore.AddDigest(canonical, id, true); err != nil {
+				return false, err
+			}
+		} else {
+			if err = addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id); err != nil {
+				return false, err
+			}
+			if err = p.config.ReferenceStore.AddTag(ref, id, true); err != nil {
+				return false, err
+			}
+		}
+	}
+	return true, nil
+```
+
+
 

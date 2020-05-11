@@ -163,3 +163,4 @@ curl -i -H "Authorization: Bearer ${USER_JWT}" $PROXY_IP/get
 {"message":"You cannot consume this service"}
 ```
 
+

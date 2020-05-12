@@ -312,7 +312,7 @@ PullImage函数在registryBackend接口中定义，由ImageService实现。在�
 	return err
 ```
 
-进入pullV2Repository,根据在image参数中是否含有tag走了不同的分支，不再赘述，这个函数最终又调用了pullV2Tag。这是pull过程的核心逻辑。在了解核心逻辑前，需要对docker image的各个概念以及存储有一个简单了解，请移步
+进入pullV2Repository,根据在image参数中是否含有tag走了不同的分支，不再赘述，这个函数最终又调用了pullV2Tag。这是pull过程的核心逻辑。在了解核心逻辑前，需要对docker image的各个概念以及存储有一个简单了解，[请移步](https://github.com/jzdwk/notes/blob/master/docker/docker%20image%20store.md)
 
 ```
 manSvc, err := p.repo.Manifests(ctx)

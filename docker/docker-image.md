@@ -312,8 +312,8 @@ PullImage函数在registryBackend接口中定义，由ImageService实现。在�
 	return err
 ```
 
-进入pullV2Repository,根据在image参数中是否含有tag走了不同的分支，不再赘述，这个函数最终又调用了pullV2Tag。这是pull过程的核心逻辑。在了解核心逻辑前，需要对docker image的各个概念以及存储有一个简单了解，[请移步](https://github.com/jzdwk/notes/blob/master/docker/docker%20image%20store.md)
-
+进入pullV2Repository,根据在image参数中是否含有tag走了不同的分支，不再赘述，这个函数最终又调用了pullV2Tag。这是pull过程的核心逻辑。在了解核心逻辑前，需要对docker image的各个概念以及存储有一个简单了解，[请移步](https://github.com/jzdwk/notes/blob/master/docker/docker-image-store.md)
+ 
 docker pull从整体上来说，做了以下工作：
 
 1. docker daemon发送image的name:tag/digest给registry服务器，服务器根据收到的image info，找到相应image的manifest，然后将manifest返回给docker daemon
@@ -334,8 +334,11 @@ docker pull从整体上来说，做了以下工作：
 
 9. 等所有的layer都下载完成后，整个image下载完成，就可以使用了
 
+下面看一下pull的核心代码，
+[manifest](https://docs.docker.com/registry/spec/manifest-v2-2/)
+
 ```
-manSvc, err := p.repo.Manifests(ctx)
+    manSvc, err := p.repo.Manifests(ctx)
 	if err != nil {
 		return false, err
 	}

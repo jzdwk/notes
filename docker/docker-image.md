@@ -334,39 +334,107 @@ docker pull从整体上来说，做了以下工作：
 
 9. 等所有的layer都下载完成后，整个image下载完成，就可以使用了
 
-下面看一下pull的核心代码，
-[manifest](https://docs.docker.com/registry/spec/manifest-v2-2/)
+下面看一下pull的核心代码，首先，根据context生成一个manifest的service，[manifest](https://docs.docker.com/registry/spec/manifest-v2-2/) 主要用于描述一个镜像的组成信息，根据版本的不同(schema1/2,2通过引入manifest list，增加了多架构下的image描述)，其解析逻辑存在差异。在解析ref时，根据docker pull的参数的不同，分为了digest和tag两种，这也从侧面说明了pull的不同方式：
 
 ```
     manSvc, err := p.repo.Manifests(ctx)
-	if err != nil {
-		return false, err
-	}
-
+	...
 	var (
 		manifest    distribution.Manifest
 		tagOrDigest string // Used for logging/progress only
 	)
 	if digested, isDigested := ref.(reference.Canonical); isDigested {
 		manifest, err = manSvc.Get(ctx, digested.Digest())
-		if err != nil {
-			return false, err
-		}
+		...
 		tagOrDigest = digested.Digest().String()
 	} else if tagged, isTagged := ref.(reference.NamedTagged); isTagged {
 		manifest, err = manSvc.Get(ctx, "", distribution.WithTag(tagged.Tag()))
-		if err != nil {
-			return false, allowV1Fallback(err)
-		}
+		...
 		tagOrDigest = tagged.Tag()
 	} else {
 		return false, fmt.Errorf("internal error: reference has neither a tag nor a digest: %s", reference.FamiliarString(ref))
 	}
+```
 
-	if manifest == nil {
-		return false, fmt.Errorf("image manifest does not exist for tag or digest %q", tagOrDigest)
+上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息。并返回一个manifest。注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
+```
+	...
+	//根据pull的参数，赋值digestOrTag
+	for _, option := range options {
+		switch opt := option.(type) {
+		case distribution.WithTagOption:
+			digestOrTag = opt.Tag
+			ref, err = reference.WithTag(ms.name, opt.Tag)
+			...
+		case contentDigestOption:
+			contentDgst = opt.digest
+		case distribution.WithManifestMediaTypesOption:
+			mediaTypes = opt.MediaTypes
+		default:
+			... err handle
+		}
 	}
+	//http操作
+	...
+	u, err := ms.ub.BuildManifestURL(ref)
+	...
+	req, err := http.NewRequest("GET", u, nil)
+	...
+	resp, err := ms.client.Do(req)
+	...
+	if resp.StatusCode == http.StatusNotModified {
+	...
+	//成功后 处理manifest
+	} else if SuccessStatus(resp.StatusCode) {
+		if contentDgst != nil {
+			dgst, err := digest.Parse(resp.Header.Get("Docker-Content-Digest"))
+			...
+		}
+		mt := resp.Header.Get("Content-Type")
+		body, err := ioutil.ReadAll(resp.Body)
+		...
+		m, _, err := distribution.UnmarshalManifest(mt, body)
+		...
+		return m, nil
+	}
+	return nil, HandleErrorResponse(resp)
+```
+拿到manifest后，其内容类似于(manifest v2 schema2)：
+```
+{
+ {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+    "config": {
+        "mediaType": "application/vnd.docker.container.image.v1+json",
+        "size": 7023,
+        "digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+    },
+    "layers": [
+        {
+            "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            "size": 32654,
+            "digest": "sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f"
+        },
+        {
+            "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            "size": 16724,
+            "digest": "sha256:3c3a4604a545cdc127456d94e421cd355bca5b528f4a9c1905b15da2eb4a4c6b"
+        },
+        {
+            "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            "size": 73109,
+            "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736"
+        }
+    ]
+}
+}
+```
+从中可以看到image基本信息以及layer信息。接下来就是解析manifest，并使用manifest的信息就pull image：
 
+```
+	...
+	//反序列化manifest，得到mediaType，并与docker daemon可支持的type做比对
 	if m, ok := manifest.(*schema2.DeserializedManifest); ok {
 		var allowedMediatype bool
 		for _, t := range p.config.Schema2Types {
@@ -383,56 +451,195 @@ docker pull从整体上来说，做了以下工作：
 			return false, invalidManifestClassError{m.Manifest.Config.MediaType, configClass}
 		}
 	}
-
-	// If manSvc.Get succeeded, we can be confident that the registry on
-	// the other side speaks the v2 protocol.
-	p.confirmedV2 = true
-
-	logrus.Debugf("Pulling ref from V2 registry: %s", reference.FamiliarString(ref))
+	//这句就是我们经常在stdout看到的
 	progress.Message(p.config.ProgressOutput, tagOrDigest, "Pulling from "+reference.FamiliarName(p.repo.Named()))
-
-	var (
-		id             digest.Digest
-		manifestDigest digest.Digest
-	)
-
+	...
+	//不同格式的manifest的pull
 	switch v := manifest.(type) {
 	case *schema1.SignedManifest:
-		if p.config.RequireSchema2 {
-			return false, fmt.Errorf("invalid manifest: not schema2")
-		}
-
-		// give registries time to upgrade to schema2 and only warn if we know a registry has been upgraded long time ago
-		// TODO: condition to be removed
-		if reference.Domain(ref) == "docker.io" {
-			msg := fmt.Sprintf("Image %s uses outdated schema1 manifest format. Please upgrade to a schema2 image for better future compatibility. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", ref)
-			logrus.Warn(msg)
-			progress.Message(p.config.ProgressOutput, "", msg)
-		}
-
+		...
 		id, manifestDigest, err = p.pullSchema1(ctx, ref, v, platform)
-		if err != nil {
-			return false, err
-		}
+	...
 	case *schema2.DeserializedManifest:
 		id, manifestDigest, err = p.pullSchema2(ctx, ref, v, platform)
-		if err != nil {
-			return false, err
-		}
+		...
 	case *ocischema.DeserializedManifest:
 		id, manifestDigest, err = p.pullOCI(ctx, ref, v, platform)
-		if err != nil {
-			return false, err
-		}
+		...
 	case *manifestlist.DeserializedManifestList:
 		id, manifestDigest, err = p.pullManifestList(ctx, ref, v, platform)
-		if err != nil {
-			return false, err
-		}
+		...
 	default:
 		return false, invalidManifestFormatError{}
 	}
+```
+在本环境下，manifest的版本为schemav2因此进入`p.pullSchema2(ctx, ref, v, platform)`函数。该函数的主要做了一个校验，当pull后的参数是digest时，保证manifest的digest和请求的一致，如果使用非digest的pull，则直接得到manifest的digest并返回。之后根据这个digest，调用函数pullSchema2Layers:
+```
+	if _, err := p.config.ImageStore.Get(target.Digest); err == nil {
+		
+		return target.Digest, nil
+	}
+```
 
+首先第一句，如果这个digest在本地有，说明镜像在本地有，就不再继续，直接返回。
+	var descriptors []xfer.DownloadDescriptor
+
+	// Note that the order of this loop is in the direction of bottom-most
+	// to top-most, so that the downloads slice gets ordered correctly.
+	for _, d := range layers {
+		layerDescriptor := &v2LayerDescriptor{
+			digest:            d.Digest,
+			repo:              p.repo,
+			repoInfo:          p.repoInfo,
+			V2MetadataService: p.V2MetadataService,
+			src:               d,
+		}
+
+		descriptors = append(descriptors, layerDescriptor)
+	}
+
+	configChan := make(chan []byte, 1)
+	configErrChan := make(chan error, 1)
+	layerErrChan := make(chan error, 1)
+	downloadsDone := make(chan struct{})
+	var cancel func()
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+
+	// Pull the image config
+	go func() {
+		configJSON, err := p.pullSchema2Config(ctx, target.Digest)
+		if err != nil {
+			configErrChan <- ImageConfigPullError{Err: err}
+			cancel()
+			return
+		}
+		configChan <- configJSON
+	}()
+
+	var (
+		configJSON       []byte          // raw serialized image config
+		downloadedRootFS *image.RootFS   // rootFS from registered layers
+		configRootFS     *image.RootFS   // rootFS from configuration
+		release          func()          // release resources from rootFS download
+		configPlatform   *specs.Platform // for LCOW when registering downloaded layers
+	)
+
+	layerStoreOS := runtime.GOOS
+	if platform != nil {
+		layerStoreOS = platform.OS
+	}
+
+	// https://github.com/docker/docker/issues/24766 - Err on the side of caution,
+	// explicitly blocking images intended for linux from the Windows daemon. On
+	// Windows, we do this before the attempt to download, effectively serialising
+	// the download slightly slowing it down. We have to do it this way, as
+	// chances are the download of layers itself would fail due to file names
+	// which aren't suitable for NTFS. At some point in the future, if a similar
+	// check to block Windows images being pulled on Linux is implemented, it
+	// may be necessary to perform the same type of serialisation.
+	if runtime.GOOS == "windows" {
+		configJSON, configRootFS, configPlatform, err = receiveConfig(p.config.ImageStore, configChan, configErrChan)
+		if err != nil {
+			return "", err
+		}
+		if configRootFS == nil {
+			return "", errRootFSInvalid
+		}
+		if err := checkImageCompatibility(configPlatform.OS, configPlatform.OSVersion); err != nil {
+			return "", err
+		}
+
+		if len(descriptors) != len(configRootFS.DiffIDs) {
+			return "", errRootFSMismatch
+		}
+		if platform == nil {
+			// Early bath if the requested OS doesn't match that of the configuration.
+			// This avoids doing the download, only to potentially fail later.
+			if !system.IsOSSupported(configPlatform.OS) {
+				return "", fmt.Errorf("cannot download image with operating system %q when requesting %q", configPlatform.OS, layerStoreOS)
+			}
+			layerStoreOS = configPlatform.OS
+		}
+
+		// Populate diff ids in descriptors to avoid downloading foreign layers
+		// which have been side loaded
+		for i := range descriptors {
+			descriptors[i].(*v2LayerDescriptor).diffID = configRootFS.DiffIDs[i]
+		}
+	}
+
+	if p.config.DownloadManager != nil {
+		go func() {
+			var (
+				err    error
+				rootFS image.RootFS
+			)
+			downloadRootFS := *image.NewRootFS()
+			rootFS, release, err = p.config.DownloadManager.Download(ctx, downloadRootFS, layerStoreOS, descriptors, p.config.ProgressOutput)
+			if err != nil {
+				// Intentionally do not cancel the config download here
+				// as the error from config download (if there is one)
+				// is more interesting than the layer download error
+				layerErrChan <- err
+				return
+			}
+
+			downloadedRootFS = &rootFS
+			close(downloadsDone)
+		}()
+	} else {
+		// We have nothing to download
+		close(downloadsDone)
+	}
+
+	if configJSON == nil {
+		configJSON, configRootFS, _, err = receiveConfig(p.config.ImageStore, configChan, configErrChan)
+		if err == nil && configRootFS == nil {
+			err = errRootFSInvalid
+		}
+		if err != nil {
+			cancel()
+			select {
+			case <-downloadsDone:
+			case <-layerErrChan:
+			}
+			return "", err
+		}
+	}
+
+	select {
+	case <-downloadsDone:
+	case err = <-layerErrChan:
+		return "", err
+	}
+
+	if release != nil {
+		defer release()
+	}
+
+	if downloadedRootFS != nil {
+		// The DiffIDs returned in rootFS MUST match those in the config.
+		// Otherwise the image config could be referencing layers that aren't
+		// included in the manifest.
+		if len(downloadedRootFS.DiffIDs) != len(configRootFS.DiffIDs) {
+			return "", errRootFSMismatch
+		}
+
+		for i := range downloadedRootFS.DiffIDs {
+			if downloadedRootFS.DiffIDs[i] != configRootFS.DiffIDs[i] {
+				return "", errRootFSMismatch
+			}
+		}
+	}
+
+	imageID, err := p.config.ImageStore.Put(configJSON)
+	if err != nil {
+		return "", err
+	}
+
+	return imageID, nil
+```
 	progress.Message(p.config.ProgressOutput, "", "Digest: "+manifestDigest.String())
 
 	if p.config.ReferenceStore != nil {

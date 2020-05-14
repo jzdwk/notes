@@ -102,7 +102,7 @@ type cliConfig struct {
 }
 ```
 
-2. 在解析完client端的配置后，根据配置来创建两个client，一个是k8s的client，用于和k8s apiserver通信，另一个是kong client。首先，根据api server的APIServerHost和KubeConfigFilePath配置kubeClient，这里使用了[client-go](https://github.com/kubernetes/client-go):
+2. 在解析完client端的配置后，根据配置来创建两个client，一个是k8s的client，用于和k8s apiserver通信，另一个是kong client。首先，根据api server的APIServerHost和KubeConfigFilePath配置kubeClient，这里使用了[client-go](https://github.com/kubernetes/client-go) :
 
 ```
     ...
@@ -124,7 +124,87 @@ type cliConfig struct {
 	}
 ```
 
-注意上述代码除了kubeClient，额外处理了config中PublishService与WatchNamespace，当以上配置不为空，测试对应的k8s中是否设置。
+注意上述代码除了kubeClient，额外处理了config中PublishService与WatchNamespace，当以上配置不为空，测试对应的k8s中是否设置。另外，createApiserverClient还返回了kubeCfg,这个kubeCfg结构体由client-go定义，主要存储了传递给kube client的信息，结构体如下：
+
+```
+type Config struct {
+	// Host must be a host string
+	Host string
+	// APIPath is a sub-path that points to an API root.
+	APIPath string
+	// ContentConfig contains settings that affect how objects are transformed when
+	// sent to the server.
+	ContentConfig
+	// Server requires Basic authentication
+	Username string
+	Password string
+	// Server requires Bearer authentication. This client will not attempt to use
+	// refresh tokens for an OAuth2 flow.
+	// TODO: demonstrate an OAuth2 compatible client.
+	BearerToken string
+
+	// Path to a file containing a BearerToken.
+	// If set, the contents are periodically read.
+	// The last successfully read value takes precedence over BearerToken.
+	BearerTokenFile string
+
+	// Impersonate is the configuration that RESTClient will use for impersonation.
+	Impersonate ImpersonationConfig
+
+	// Server requires plugin-specified authentication.
+	AuthProvider *clientcmdapi.AuthProviderConfig
+
+	// Callback to persist config for AuthProvider.
+	AuthConfigPersister AuthProviderConfigPersister
+
+	// Exec-based authentication provider.
+	ExecProvider *clientcmdapi.ExecConfig
+
+	// TLSClientConfig contains settings to enable transport layer security
+	TLSClientConfig
+
+	// UserAgent is an optional field that specifies the caller of this request.
+	UserAgent string
+
+	// DisableCompression bypasses automatic GZip compression requests to the
+	// server.
+	DisableCompression bool
+
+	// Transport may be used for custom HTTP behavior. This attribute may not
+	// be specified with the TLS client certificate options. Use WrapTransport
+	// to provide additional per-server middleware behavior.
+	Transport http.RoundTripper
+	// WrapTransport will be invoked for custom HTTP behavior after the underlying
+	// transport is initialized (either the transport created from TLSClientConfig,
+	// Transport, or http.DefaultTransport). The config may layer other RoundTrippers
+	// on top of the returned RoundTripper.
+	//
+	// A future release will change this field to an array. Use config.Wrap()
+	// instead of setting this value directly.
+	WrapTransport transport.WrapperFunc
+
+	// QPS indicates the maximum QPS to the master from this client.
+	// If it's zero, the created RESTClient will use DefaultQPS: 5
+	QPS float32
+
+	// Maximum burst for throttle.
+	// If it's zero, the created RESTClient will use DefaultBurst: 10.
+	Burst int
+
+	// Rate limiter for limiting connections to the master from this client. If present overwrites QPS/Burst
+	RateLimiter flowcontrol.RateLimiter
+
+	// The maximum length of time to wait before giving up on a server request. A value of zero means no timeout.
+	Timeout time.Duration
+
+	// Dial specifies the dial function for creating unencrypted TCP connections.
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
+
+	// Version forces a specific version to be used (if registered)
+	// Do we need this?
+	// Version string
+}
+```
 
 3. 接下来创建kong client,首先，解析cliConfig内容并封装为controller.Configuration，后者包含了kongIngress需要的所有配置以及client。其结构如下：
 
@@ -133,7 +213,7 @@ type cliConfig struct {
 	Kong //封装了kong各个组件的service
 
 	KubeClient       clientset.Interface //kong client
-	KongConfigClient configurationClientSet.Interface 
+	KongConfigClient configurationClientSet.Interface  
 	KnativeClient    knativeClientSet.Interface
 
 	ResyncPeriod      time.Duration
@@ -224,33 +304,37 @@ type cliConfig struct {
 	controllerConfig.Kong.Client = kongClient
 ```
 
-5. 两个client初始化完毕后，将创建informer用于监听api server：
+5. 两个client初始化完毕后，将创建informer用于监听api server，首先根据之前的kubeClient创建一个coreInformerFactory，这个对象主要用于k8s自带的资源操作。
 
-	
-
-	err = discovery.ServerSupportsVersion(kubeClient.Discovery(), schema.GroupVersion{
-		Group:   "networking.k8s.io",
-		Version: "v1beta1",
-	})
-	if err == nil {
-		controllerConfig.UseNetworkingV1beta1 = true
-	}
+```
+	...
 	coreInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		kubeClient,
 		cliConfig.SyncPeriod,
 		informers.WithNamespace(cliConfig.WatchNamespace),
 	)
-	confClient, _ := configurationclientv1.NewForConfig(kubeCfg)
-	controllerConfig.KongConfigClient = confClient
+```
 
+另外，由于在kong中定义了crd，同样需要对这些资源进行操作。所以，根据之前返回的kubeCfg，重新封装了一个ClientSet对象`confClient, _ := configurationclientv1.NewForConfig(kubeCfg)`，这个Clientset继承了client-go的client：
+```
+	type Clientset struct {
+		*discovery.DiscoveryClient //client-go
+		configurationV1      *configurationv1.ConfigurationV1Client //v1组client
+		configurationV1beta1 *configurationv1beta1.ConfigurationV1beta1Client //v1beta1组client
+	}		
+```
+然后，根据这个clientset创建kongInformerFactory：
+```
+	controllerConfig.KongConfigClient = confClient
 	kongInformerFactory := configurationinformer.NewSharedInformerFactoryWithOptions(
 		confClient,
 		cliConfig.SyncPeriod,
 		configurationinformer.WithNamespace(cliConfig.WatchNamespace),
 	)
-
+```
+然后是Knative的相关设置，Knative的[相关资料](https://knative.dev/docs/) 参考，内容待补充。
+```
 	knativeClient, _ := knativeclient.NewForConfig(kubeCfg)
-
 	var knativeInformerFactory knativeinformer.SharedInformerFactory
 	err = discovery.ServerSupportsVersion(knativeClient.Discovery(), schema.GroupVersion{
 		Group:   "networking.internal.knative.dev",
@@ -265,6 +349,9 @@ type cliConfig struct {
 			knativeinformer.WithNamespace(cliConfig.WatchNamespace),
 		)
 	}
+```
+
+6. InformerFactory创建完毕后，
 
 	var synced []cache.InformerSynced
 	updateChannel := channels.NewRingChannel(1024)

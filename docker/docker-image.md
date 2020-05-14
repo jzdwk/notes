@@ -54,35 +54,33 @@ Filesystem)，较为常见的有UnionFS、aufs 、OverlayFS 等
 
 基于此，docker在所创建的容器中使用文件系统时，从内核角度来看，将出现rootfs以及一个可读写的文件系统，并通过union mount进行合并。所有的配置、install都是在读写层进行的，即使是删除操作，也是在读写层进行，只读层永远不会变。对于用户来说，感知不到这两个层次，只会通过fs的COW (copy-on-write)特性看到操作结果。
 
-### image
+### image layer
 
-最为简单地解释image,它就是Docker容器中只读文件系统rootfs的一部分。Docker容器的rootfs可以由多个image 来构成。多个image构成 rootfs的方式依然沿用Union Mount技术。下例为镜像层次从上至下：
+最为简单地解释image layer,它就是Docker容器中只读文件系统rootfs的一部分。Docker容器的rootfs可以由多个image layer 来构成。多个image layer构成 rootfs的方式依然沿用Union Mount技术。下例为镜像层次从上至下：
 
-- image_n: /lib /etc
-- image_2：/media /opt /home
-- image_1：/var /boot /proc
+- image_layer_n: /lib /etc
+- image_layer_2：/media /opt /home
+- image_layer_1：/var /boot /proc
 
-比如上面的例子，rootfs被分成了n层，每一层包含其中的一部分，每一层的image都叠加在另一个image之上。基于以上概念，docker iamge产生两种概念:
+比如上面的例子，rootfs被分成了n层，每一层包含其中的一部分，每一层的image layer都叠加在另一个image layer之上。基于以上概念，docker iamge layer产生两种概念:
 
-- 父镜像：其余镜像都依赖于其底下的一个或多个镜像，Docker将下一层的镜像称为上一层镜像的父镜像。如image_1是image_2的父镜像。
+- 父镜像：其余镜像都依赖于其底下的一个或多个镜像，Docker将下一层的镜像称为上一层镜像的父镜像。如image_layer_1是image_layer_2的父镜像。
 
-- 基础镜像： rootfs最底层镜像，没有父镜像，如image_1。
+- 基础镜像： rootfs最底层镜像，没有父镜像，如image_layer_1。
 
 将一个整体的image拆分，就能够对子image进行复用，比如一个mysql和一个ubuntu的应用，复用的例子就如下：
 
-- image_0-> image_1-> image_3->image_4（ubuntu）->image_5(mysql)
+- image_layer_0-> image_layer_1-> image_layer_3->image_layer_4（ubuntu）->image_layer_5(mysql)
 
-需要注意，以上描述的多个image分层，都是**只读分层**
+需要注意，以上描述的多个image layer分层，都是**只读分层**
 
-### layer
+### container layer
 
 除了只读的image之外，Docker Daemon在创建容器时会在容器的rootfs之上，再挂载
-一层读写文件系统，而这一层文件系统也称为容器的一个layer ，常被称为 top layer， Docker还会在rootfs和top layer 之间再挂载一个layer ，这一个 layer中主要包含/etc/hosts,/etc/hostname 以及/etc/resolv.conf，一般这一个layer称为init layer。
-Docker容器中每一层只读的image 以及最上层可读写的文件系统，均称为layer。**layer的范畴比image多包含了最上层的读写文件系统。**
+一层读写文件系统，而这一层文件系统称为容器的container layer， Docker还会在rootfs和top layer之间再挂载一个layer ，这一个 layer中主要包含/etc/hosts,/etc/hostname 以及/etc/resolv.conf，一般这一个layer称为init layer。
 
-另外，根据image层次的复用逻辑，docker在设计时，**提供了commit和基于dockerfile的build来将top layer转变为image**。开发者可以基于某个镜像创
-建容器做开发工作，并且无论在开发周期的哪个时间点，都可以对容器进行commit,将所
-有top layer中的内容打包为一个image ，构成一个新的镜像。
+另外，根据image层次的复用逻辑，docker在设计时，**提供了commit和基于dockerfile的build来将container layer+下层image_layer转变为新的image**。开发者可以基于某个镜像创
+建容器做开发工作，并且无论在开发周期的哪个时间点，都可以对容器进行commit,将container内容打包为一个image ，构成一个新的镜像。
 
 ## pull image
 
@@ -384,7 +382,7 @@ docker pull从整体上来说，做了以下工作：
 	...
 	if resp.StatusCode == http.StatusNotModified {
 	...
-	//成功后 处理manifest
+	//成功后 处理manifest，注意从httpHeader的Docker-Content-Digest读取了digest的sha256值
 	} else if SuccessStatus(resp.StatusCode) {
 		if contentDgst != nil {
 			dgst, err := digest.Parse(resp.Header.Get("Docker-Content-Digest"))
@@ -430,6 +428,15 @@ docker pull从整体上来说，做了以下工作：
 }
 }
 ```
+这里有几个sha256值要注意区分，在这里做下记录：
+
+- **manifest digest**： 指的是manifest这个文件的sha256值，在http请求manifest后，通过resp的header进行了返回，header的key是`Docker-Content-Digest`也是在docker pull镜像时，stdout打印出的digest。
+
+- **image digest**：对应于Manifest内容的config.digest，它就是docker images输出的镜像ID(docker image)，镜像的ID是镜像配置文件的sha256，我们可以用它继续从Registry上下载镜像配置文件
+
+- **layer digest**： layer层的sha256，取值为把层里所有的文件打包成一个tar，对它计算sha256，得到的就是层id(LayerId)
+
+
 从中可以看到image基本信息以及layer信息。接下来就是解析manifest，并使用manifest的信息就pull image：
 
 ```

@@ -35,6 +35,7 @@ repositories.json文件中存储了本地的所有镜像，里面主要涉及了
 {"Repositories":{"goharbor/chartmuseum-photon":{"goharbor/chartmuseum-photon:v0.9.0-v1.8.2":"sha256:e72f3e685a37b15a15a0ae1fe1570c4a2e3630df776c48e82e4ef15a3d7c9cba"...
 ```
 
+
 ## imagedb
 
 imagedb目录中存放了镜像信息。在imagedb下有两个子目录，**metadata**目录保存每个镜像的parent镜像ID，即使用docker build时，就是`FROM XXX`的镜像XXX信息。另一个是**content**目录，该目录下存储了镜像的JSON格式描述信息，文件名以image的sha256形式保存。比如cat一个具体的content下busybox镜像文件，可以看到：
@@ -224,4 +225,6 @@ sha256:5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcabroot@myha
 docker image目录下的repositories.json是一个总的*索引文件*，记录了本地image的name:sha256 id的基本映射信息（把一个镜像tag为另一个时，两个tag的镜像都指向同一个image sha256 id，所以这个命令相当于只有修改了repositories.json）。根据这个sha256 id，可以在iamgedb里找到这个image的详细config以及parent信息。根据详细的config，则可以对应到这个image的layer上去，即diff_id。这个diff_id有两个用途：
 1. 根据diff_id，在layerdb中定位实际的layer存储位置、size、tar包
 2. 根据diff_id，在distribution中，得到仓库相关的digest信息，用于pull/push操作。
+
+
 

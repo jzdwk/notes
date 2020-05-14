@@ -128,7 +128,7 @@ imagedb目录中存放了镜像信息。在imagedb下有两个子目录，**meta
 
 - **history**：构建该镜像的所有历史命令
 
-- **rootfs**：该镜像包含的layer层的diff id，这里的值主要用于描述layer，但注意*此处的diff_id不一定等于layer下的对应id*,另外，diff_id的个数也不一定等于在Dockerfile中Run的命令数，因为*事实上，如果我们认为镜像是一个打包的静态OS，那么Layer可以认为是描述该OS的fs变化，即文件系统中文件或者目录发生的改变，有些命令并不会引起fs的变化，只是会写入该镜像的config中，在生成容器时读取即可，就不存在diff id*
+- **rootfs**：该镜像包含的layer层的diff id，这里的值主要用于描述layer，但注意*此处的diff_id不一定等于layer下的对应id*,另外，diff_id的个数也不一定等于在Dockerfile中Run的命令数，*事实上，如果我们认为镜像是一个打包的静态OS，那么Layer可以认为是描述该OS的fs变化，即文件系统中文件或者目录发生的改变，有些命令并不会引起fs的变化，只是会写入该镜像的config中，在生成容器时读取即可，就不存在diff id*
 
 ## layerdb
 
@@ -177,7 +177,7 @@ ChainID(A|B|C) = Digest(ChainID(A|B) + " " + DiffID(C))
 
 ## distribution
 
-distribution目录包含了Layer层diif_id和digest之间的对应关系，**digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有digest**，当执行push/pull时，镜像仓库需要通过digest来对应到具体的layer上，即distribution的作用。它的结构大致如下：
+distribution目录包含了Layer层diif_id和manifest digest之间的对应关系，**manifest digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有manifest digest**，当执行push/pull时，镜像仓库需要通过digest来对应到具体的layer上，即distribution的作用。它的结构大致如下：
 
 ```
 distribution/

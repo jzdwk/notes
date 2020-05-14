@@ -434,10 +434,10 @@ docker pull从整体上来说，做了以下工作：
 
 - **image digest**：对应于Manifest内容的config.digest，它就是docker images输出的镜像ID(docker image)，镜像的ID是镜像配置文件的sha256，我们可以用它继续从Registry上下载镜像配置文件
 
-- **layer digest**： layer层的sha256，取值为把层里所有的文件打包成一个tar，对它计算sha256，得到的就是层id(LayerId)
+- **layer digest**：layer层的sha256，取值为把层里所有的文件打包成一个tar，对它计算sha256，得到的就是层id(LayerId)
 
 
-从中可以看到image基本信息以及layer信息。接下来就是解析manifest，并使用manifest的信息就pull image：
+从中可以看到image基本信息以及layer信息。接下来就是解析manifest，并使用manifest的信息pull image：
 
 ```
 	...
@@ -480,7 +480,8 @@ docker pull从整体上来说，做了以下工作：
 		return false, invalidManifestFormatError{}
 	}
 ```
-在本环境下，manifest的版本为schemav2因此进入`p.pullSchema2(ctx, ref, v, platform)`函数。该函数的主要做了一个校验，当pull后的参数是digest时，保证manifest的digest和请求的一致，如果使用非digest的pull，则直接得到manifest的digest并返回。之后根据这个digest，调用函数pullSchema2Layers:
+在本环境下，manifest的版本为schemav2因此进入`p.pullSchema2(ctx, ref, v, platform)`函数。该函数的主要做了一个校验，当pull后的参数是digest时，保证manifest的digest和请求的一致，如果使用非digest的pull，则直接得到manifest的digest并返回。之后根据这个digest，调用函数pullSchema2Layers。首先第一句，如果这个digest在本地有，说明镜像在本地有，就不再继续，直接返回：
+
 ```
 	if _, err := p.config.ImageStore.Get(target.Digest); err == nil {
 		
@@ -488,31 +489,31 @@ docker pull从整体上来说，做了以下工作：
 	}
 ```
 
-首先第一句，如果这个digest在本地有，说明镜像在本地有，就不再继续，直接返回。
-	var descriptors []xfer.DownloadDescriptor
-
-	// Note that the order of this loop is in the direction of bottom-most
-	// to top-most, so that the downloads slice gets ordered correctly.
-	for _, d := range layers {
-		layerDescriptor := &v2LayerDescriptor{
-			digest:            d.Digest,
-			repo:              p.repo,
-			repoInfo:          p.repoInfo,
-			V2MetadataService: p.V2MetadataService,
-			src:               d,
-		}
-
-		descriptors = append(descriptors, layerDescriptor)
-	}
-
-	configChan := make(chan []byte, 1)
-	configErrChan := make(chan error, 1)
+函数`pullSchema2Layers(ctx context.Context, target distribution.Descriptor, layers []distribution.Descriptor, platform *specs.Platform)`的4个参数中，target即为manifest的config项，layers为layer项。接下来首先遍历image的所有layer，并封装为一个v2LayerDescriptor切片。后者的定义如下：
+```
+type v2LayerDescriptor struct {
+	digest            digest.Digest  //manifest digest
+	diffID            layer.DiffID 
+	repoInfo          *registry.RepositoryInfo
+	repo              distribution.Repository
+	V2MetadataService metadata.V2MetadataService
+	tmpFile           *os.File
+	verifier          digest.Verifier
+	src               distribution.Descriptor // layers
+}
+```
+然后定义了4个chan用于download
+```
+	configChan := make(chan []byte, 1)  //1长度缓冲chan，获取image config
+	configErrChan := make(chan error, 1)  //1长度缓冲chan，获取image config失败时的
 	layerErrChan := make(chan error, 1)
 	downloadsDone := make(chan struct{})
+```
+根据manifest里的config.digest,即镜像的sha256,去获取镜像的config信息,**这个config信息，就是在/var/lib/docker/image/imagedb/metadata里的信息**,写入configChan:
+```
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
-
 	// Pull the image config
 	go func() {
 		configJSON, err := p.pullSchema2Config(ctx, target.Digest)
@@ -523,59 +524,9 @@ docker pull从整体上来说，做了以下工作：
 		}
 		configChan <- configJSON
 	}()
-
-	var (
-		configJSON       []byte          // raw serialized image config
-		downloadedRootFS *image.RootFS   // rootFS from registered layers
-		configRootFS     *image.RootFS   // rootFS from configuration
-		release          func()          // release resources from rootFS download
-		configPlatform   *specs.Platform // for LCOW when registering downloaded layers
-	)
-
-	layerStoreOS := runtime.GOOS
-	if platform != nil {
-		layerStoreOS = platform.OS
-	}
-
-	// https://github.com/docker/docker/issues/24766 - Err on the side of caution,
-	// explicitly blocking images intended for linux from the Windows daemon. On
-	// Windows, we do this before the attempt to download, effectively serialising
-	// the download slightly slowing it down. We have to do it this way, as
-	// chances are the download of layers itself would fail due to file names
-	// which aren't suitable for NTFS. At some point in the future, if a similar
-	// check to block Windows images being pulled on Linux is implemented, it
-	// may be necessary to perform the same type of serialisation.
-	if runtime.GOOS == "windows" {
-		configJSON, configRootFS, configPlatform, err = receiveConfig(p.config.ImageStore, configChan, configErrChan)
-		if err != nil {
-			return "", err
-		}
-		if configRootFS == nil {
-			return "", errRootFSInvalid
-		}
-		if err := checkImageCompatibility(configPlatform.OS, configPlatform.OSVersion); err != nil {
-			return "", err
-		}
-
-		if len(descriptors) != len(configRootFS.DiffIDs) {
-			return "", errRootFSMismatch
-		}
-		if platform == nil {
-			// Early bath if the requested OS doesn't match that of the configuration.
-			// This avoids doing the download, only to potentially fail later.
-			if !system.IsOSSupported(configPlatform.OS) {
-				return "", fmt.Errorf("cannot download image with operating system %q when requesting %q", configPlatform.OS, layerStoreOS)
-			}
-			layerStoreOS = configPlatform.OS
-		}
-
-		// Populate diff ids in descriptors to avoid downloading foreign layers
-		// which have been side loaded
-		for i := range descriptors {
-			descriptors[i].(*v2LayerDescriptor).diffID = configRootFS.DiffIDs[i]
-		}
-	}
-
+```
+接下来，将进行layer的下载(暂时忽略windows的内容)，主要调用了RootFSDownloadManager接口的`Download`这个函数，由downloadManager实现：
+```
 	if p.config.DownloadManager != nil {
 		go func() {
 			var (
@@ -584,96 +535,59 @@ docker pull从整体上来说，做了以下工作：
 			)
 			downloadRootFS := *image.NewRootFS()
 			rootFS, release, err = p.config.DownloadManager.Download(ctx, downloadRootFS, layerStoreOS, descriptors, p.config.ProgressOutput)
-			if err != nil {
-				// Intentionally do not cancel the config download here
-				// as the error from config download (if there is one)
-				// is more interesting than the layer download error
-				layerErrChan <- err
-				return
-			}
-
+			...
 			downloadedRootFS = &rootFS
 			close(downloadsDone)
 		}()
 	} else {
-		// We have nothing to download
-		close(downloadsDone)
+		...
 	}
-
-	if configJSON == nil {
-		configJSON, configRootFS, _, err = receiveConfig(p.config.ImageStore, configChan, configErrChan)
-		if err == nil && configRootFS == nil {
-			err = errRootFSInvalid
+```
+进入download内部，有4个入参，其中initialRootFS为一个空的rootfs结构，layers即层信息，progressOutput为要输出的内容。这个函数的实现是一个对于layer的for循环，根据每一个layer，在`l.Download(ctx, progressOutput)`中发送http get去获取layer数据，并将其写入`dm.blobStore.New()`的tmp目录中：
+```
+for _, l := range layers {
+		b, err := dm.blobStore.New()
+		...
+		rc, _, err := l.Download(ctx, progressOutput)
+		defer rc.Close()
+		r := io.TeeReader(rc, b)
+		inflatedLayerData, err := archive.DecompressStream(r)
+		...
+}	
+```
+进入`func (ld *layerDescriptor) Download(ctx context.Context, progressOutput pkgprogress.Output)`。这里首先通过一个newHTTPReadSeeker结构进行fetch，即下载layer，注意这里还封装了一个retry用于尝试多次获取，直到获取成功or超过5次，将返回的layer流rc写入tmp，在写入时，如果发现数据已经存在，即layer已经存在，直接返回：
+```
+	rc, err := ld.fetcher.Fetch(ctx, ld.desc)
+	...
+	//根据layer的不同类型，得到对应的digest
+	refKey := remotes.MakeRefKey(ctx, ld.desc)
+	//写tmp
+	if err := content.WriteBlob(ctx, ld.is.ContentStore, refKey, rc, ld.desc); err != nil {
+		...
+	}
+	ra, err := ld.is.ContentStore.ReaderAt(ctx, ld.desc)
+	...
+	return ioutil.NopCloser(content.NewReader(ra)), ld.desc.Size, nil
+```
+回到之前函数，当layer下载完成后，进行解压：
+```
+	for _, l := range layers {
+		...
+		defer inflatedLayerData.Close()
+		digester := digest.Canonical.Digester()
+		if _, err := chrootarchive.ApplyLayer(dm.tmpDir, io.TeeReader(inflatedLayerData, digester.Hash())); err != nil {
+			return initialRootFS, nil, err
 		}
+		initialRootFS.Append(layer.DiffID(digester.Digest()))
+		d, err := b.Commit()
 		if err != nil {
-			cancel()
-			select {
-			case <-downloadsDone:
-			case <-layerErrChan:
-			}
-			return "", err
+			return initialRootFS, nil, err
 		}
+		dm.blobs = append(dm.blobs, d)
 	}
-
-	select {
-	case <-downloadsDone:
-	case err = <-layerErrChan:
-		return "", err
-	}
-
-	if release != nil {
-		defer release()
-	}
-
-	if downloadedRootFS != nil {
-		// The DiffIDs returned in rootFS MUST match those in the config.
-		// Otherwise the image config could be referencing layers that aren't
-		// included in the manifest.
-		if len(downloadedRootFS.DiffIDs) != len(configRootFS.DiffIDs) {
-			return "", errRootFSMismatch
-		}
-
-		for i := range downloadedRootFS.DiffIDs {
-			if downloadedRootFS.DiffIDs[i] != configRootFS.DiffIDs[i] {
-				return "", errRootFSMismatch
-			}
-		}
-	}
-
-	imageID, err := p.config.ImageStore.Put(configJSON)
-	if err != nil {
-		return "", err
-	}
-
-	return imageID, nil
+	return initialRootFS, nil, nil	
 ```
-	progress.Message(p.config.ProgressOutput, "", "Digest: "+manifestDigest.String())
-
-	if p.config.ReferenceStore != nil {
-		oldTagID, err := p.config.ReferenceStore.Get(ref)
-		if err == nil {
-			if oldTagID == id {
-				return false, addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id)
-			}
-		} else if err != refstore.ErrDoesNotExist {
-			return false, err
-		}
-
-		if canonical, ok := ref.(reference.Canonical); ok {
-			if err = p.config.ReferenceStore.AddDigest(canonical, id, true); err != nil {
-				return false, err
-			}
-		} else {
-			if err = addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id); err != nil {
-				return false, err
-			}
-			if err = p.config.ReferenceStore.AddTag(ref, id, true); err != nil {
-				return false, err
-			}
-		}
-	}
-	return true, nil
-```
+最后，再做一下digest的校验，将image的config保存后，返回imageid。
 
 
 

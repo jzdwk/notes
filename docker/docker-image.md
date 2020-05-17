@@ -286,7 +286,7 @@ PullImage函数在registryBackend接口中定义，由ImageService实现。在�
 	//根据ref信息解析出test/hello-world
 	repoInfo, err := imagePullConfig.RegistryService.ResolveRepository(ref)
 	....
-	//解析出test， 注意此时的endpoints为一个切片，原因为docker pull 后可跟多个镜像参数 so 多endpoint？
+	//解析出test， 注意此时的endpoints为一个切片，原因？
 	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
 	...
 	for _, endpoint := range endpoints {
@@ -354,7 +354,7 @@ docker pull从整体上来说，做了以下工作：
 	}
 ```
 
-上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息。并返回一个manifest。注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
+上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息(docker pull mysql:5.7 or docker pull mysql@digest)。并返回一个manifest。注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
 ```
 	...
 	//根据pull的参数，赋值digestOrTag
@@ -578,7 +578,7 @@ for _, l := range layers {
 		if _, err := chrootarchive.ApplyLayer(dm.tmpDir, io.TeeReader(inflatedLayerData, digester.Hash())); err != nil {
 			return initialRootFS, nil, err
 		}
-		initialRootFS.Append(layer.DiffID(digester.Digest()))
+		initialRootFS.Append(layer.DiffID(digester.Digest())) //将每一层的digest append进diff
 		d, err := b.Commit()
 		if err != nil {
 			return initialRootFS, nil, err
@@ -587,7 +587,41 @@ for _, l := range layers {
 	}
 	return initialRootFS, nil, nil	
 ```
-最后，再做一下digest的校验，将image的config保存后，返回imageid。
+并将layer信息封装至initialRootFs结构体，rootFS表示一个image的所有定义的文件结构，即image layers，后者的定义如下：
+```
+type RootFS struct {
+	Type    string         `json:"type"` 
+	DiffIDs []layer.DiffID `json:"diff_ids,omitempty"` //diff id，每个id代表一个layer
+
+}
+```
+当函数返回后，这时，我们已经有了：
+- 根据manifest中layer项描述的，从registry中download的各个layer以及digest
+- 根据manifest中config项的image digest，从registry中download的image的config信息(在../image/imagedb/metadata中)
+接下来，pull_v2函数将layer的digest和config中的diff进行比对，确保layer的正确性。
+```
+	if configJSON == nil {
+		configJSON, configRootFS, _, err = receiveConfig(p.config.ImageStore, configChan, configErrChan)
+		...
+	}
+	...
+	if downloadedRootFS != nil {
+		//layer的检查
+		if len(downloadedRootFS.DiffIDs) != len(configRootFS.DiffIDs) {
+			return "", errRootFSMismatch
+		}
+		for i := range downloadedRootFS.DiffIDs {
+			if downloadedRootFS.DiffIDs[i] != configRootFS.DiffIDs[i] {
+				return "", errRootFSMismatch
+			}
+		}
+	}
+
+	imageID, err := p.config.ImageStore.Put(configJSON)
+	...
+	return imageID, nil
+```
+都没有问题后，调用`p.config.ImageStore.Put(configJSON)`将config保存。至此,pull过程完毕并返回image id。
 
 
 

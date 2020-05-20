@@ -27,12 +27,81 @@ client-go是k8s的sdk，整体架构如下图所示：
 ## sample-controller 示例
 
 [sample-controller](https://github.com/kubernetes/sample-controller) 为client-go给的官方创建crd示例，总体来说，构建定义一个crd需要有两大步：
-- 定义crd struct/yaml，并将其下发至k8s对象
-- 定义crd相关的Informer controller等组件，具体来说：
-1. 根据kubeconfig创建CRD的client set
-2. 构建CRD **informerFactory，informer**
-3. 根据informerFactory创建controller,controller中封装了：`client set`,`lister`,`synced`,**`workqueue`**,`recorder`，同时添加CRD informer的**Resource Event Handlers**，当有对应事件，处理一部分业务逻辑，并将key放入work queue
-4. controller创建完成后，实现Run方法，启动n个**process item**，从work queue中不断取出key，通过key去执行一个sync逻辑，保证k8s中资源对象的状态(通过**lister**获取，其实就是informer的local store)=spec的状态
+
+1. 定义crd struct/yaml，并将其下发至k8s对象
+
+2. 定义crd相关的Informer controller等组件，具体来说：
+
+- 根据kubeconfig创建CRD的client set
+
+- 构建CRD **informerFactory，informer**
+
+- 根据informerFactory创建controller,controller中封装了：`client set`,`lister`,`synced`,**`workqueue`**,`recorder`，同时添加CRD informer的**Resource Event Handlers**，当有对应事件，处理一部分业务逻辑，并将key放入work queue
+
+- controller创建完成后，实现Run方法，启动n个**process item**，从work queue中不断取出key，通过key去执行一个sync逻辑，保证k8s中资源对象的状态(通过**lister**获取，其实就是informer的local store)=spec的状态
+
+### crd定义
+
+[crd](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#create-a-customresourcedefinition) 是用于描述k8s的自定义资源对象，定义的模板为：
+```
+apiVersion: apiextensions.k8s.io/v1  #此处有两个版本，1.16之前为apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  # 定义 crd_name.group_name,所以crontabs就是这个crd的kind，而stable.example.com对应于yaml中的spec.group
+  name: crontabs.stable.example.com
+spec:
+  # 这个名称对应了未来的k8s rest api路径: /apis/<group>/<version>
+  group: stable.example.com
+  # 版本列表，不同的版本中可定义不同属性，同样对应k8s rest api中的version
+  versions:
+    # 版本名称
+    - name: v1
+      # 是否启用这个版本的flag
+      served: true
+      # 是否存储，只能有一个版本被设置为true
+      storage: true
+	  # 1.16中新增加的属性
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                cronSpec:
+                  type: string
+                image:
+                  type: string
+                replicas:
+                  type: integer
+  # crd的定义范围，ns级还是cluster级
+  scope: Namespaced
+  # crd的名称
+  names:
+    # 复数的名称,要求小写
+    plural: crontabs
+    # 单数的名称,要求小写
+    singular: crontab
+    # 资源类型名称，首字母大写+驼峰
+    kind: CronTab
+    # 缩写定义,要求小写
+    shortNames:
+    - ct
+```
+因此，crd的定义位于/artifacts/examples/crd.yaml中，内容为：
+```
+apiVersion: apiextensions.k8s.io/v1beta1 #注意此处的apiVersion
+kind: CustomResourceDefinition
+metadata:
+  name: foos.samplecontroller.k8s.io
+spec:
+  group: samplecontroller.k8s.io
+  version: v1alpha1
+  names:
+    kind: Foo
+    plural: foos
+  scope: Namespaced
+```
 
 
 

@@ -173,6 +173,101 @@ func RegistryAuthenticationPrivilegedFunc(cli Cli, index *registrytypes.IndexInf
 }
 ```
 
-### docker daemon
+## docker daemon
 
-## tag image
+和docker pull一样，docker push的api位于/engine/api/server/router/image/image.go中。具体的路由为：`router.NewPostRoute("/images/{name:.*}/push", r.postImagesPush),`。 回顾docker push函数:
+```
+Usage:  docker push [OPTIONS] NAME[:TAG]
+
+Push an image or a repository to a registry
+
+Options:
+      --disable-content-trust   Skip image signing (default true)
+```
+push后指定要上传镜像的repo/image/tag，因此猜测，整体过程为：
+ 
+1. 根据repo/image:tag，在repositories.json中获取image的digest
+
+2. 根据这个image digest，从imagedb的content中得到具体的layer配置信息
+
+3. 根绝layer信息，从layerdb中得到具体的layer文件，将layer文件上传
+
+4. 根据上传的layer制作manifest文件，并签名后上传
+
+下面进入`postImagesPush`函数，实现如下：
+```
+func (s *imageRouter) postImagesPush(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	//对于auth信息的处理，如果有auth信息，则取出后解base64
+	...
+	authConfig := &types.AuthConfig{}
+	authEncoded := r.Header.Get("X-Registry-Auth")
+	if authEncoded != "" {
+		// the new format is to handle the authConfig as a header
+		authJSON := base64.NewDecoder(base64.URLEncoding, strings.NewReader(authEncoded))
+		...
+	} else {
+		...
+		//老版本从body中获取
+	}
+	//解析image信息
+	image := vars["name"]
+	tag := r.Form.Get("tag")
+	output := ioutils.NewWriteFlusher(w)
+	...
+	w.Header().Set("Content-Type", "application/json")
+	//backend的push实现
+	if err := s.backend.PushImage(ctx, image, tag, metaHeaders, authConfig, output); err != nil {
+		...
+	}
+	return nil
+}
+```
+
+上面的函数只做了参数解析的工作，一是解析了auth信息，二是image信息，然后就直接调用了backend的PushImage函数：
+```
+func (i *ImageService) PushImage(ctx context.Context, image, tag string, metaHeaders map[string][]string, authConfig *types.AuthConfig, outStream io.Writer) error {
+	start := time.Now()
+	//将image信息封装为reference
+	ref, err := reference.ParseNormalizedNamed(image)
+	...
+	if tag != "" {
+		ref, err = reference.WithTag(ref, tag)
+		...
+	}
+	//定义用于输出push过程信息的chan以及标志结束的无缓冲chan
+	progressChan := make(chan progress.Progress, 100)
+	writesDone := make(chan struct{})
+	ctx, cancelFunc := context.WithCancel(ctx)
+	//用一个routine 从progressChan中读取信息并写到stdout
+	go func() {
+		progressutils.WriteDistributionProgress(cancelFunc, outStream, progressChan)
+		close(writesDone)
+	}()
+	//配置image push config
+	imagePushConfig := &distribution.ImagePushConfig{
+		Config: distribution.Config{ //基本image信息
+			MetaHeaders:      metaHeaders,
+			AuthConfig:       authConfig,
+			ProgressOutput:   progress.ChanOutput(progressChan),
+			RegistryService:  i.registryService,
+			ImageEventLogger: i.LogImageEvent,
+			MetadataStore:    i.distributionMetadataStore,
+			ImageStore:       distribution.NewImageConfigStoreFromStore(i.imageStore),
+			ReferenceStore:   i.referenceStore,
+		},
+		ConfigMediaType: schema2.MediaTypeImageConfig,//image版本描述
+		LayerStores:     distribution.NewLayerProvidersFromStores(i.layerStores), //具体layer的存储实现
+		TrustKey:        i.trustKey,
+ 		UploadManager:   i.uploadManager, //看名字像是上传实现相关的
+	}
+	//调用distribution的push
+	err = distribution.Push(ctx, ref, imagePushConfig)
+	close(progressChan)
+	//等待done开关
+	<-writesDone
+	imageActions.WithValues("push").UpdateSince(start)
+	return err
+}
+```
+上面这个函数也只做了两件事，一是定义一个progressChan用于接收push的信息并打印，二是封装了一个imagePushConfig的结构体。这个结构体中，除了基本的image信息，也定义了mediaType，即image的格式版本(回忆pull)，根据os环境layerStore的对象。继续进入`err = distribution.Push(ctx, ref, imagePushConfig)`,从包名字distribution可以联想到，这个包和image存储时的distribution相关。
+

@@ -260,7 +260,16 @@ ChainID(A|B|C) = Digest(ChainID(A|B) + " " + DiffID(C))
 
 ### distribution
 
-distribution目录包含了Layer层diif_id和manifest digest之间的对应关系，**manifest digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有manifest digest**，当执行push/pull时，镜像仓库需要通过digest来对应到具体的layer上，即distribution的作用。它的结构大致如下：
+distribution目录主要用于和docker registry操作，包含了Layer的ID，即diif_id和digest之间的对应关系。**注意，这个digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有digest。 push 完成后，registry生成digest给server，server将layer id和digest建立对应关系**，push后的digest在stdout打印：
+```
+The push refers to repository [docker.io/backbp/test-image]
+a6c8828ba4b5: Pushed 
+9edc93f4dcf6: Pushed 
+b1ddbff02257: Pushed 
+7bff100f35cb: Mounted from library/alpine 
+lasted: digest: sha256:3dc66a43c28ea3e994e4abf6a2d04c7027a9330e8eeab5c609e4971a8c58f0b0 size: 1156
+```
+distribution的结构大致如下：
 
 ```
 distribution/
@@ -274,7 +283,7 @@ distribution/
 
 这个结构里有两个目录:
 
-- **v2metadata-by-diffid**: v2metadata-by-diffid目录下，可以通过Layer的diff_id找到对应的digest描述，并且包含了生成该digest的源仓库,比如本地的busybox镜像diff_id的描述：
+- **v2metadata-by-diffid**: v2metadata-by-diffid目录下，可以通过Layer的diff_id，也就是layer id，找到对应的 digest描述，并且包含了生成该digest的源仓库,比如本地的busybox镜像diff_id的描述：
 
 ```
 cat 5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab
@@ -293,7 +302,7 @@ cat 5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab
   ...
 ]
 ```
-busybox的镜像打了不同的tag，所以，对于一份busybox，存在一个唯一的imageId描述，这个iamgeId在imagedb里描述了diff_id，也就是layer id，对应此处的digest。
+busybox的镜像打了不同的tag并push，所以，对于一份busybox，存在唯一的digest描述`e2334dd9fee4b77e48a8f2d793904118a3acf26f1f2e72a3d79c6cae993e07f0`，而layer ID对应此处的5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab。
 
 - **diffid-by-digest**: diffid-by-digest目录则与v2metadata-by-diffid相反，通过digest来得到对应的layer id，如
 

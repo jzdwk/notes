@@ -1,5 +1,88 @@
 # docker image store
 
+## 概念
+
+### rootfs
+
+全称是root file system，这是一个linux系统中的根文件系统 一个典型的Linux系统要能运行的话，它至少需要两个文件系统：
+
+- boot file system （bootfs）：包含bootloader和 kernel。用户不会修改这个文件系统。在boot过程完成后，整个内核都会被加载进内存，此时bootfs 会被卸载掉从而释放出所占用的内存。对于同样内核版本的不同的Linux发行版的bootfs都是一致的。
+
+- root file system （rootfs）：包含典型的目录结构，包括dev,proc,bin,etc,lib,usr,tmp 等再加上要运行用户应用所需要的所有配置文件，二进制文件和库文件。这个文件系统在不同的Linux 发行版中是不同的。而且用户可以对这个文件进行修改。
+
+Linux操作系统内核启动时，内核首先会挂载一个只读( read-only)的rootfs，
+当系统检测其完整性之后，决定是否将其切换为读写( read-write) 模式，或者最后在rootfs
+之上另行挂载一种文件系统并忽略rootfs。
+
+Docker架构下依然沿用Linux 中rootfs的思想。
+当Docker Daemon为Docker容器挂载rootfs的时候，与传统Linux内核类似，将其设定为只
+读模式。不同的是，docker在挂载rootfs之后，**并没有将docker容器的文件系统设为读写模式**，而是利用**Union Mount** 的技术，**在这个只读的rootfs之上再
+挂载一个读写的文件系统**，挂载时该读写文件系统内空无一物。
+
+### unionfs
+
+全称是union file system， 代表一种文件系统挂载方式，允许同一时刻多种文件系统叠加挂载在一起，
+并以一种文件系统的形式，呈现多种文件系统内容合并后的目录。举个例子：
+
+```
+$ tree
+.
+├── fruits
+│   ├── apple
+│   └── tomato
+└── vegetables
+    ├── carrots
+    └── tomato
+```
+
+上面的目录结构，经过union mount：
+
+```
+$ sudo mount -t aufs -o dirs=./fruits:./vegetables none ./mnt
+$ tree ./mnt
+./mnt
+├── apple
+├── carrots
+└── tomato
+```
+
+通常来讲，被合并的文件系统中只有一个会以读写(read-write)模式挂载，其他文件系统的挂载模式均
+为只读( read-only)。实现这种Union Mount技术的文件系统一般称为联合文件系统(Union
+Filesystem)，较为常见的有UnionFS、aufs 、OverlayFS 等
+
+基于此，docker在所创建的容器中使用文件系统时，从内核角度来看，将出现rootfs以及一个可读写的文件系统，并通过union mount进行合并。所有的配置、install都是在读写层进行的，即使是删除操作，也是在读写层进行，只读层永远不会变。对于用户来说，感知不到这两个层次，只会通过fs的COW (copy-on-write)特性看到操作结果。
+
+### image layer
+
+最为简单地解释image layer,它就是Docker容器中只读文件系统rootfs的一部分。Docker容器的rootfs可以由多个image layer 来构成。多个image layer构成 rootfs的方式依然沿用Union Mount技术。下例为镜像层次从上至下：
+
+- image_layer_n: /lib /etc
+- image_layer_2：/media /opt /home
+- image_layer_1：/var /boot /proc
+
+比如上面的例子，rootfs被分成了n层，每一层包含其中的一部分，每一层的image layer都叠加在另一个image layer之上。基于以上概念，docker iamge layer产生两种概念:
+
+- 父镜像：其余镜像都依赖于其底下的一个或多个镜像，Docker将下一层的镜像称为上一层镜像的父镜像。如image_layer_1是image_layer_2的父镜像。
+
+- 基础镜像： rootfs最底层镜像，没有父镜像，如image_layer_1。
+
+将一个整体的image拆分，就能够对子image进行复用，比如一个mysql和一个ubuntu的应用，复用的例子就如下：
+
+- image_layer_0-> image_layer_1-> image_layer_3->image_layer_4（ubuntu）->image_layer_5(mysql)
+
+需要注意，以上描述的多个image layer分层，都是**只读分层**
+
+### container layer
+
+除了只读的image之外，Docker Daemon在创建容器时会在容器的rootfs之上，再挂载
+一层读写文件系统，而这一层文件系统称为容器的container layer， Docker还会在rootfs和top layer之间再挂载一个layer ，这一个 layer中主要包含/etc/hosts,/etc/hostname 以及/etc/resolv.conf，一般这一个layer称为init layer。
+
+另外，根据image层次的复用逻辑，docker在设计时，**提供了commit和基于dockerfile的build来将container layer+下层image_layer转变为新的image**。开发者可以基于某个镜像创
+建容器做开发工作，并且无论在开发周期的哪个时间点，都可以对容器进行commit,将container内容打包为一个image ，构成一个新的镜像。
+
+
+## image store
+
 了解docker对于image的存储有助于对docker源码的理解。一般默认安装启动Docker，所有相关的文件都会存储在/var/lib/docker下面，与Image相关的目录主要是image，再下一层是驱动目录名称，Ubuntu 18.04/Docker19.03 为[overlay2](https://docs.docker.com/storage/storagedriver/select-storage-driver/)
 
 定位到/image/overlay2/后，使用`tree`查看目录结构，可以看到：
@@ -27,7 +110,7 @@
 └── repositories.json
 ```
 
-## repositories.json
+### repositories.json
 
 repositories.json文件中存储了本地的所有镜像，里面主要涉及了image的name/tag以及image的sha256值，大致内容如下：
 
@@ -36,7 +119,7 @@ repositories.json文件中存储了本地的所有镜像，里面主要涉及了
 ```
 
 
-## imagedb
+### imagedb
 
 imagedb目录中存放了镜像信息。在imagedb下有两个子目录，**metadata**目录保存每个镜像的parent镜像ID，即使用docker build时，就是`FROM XXX`的镜像XXX信息。另一个是**content**目录，该目录下存储了镜像的JSON格式描述信息，文件名以image的sha256形式保存。比如cat一个具体的content下busybox镜像文件，可以看到：
 
@@ -130,7 +213,7 @@ imagedb目录中存放了镜像信息。在imagedb下有两个子目录，**meta
 
 - **rootfs**：该镜像包含的layer层的diff id，这里的值主要用于描述layer，但注意*此处的diff_id不一定等于layer下的对应id*,另外，diff_id的个数也不一定等于在Dockerfile中Run的命令数，*事实上，如果我们认为镜像是一个打包的静态OS，那么Layer可以认为是描述该OS的fs变化，即文件系统中文件或者目录发生的改变，有些命令并不会引起fs的变化，只是会写入该镜像的config中，在生成容器时读取即可，就不存在diff id*
 
-## layerdb
+### layerdb
 
 layerdb根据命名即可理解该目录主要用来存储Docker的Layer信息，layerdb的大致结构如下：
 
@@ -175,7 +258,7 @@ ChainID(A|B|C) = Digest(ChainID(A|B) + " " + DiffID(C))
 
 进入某个sha256目录，里面的`diff`就描述了该Layer层的diff_id;`size`描述了该Layer的大小，单位字节；`tar-split.json.gz`表示layer层数据tar压缩包的split文件，该文件生成需要依赖tar-split，通过这个文件可以还原layer的tar包。`cache_id`内容为一个uuid，指向Layer本地的真正存储位置。而这个真正的存储位置便是**/var/lib/docker/overlay2**目录
 
-## distribution
+### distribution
 
 distribution目录包含了Layer层diif_id和manifest digest之间的对应关系，**manifest digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有manifest digest**，当执行push/pull时，镜像仓库需要通过digest来对应到具体的layer上，即distribution的作用。它的结构大致如下：
 

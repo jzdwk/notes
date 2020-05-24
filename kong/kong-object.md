@@ -103,7 +103,7 @@ route的tls配置，以及对grpc等的代理，请[参考文档](https://docs.k
 
 ## consumer
 
-consumer定义了对于一个service的使用者。这个使用者既可以使用kong来管理，也可以将user列表映射到外部DB，以保持Kong与现有主数据存储之间的一致性。*具体应用场景待了解*
+consumer定义了对于一个service的使用者，主要用于api的认证。这个使用者既可以使用kong来管理，也可以将user列表映射到外部DB，以保持Kong与现有主数据存储之间的一致性。consumer的主要作用为认证和访问控制，consumer通过和认证信息关联来提供身份信息。当api上使用了kong的认证插件，插件会根据请求的认证信息去检索是否存在对应绑定的consumer来判断是否放行。
 
 ## plugin
 
@@ -159,7 +159,7 @@ plugin在整个请求响应中，只会运行一次。但是，plugin可以定�
 
 举一个例子：
 
-- 在service和consumer上各添加了rate-limiting插件，但是使用了不同的配置，前者配置为A，后者配置为B，那么，当一个带有认证的请求在service和consumer上各添加了rate-limiting插件，但是使用了不同的配置，前者配置为A，后者配置为B，那么，当一个带有认证的请求(通过consumer)到来时，将使用配置B而忽略A。如果这个请求没有使用认证，则走配置A。如果将配置B置false，则所有请求都走配置A。
+- 在service和consumer上各添加了rate-limiting插件，但是使用了不同的配置，前者配置为A，后者配置为B，那么，当一个带有认证的请求(通过consumer)到来时，将使用配置B而忽略A。如果这个请求没有使用认证，则走配置A。如果将配置B置false，则所有请求都走配置A。
 - 同样的，如果这个插件配置在了route(conf = A)和service(conf = B)时，访问该route,基于配置B，否则将基于配置A
 
 ## certificate
@@ -199,7 +199,7 @@ http POST :8001/upstreams/upstream/targets target=httpbin.org:80
 
 ## targets
 
-target表示一个标识后端服务，带有端口的ip地址/主机名，的实例。每个upstream都可以有多个target，并且可以动态地添加。
+target表示一个标识后端服务，带有**端口的ip地址/主机名**的实例。每个upstream都可以有多个target，并且可以动态地添加。
 
 ### 注意
 

@@ -190,7 +190,7 @@ push后指定要上传镜像的repo/image/tag，因此猜测，整体过程为：
 
 2. 根据这个image digest，从imagedb的content中得到具体的layer配置信息
 
-3. 根绝layer信息，从layerdb中得到具体的layer文件，将layer文件上传
+3. 根据layer信息，从layerdb中得到具体的layer文件，将layer文件上传
 
 4. 根据上传的layer制作manifest文件，并签名后上传
 
@@ -269,5 +269,254 @@ func (i *ImageService) PushImage(ctx context.Context, image, tag string, metaHea
 	return err
 }
 ```
-上面这个函数也只做了两件事，一是定义一个progressChan用于接收push的信息并打印，二是封装了一个imagePushConfig的结构体。这个结构体中，除了基本的image信息，也定义了mediaType，即image的格式版本(回忆pull)，根据os环境layerStore的对象。继续进入`err = distribution.Push(ctx, ref, imagePushConfig)`,从包名字distribution可以联想到，这个包和image存储时的distribution相关。
+上面这个函数也只做了两件事，一是定义一个progressChan用于接收push的信息并打印，二是封装了一个imagePushConfig的结构体。这个结构体中，除了基本的image信息，也定义了mediaType，即image的格式版本(回忆pull)，根据os环境layerStore的对象。继续进入`err = distribution.Push(ctx, ref, imagePushConfig)`,从包名字distribution可以联想到，这个包和image存储时的distribution相关。有关distribution的信息，请参阅[docker-image-store](docker-image-store.md) 。进入函数，实现如下：
+
+```
+func Push(ctx context.Context, ref reference.Named, imagePushConfig *ImagePushConfig) error {
+	//解析出RepositoryInfo结构体，这个结构体封装了docker repo的信息,除了ref域，还有registry，是否为官方registry的flag
+	repoInfo, err := imagePushConfig.RegistryService.ResolveRepository(ref)
+	...
+	//根据repoInfo的ref，解析出endpoints，即registry的socket组
+	endpoints, err := imagePushConfig.RegistryService.LookupPushEndpoints(reference.Domain(repoInfo.Name))
+	...
+	//根据ref,解析出association，这是个描述image的二元组struct，两个字段，一个ref,一个image的digest，猜想1验证
+	associations := imagePushConfig.ReferenceStore.ReferencesByName(repoInfo.Name)
+	...
+	//根据endpoint操作，某个endpoint操作成功就返回
+	for _, endpoint := range endpoints {
+		...//版本验证
+		//tls验证
+		if endpoint.URL.Scheme != "https" {
+			if _, confirmedTLS := confirmedTLSRegistries[endpoint.URL.Host]; confirmedTLS {
+				logrus.Debugf("Skipping non-TLS endpoint %s for host/port that appears to use TLS", endpoint.URL)
+				continue
+			}
+		}
+		//push对入参进行了封装，并根据入参中registry的版本信息，生成不同的push
+		pusher, err := NewPusher(ref, endpoint, repoInfo, imagePushConfig)
+		...
+		if err := pusher.Push(ctx); err != nil {
+			// Was this push cancelled? If so, don't try to fall
+			// back.
+			select {
+			case <-ctx.Done():
+			default:
+				//fallback err时，换一个endpoint然后continue
+				...
+			}
+			...
+		}
+		imagePushConfig.ImageEventLogger(reference.FamiliarString(ref), reference.FamiliarName(repoInfo.Name), "push")
+		return nil
+	}
+	...
+	return lastErr
+}
+```
+
+上述代码主要是解析endpoint，endpoint的结构如下,：
+```
+type APIEndpoint struct {
+	Mirror                         bool
+	URL                            *url.URL	//registry url
+	Version                        APIVersion //registry version
+	AllowNondistributableArtifacts bool 
+	Official                       bool // 是否官方registry
+	TrimHostname                   bool 
+	TLSConfig                      *tls.Config //https config
+}
+```
+然后进行了image/registry的版本校验，依次将image push到解析出的所有endpoint，直到一个endpoint成功。在push时，通过Pusher接口封装了push所需的信息，并根据registry版本提供了v2版本的实现。继续进入v2Pusher的实现：
+```
+func (p *v2Pusher) Push(ctx context.Context) (err error) {
+	//通过map的k v判断，key是layerID，descriptor是layer内容的描述
+	p.pushState.remoteLayers = make(map[layer.DiffID]distribution.Descriptor)
+	p.repo, p.pushState.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "push", "pull")
+	p.pushState.hasAuthInfo = p.config.AuthConfig.RegistryToken != "" || (p.config.AuthConfig.Username != "" && p.config.AuthConfig.Password != "")
+	...
+	if err = p.pushV2Repository(ctx); err != nil {
+		//判断是否尝试下一个endpoint，如果是，返回一个fallback err
+		...
+	}
+	return err
+}
+```
+上述代码对v2pusher中的各个字段进行了填充，其中的descriptor结构描述了一个layer，其内容如下：
+```
+type Descriptor struct {
+	MediaType string  //类型
+	Size int64  //大小
+	Digest digest.Digest //ID，用于做内容校验
+	URLs []string  //layer的源url
+	Annotations map[string]string //注释信息
+	Platform *v1.Platform //layer所属架构
+}
+```
+继续进入函数`p.pushV2Repository(ctx)`,这个函数的主要功能为，根据tag信息，进行具体的Push操作，如果有tag，直接push，否则，push所有的tag.
+```
+func (p *v2Pusher) pushV2Repository(ctx context.Context) (err error) {
+	//如果有tag信息，则解析出image digest，
+	if namedTagged, isNamedTagged := p.ref.(reference.NamedTagged); isNamedTagged {
+		imageID, err := p.config.ReferenceStore.Get(p.ref)
+		...
+		return p.pushV2Tag(ctx, namedTagged, imageID)
+	}
+	...
+	pushed := 0
+	//因为在前面的代码已经解析过association，所以此处一定存在，push all tag
+	for _, association := range p.config.ReferenceStore.ReferencesByName(p.ref) {
+		if namedTagged, isNamedTagged := association.Ref.(reference.NamedTagged); isNamedTagged {
+			pushed++
+			if err := p.pushV2Tag(ctx, namedTagged, association.ID); err != nil {
+				return err
+			}
+		}
+	}
+	...
+}
+```
+因此，进入pushV2Tag,一段段来看，首先是根据image digest得到iamge config以及相关信息：
+
+```
+func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id digest.Digest) error {
+	//根据image digest，获取image的配置信息，这部分信息调用了ImageConfigStore接口的get方法，就是imagedb里的content目录中内容
+	imgConfig, err := p.config.ImageStore.Get(id)
+	//获取配置信息中的rootfs字段，里面存放了组成image的各个layer diff_id ，即layer id
+	...
+	rootfs, err := p.config.ImageStore.RootFSFromConfig(imgConfig)
+	...
+	//platform ，即os字段linux
+	platform, err := p.config.ImageStore.PlatformFromConfig(imgConfig)
+	...
+	//l为具体的layer内容
+	l, err := p.config.LayerStores[platform.OS].Get(rootfs.ChainID())
+	...
+	//计算认证信息摘要，防篡改
+	hmacKey, err := metadata.ComputeV2MetadataHMACKey(p.config.AuthConfig)
+	...
+	defer l.Release()
+	...
+}
+```
+上面代码获取的imageconfig就是docker存储image时的imagedb中的content目录中某个iamge的内容，可以根据上面的代码对应下面的每一个项上，imageconfig的结构如下：
+```
+{
+  "architecture": "amd64",
+  "config": {
+    ...
+  },
+  "container": "f7e67f16a539f8bbf53aae18cdb5f8c53e6a56930e7660010d9396ae77f7acfa",
+  "container_config": {
+   ...
+  },
+  "created": "2020-04-14T19:19:53.590635493Z",
+  "docker_version": "18.09.7",
+  "history": [
+   ...
+  ],
+  "os": "linux",
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab"
+    ]
+  }
+}
+
+```
+基本信息获取后，封装一个descriptors的切片，这个切片的每个元素就是layer和registry的具体信息。
+
+```
+	...
+	var descriptors []xfer.UploadDescriptor
+	descriptorTemplate := v2PushDescriptor{
+		v2MetadataService: p.v2MetadataService,
+		hmacKey:           hmacKey,
+		repoInfo:          p.repoInfo.Name,
+		ref:               p.ref,
+		endpoint:          p.endpoint,
+		repo:              p.repo,
+		pushState:         &p.pushState,
+	}
+	//根据一个
+	for range rootfs.DiffIDs {
+		descriptor := descriptorTemplate
+		descriptor.layer = l
+		descriptor.checkedDigests = make(map[digest.Digest]struct{})
+		descriptors = append(descriptors, &descriptor)
+		//根据diff的描述，获取当前镜像的父image
+		l = l.Parent()
+	}
+	//
+	if err := p.config.UploadManager.Upload(ctx, descriptors, p.config.ProgressOutput); err != nil {
+		return err
+	}
+
+	// Try schema2 first
+	builder := schema2.NewManifestBuilder(p.repo.Blobs(ctx), p.config.ConfigMediaType, imgConfig)
+	manifest, err := manifestFromBuilder(ctx, builder, descriptors)
+	if err != nil {
+		return err
+	}
+
+	manSvc, err := p.repo.Manifests(ctx)
+	if err != nil {
+		return err
+	}
+
+	putOptions := []distribution.ManifestServiceOption{distribution.WithTag(ref.Tag())}
+	if _, err = manSvc.Put(ctx, manifest, putOptions...); err != nil {
+		if runtime.GOOS == "windows" || p.config.TrustKey == nil || p.config.RequireSchema2 {
+			logrus.Warnf("failed to upload schema2 manifest: %v", err)
+			return err
+		}
+
+		logrus.Warnf("failed to upload schema2 manifest: %v - falling back to schema1", err)
+
+		msg := fmt.Sprintf("[DEPRECATION NOTICE] registry v2 schema1 support will be removed in an upcoming release. Please contact admins of the %s registry NOW to avoid future disruption. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", reference.Domain(ref))
+		logrus.Warn(msg)
+		progress.Message(p.config.ProgressOutput, "", msg)
+
+		manifestRef, err := reference.WithTag(p.repo.Named(), ref.Tag())
+		if err != nil {
+			return err
+		}
+		builder = schema1.NewConfigManifestBuilder(p.repo.Blobs(ctx), p.config.TrustKey, manifestRef, imgConfig)
+		manifest, err = manifestFromBuilder(ctx, builder, descriptors)
+		if err != nil {
+			return err
+		}
+
+		if _, err = manSvc.Put(ctx, manifest, putOptions...); err != nil {
+			return err
+		}
+	}
+
+	var canonicalManifest []byte
+
+	switch v := manifest.(type) {
+	case *schema1.SignedManifest:
+		canonicalManifest = v.Canonical
+	case *schema2.DeserializedManifest:
+		_, canonicalManifest, err = v.Payload()
+		if err != nil {
+			return err
+		}
+	}
+
+	manifestDigest := digest.FromBytes(canonicalManifest)
+	progress.Messagef(p.config.ProgressOutput, "", "%s: digest: %s size: %d", ref.Tag(), manifestDigest, len(canonicalManifest))
+
+	if err := addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id); err != nil {
+		return err
+	}
+
+	// Signal digest to the trust client so it can sign the
+	// push, if appropriate.
+	progress.Aux(p.config.ProgressOutput, apitypes.PushResult{Tag: ref.Tag(), Digest: manifestDigest.String(), Size: len(canonicalManifest)})
+
+	return nil
+}
+```
+
 

@@ -192,7 +192,7 @@ push后指定要上传镜像的repo/image/tag，因此猜测，整体过程为：
 
 3. 根据layer信息，从layerdb中得到具体的layer文件，将layer文件上传
 
-4. 根据上传的layer制作manifest文件，并签名后上传
+4. 根据上传的layer在distribution目录中更新内容，制作manifest文件，并签名后上传
 
 下面进入`postImagesPush`函数，实现如下：
 ```
@@ -314,13 +314,13 @@ func Push(ctx context.Context, ref reference.Named, imagePushConfig *ImagePushCo
 }
 ```
 
-上述代码主要是解析endpoint，endpoint的结构如下,：
+上述代码主要是解析endpoint，，并得到image的digest，即**前文的步骤1**。endpoint的结构如下,：
 ```
 type APIEndpoint struct {
-	Mirror                         bool
+	Mirror                         bool //docker mirror，镜像加速设置
 	URL                            *url.URL	//registry url
 	Version                        APIVersion //registry version
-	AllowNondistributableArtifacts bool 
+	AllowNondistributableArtifacts bool  //本地registry配置，在daemon.json的allow-nondistributable-artifacts"中设置
 	Official                       bool // 是否官方registry
 	TrimHostname                   bool 
 	TLSConfig                      *tls.Config //https config
@@ -375,7 +375,7 @@ func (p *v2Pusher) pushV2Repository(ctx context.Context) (err error) {
 	...
 }
 ```
-因此，进入pushV2Tag,一段段来看，首先是根据image digest得到iamge config以及相关信息：
+因此，进入pushV2Tag,一段段来看，首先是根据image digest得到iamge config以及相关信息，比如layer/platform和layer内容，也就是**前文的步骤2**：
 
 ```
 func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id digest.Digest) error {
@@ -387,6 +387,9 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 	...
 	//platform ，即os字段linux
 	platform, err := p.config.ImageStore.PlatformFromConfig(imgConfig)
+```
+继续获取layer信息，得到layer的内容描述l，即**前文的步骤3**：
+```
 	...
 	//l为具体的layer内容
 	l, err := p.config.LayerStores[platform.OS].Get(rootfs.ChainID())
@@ -396,7 +399,6 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 	...
 	defer l.Release()
 	...
-}
 ```
 上面代码获取的imageconfig就是docker存储image时的imagedb中的content目录中某个iamge的内容，可以根据上面的代码对应下面的每一个项上，imageconfig的结构如下：
 ```
@@ -425,7 +427,6 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 
 ```
 基本信息获取后，封装一个descriptors的切片，这个切片的每个元素就是layer和registry的具体信息。
-
 ```
 	...
 	var descriptors []xfer.UploadDescriptor
@@ -438,62 +439,244 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 		repo:              p.repo,
 		pushState:         &p.pushState,
 	}
-	//根据一个
+	//根据image config的rootfs项遍历layer
 	for range rootfs.DiffIDs {
 		descriptor := descriptorTemplate
 		descriptor.layer = l
 		descriptor.checkedDigests = make(map[digest.Digest]struct{})
 		descriptors = append(descriptors, &descriptor)
-		//根据diff的描述，获取当前镜像的父image
+		//当前镜像的父image
 		l = l.Parent()
 	}
 	//
 	if err := p.config.UploadManager.Upload(ctx, descriptors, p.config.ProgressOutput); err != nil {
 		return err
 	}
+```
+继续进入`p.config.UploadManager.Upload`内部实现,根据docker push的行为表现，知道layer是一层层push的，即同步的。在此函数的注释中看到对此过程的描述：
+```
+// Upload is a blocking function which ensures the listed layers are present on
+// the remote registry. It uses the string returned by the Key method to
+// deduplicate uploads.
+func (lum *LayerUploadManager) Upload(ctx context.Context, layers []UploadDescriptor, progressOutput progress.Output) error {
+	var (
+		uploads          []*uploadTransfer
+		dedupDescriptors = make(map[string]*uploadTransfer)
+	)
+	//遍历每一个layer，执行xferFunc函数
+	for _, descriptor := range layers {
+		progress.Update(progressOutput, descriptor.ID(), "Preparing")
 
-	// Try schema2 first
+		key := descriptor.Key()
+		//如果这个layer上传过了，则跳过
+		if _, present := dedupDescriptors[key]; present {
+			continue
+		}
+		xferFunc := lum.makeUploadFunc(descriptor)
+		upload, watcher := lum.tm.Transfer(descriptor.Key(), xferFunc, progressOutput)
+		defer upload.Release(watcher)
+		//切片保存
+		uploads = append(uploads, upload.(*uploadTransfer))
+		//将上传过的layer缓存
+		dedupDescriptors[key] = upload.(*uploadTransfer)
+	}
+	//遍历上传过的layer，处理返回
+	for _, upload := range uploads {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-upload.Transfer.Done():
+			if upload.err != nil {
+				return upload.err
+			}
+		}
+	}
+	//填充layer的remoteDescriptor字段，标注哪些layer已经upload
+	for _, l := range layers {
+		l.SetRemoteDescriptor(dedupDescriptors[l.Key()].remoteDescriptor)
+	}
+
+	return nil
+}
+```
+上述代码完成了upload的框架性功能，就是依次upload，处理返回信息，进入upload的函数变量xferFunc实现：
+```
+func (lum *LayerUploadManager) makeUploadFunc(descriptor UploadDescriptor) DoFunc {
+	return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
+		u := &uploadTransfer{
+			Transfer: NewTransfer(),
+		}
+		//定义goroutine异步处理push
+		go func() {
+			defer func() {
+				close(progressChan)
+			}()
+
+			progressOutput := progress.ChanOutput(progressChan)
+			//同步控制，等待父layer完成后，进行当前layer的push
+			select {
+			case <-start:
+			default:
+				progress.Update(progressOutput, descriptor.ID(), "Waiting")
+				<-start
+			}
+			//循环push，直到失败
+			retries := 0
+			for {
+				//如果上传成功，将remoteDescriptor写于uploadTransfer
+				remoteDescriptor, err := descriptor.Upload(u.Transfer.Context(), progressOutput)
+				if err == nil {
+					u.remoteDescriptor = remoteDescriptor
+					break
+				}
+				//取消处理
+				select {
+				case <-u.Transfer.Context().Done():
+					u.err = err
+					return
+				default:
+				}
+				//重传控制
+				...
+			}
+		}()
+		return u
+	}
+}
+```
+上述代码为每一个layer开启了一个goroutine去push，push完成后将layer描述写入uploadTransfer。并通过channel去进行同步控制，继续看`remoteDescriptor, err := descriptor.Upload(u.Transfer.Context(), progressOutput)`的实现,其中descriptor的类型为v2PushDescriptor：
+```
+func (pd *v2PushDescriptor) Upload(ctx context.Context, progressOutput progress.Output) (distribution.Descriptor, error) {
+	//nondistributable artifacts配置
+	...
+	diffID := pd.DiffID()
+	...
+	//缓存处理，如果已经push，则return
+	...
+	//根据layer计算push配置参数
+	maxMountAttempts, maxExistenceChecks, checkOtherRepositories := getMaxMountAndExistenceCheckAttempts(pd.layer)
+	//metadata即distribution目录中layer id和digest的对应关系
+	v2Metadata, err := pd.v2MetadataService.GetMetadata(diffID)
+	//如果这个layer已经被别的image push（因为image会共享父layer），则layer已经存在。直接返回这个layer
+	...
+	//以上检查都false 说明这个layer没有被push过，则准备push，首先封装一个registry的blob
+	bs := pd.repo.Blobs(ctx)
+	var layerUpload distribution.BlobWriter
+
+	//之前都是在同一个repo中的image上find已经上传的layer,现在去不同的repo中找，如果存在，则进行mount，并将信息作为Push参数
+	candidates := getRepositoryMountCandidates(pd.repoInfo, pd.hmacKey, maxMountAttempts, v2Metadata)
+	isUnauthorizedError := false
+	for _, mountCandidate := range candidates {
+		mountCandidate.SourceRepository)
+		createOpts := []distribution.BlobCreateOption{}
+		if len(mountCandidate.SourceRepository) > 0 {
+			namedRef, err := reference.ParseNormalizedNamed(mountCandidate.SourceRepository)
+			...
+			remoteRef, err := reference.WithName(reference.Path(namedRef))
+			...
+			canonicalRef, err := reference.WithDigest(reference.TrimNamed(remoteRef), mountCandidate.Digest)
+			...
+			createOpts = append(createOpts, client.WithMountFrom(canonicalRef))
+		}
+
+		//根据bs，创建一个post请求的http client，创建过程其实首选发送了一个post，获取resp中的UUID header，这里猜测是防重放
+		lu, err := bs.Create(ctx, createOpts...)
+		...
+		// when error is unauthorizedError and user don't hasAuthInfo that's the case user don't has right to push layer to register
+		// auth check
+		...
+		if lu != nil {
+			// cancel previous upload
+			cancelLayerUpload(ctx, mountCandidate.Digest, layerUpload)
+			layerUpload = lu
+		}
+	}
+	...
+	//如果layer完全是新的，则push
+	if layerUpload == nil {
+		layerUpload, err = bs.Create(ctx)
+		...
+	}
+	defer layerUpload.Close()
+	// 最终的push
+	return pd.uploadUsingSession(ctx, progressOutput, diffID, layerUpload)
+}
+```
+进入` pd.uploadUsingSession(ctx, progressOutput, diffID, layerUpload)`内部，猜测其完成了**步骤3中的push layer以及distribution更新**：
+```
+func (pd *v2PushDescriptor) uploadUsingSession(
+	ctx context.Context,
+	progressOutput progress.Output,
+	diffID layer.DiffID,
+	layerUpload distribution.BlobWriter,
+) (distribution.Descriptor, error) {
+	//常规io操作
+	contentReader, err := pd.layer.Open()
+	...
+	size, _ := pd.layer.Size()
+	reader = progress.NewProgressReader(ioutils.NewCancelReadCloser(ctx, contentReader), progressOutput, size, pd.ID(), "Pushing")
+	...
+	digester := digest.Canonical.Digester()
+	tee := io.TeeReader(reader, digester.Hash())
+	//push layer在此处，这个layerUpload的具体类型为httpBlobUpload，通过http PATCH请求发送layer数据，并返回layer大小信息
+	nn, err := layerUpload.ReadFrom(tee)
+	reader.Close()
+	...
+	//验证已经push的Layer，将layer的digest 通过http put方法发送给registry做校验？
+	pushDigest := digester.Digest()
+	if _, err := layerUpload.Commit(ctx, distribution.Descriptor{Digest: pushDigest}); err != nil {
+		return distribution.Descriptor{}, retryOnError(err)
+	}
+	...
+	// 将已经push的layer添加到cache
+	if err := pd.v2MetadataService.TagAndAdd(diffID, pd.hmacKey, metadata.V2Metadata{
+		Digest:           pushDigest,
+		SourceRepository: pd.repoInfo.Name(),
+	}); err != nil {
+		return distribution.Descriptor{}, xfer.DoNotRetry{Err: err}
+	}
+	desc := distribution.Descriptor{
+		Digest:    pushDigest,
+		MediaType: schema2.MediaTypeLayer,
+		Size:      nn,
+	}
+	...
+	return desc, nil
+}
+```
+至此，返回`makeUploadFunc`看到之后的最主要工作是将返回的desc赋值给uploadTransfer，继续返回，在`func (lum *LayerUploadManager) Upload`函数中，执行完所有的layer后，更新distribution目录信息：
+```
+for _, upload := range uploads {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-upload.Transfer.Done():
+			if upload.err != nil {
+				return upload.err
+			}
+		}
+	}
+	for _, l := range layers {
+		l.SetRemoteDescriptor(dedupDescriptors[l.Key()].remoteDescriptor)
+	}
+
+	return nil
+```
+继续返回上层函数至`func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id digest.Digest)`,最后，根据**步骤4的猜测，将生成manifest并更新给registry**，具体代码如下：
+```
+	//构建manifest内容
 	builder := schema2.NewManifestBuilder(p.repo.Blobs(ctx), p.config.ConfigMediaType, imgConfig)
 	manifest, err := manifestFromBuilder(ctx, builder, descriptors)
-	if err != nil {
-		return err
-	}
-
 	manSvc, err := p.repo.Manifests(ctx)
-	if err != nil {
-		return err
-	}
-
+	...
 	putOptions := []distribution.ManifestServiceOption{distribution.WithTag(ref.Tag())}
+	//具体的put实现，manifests发送http put请求，
 	if _, err = manSvc.Put(ctx, manifest, putOptions...); err != nil {
-		if runtime.GOOS == "windows" || p.config.TrustKey == nil || p.config.RequireSchema2 {
-			logrus.Warnf("failed to upload schema2 manifest: %v", err)
-			return err
-		}
-
-		logrus.Warnf("failed to upload schema2 manifest: %v - falling back to schema1", err)
-
-		msg := fmt.Sprintf("[DEPRECATION NOTICE] registry v2 schema1 support will be removed in an upcoming release. Please contact admins of the %s registry NOW to avoid future disruption. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", reference.Domain(ref))
-		logrus.Warn(msg)
-		progress.Message(p.config.ProgressOutput, "", msg)
-
-		manifestRef, err := reference.WithTag(p.repo.Named(), ref.Tag())
-		if err != nil {
-			return err
-		}
-		builder = schema1.NewConfigManifestBuilder(p.repo.Blobs(ctx), p.config.TrustKey, manifestRef, imgConfig)
-		manifest, err = manifestFromBuilder(ctx, builder, descriptors)
-		if err != nil {
-			return err
-		}
-
-		if _, err = manSvc.Put(ctx, manifest, putOptions...); err != nil {
-			return err
-		}
+		//根据err 进行版本适配等reput
+		...
 	}
 
 	var canonicalManifest []byte
-
 	switch v := manifest.(type) {
 	case *schema1.SignedManifest:
 		canonicalManifest = v.Canonical
@@ -503,18 +686,8 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 			return err
 		}
 	}
-
-	manifestDigest := digest.FromBytes(canonicalManifest)
-	progress.Messagef(p.config.ProgressOutput, "", "%s: digest: %s size: %d", ref.Tag(), manifestDigest, len(canonicalManifest))
-
-	if err := addDigestReference(p.config.ReferenceStore, ref, manifestDigest, id); err != nil {
-		return err
-	}
-
-	// Signal digest to the trust client so it can sign the
-	// push, if appropriate.
-	progress.Aux(p.config.ProgressOutput, apitypes.PushResult{Tag: ref.Tag(), Digest: manifestDigest.String(), Size: len(canonicalManifest)})
-
+	//本地保存digest
+	...
 	return nil
 }
 ```

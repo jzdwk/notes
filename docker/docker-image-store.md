@@ -283,7 +283,7 @@ distribution/
 
 这个结构里有两个目录:
 
-- **v2metadata-by-diffid**: v2metadata-by-diffid目录下，可以通过Layer的diff_id，也就是layer id，找到对应的 digest描述，并且包含了生成该digest的源仓库,比如本地的busybox镜像diff_id的描述：
+- **v2metadata-by-diffid**: v2metadata-by-diffid目录下，可以通过Layer的diff_id，也就是layer id，找到对应的 **digest描述，这个digest用于标记这个layer是否已经Push到了描述的registry上**，并且包含了生成该digest的源仓库,比如本地的busybox镜像diff_id的描述：
 
 ```
 cat 5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab
@@ -302,7 +302,7 @@ cat 5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab
   ...
 ]
 ```
-busybox的镜像打了不同的tag并push，所以，对于一份busybox，存在唯一的digest描述`e2334dd9fee4b77e48a8f2d793904118a3acf26f1f2e72a3d79c6cae993e07f0`，而layer ID对应此处的5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab。
+busybox的镜像**打了不同的tag并push**，所以，对于一份busybox，存在唯一的digest描述`e2334dd9fee4b77e48a8f2d793904118a3acf26f1f2e72a3d79c6cae993e07f0`，而layer ID对应此处的5b0d2d635df829f65d0ffb45eab2c3124a470c4f385d6602bda0c21c5248bcab。
 
 - **diffid-by-digest**: diffid-by-digest目录则与v2metadata-by-diffid相反，通过digest来得到对应的layer id，如
 

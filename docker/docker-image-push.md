@@ -149,6 +149,7 @@ func (cli *Client) ImagePush(ctx context.Context, image string, options types.Im
 }
 ```
 当进行tryImagePush时，出现未授权的err时，则调用之前创建的函数变量PrivilegeFunc。因此猜测这个函数的作用为授权操作，具体的场景为：虽然通过config.json得到了auth信息，但是，这个auth信息所包含的用户并不能够将image push到这个repo上，因此需要用授权的另一个账户登录，从而拿新的auth信息来操作。
+此处涉及到了**docker client对于registr**
 
 因此，回过头看下`RegistryAuthenticationPrivilegedFunc`完成的工作，猜想得到验证：
 ```

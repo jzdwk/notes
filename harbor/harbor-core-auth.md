@@ -47,7 +47,8 @@ func Init() {
 		&unauthorizedReqCtxModifier{}}
 }
 ```
-上述代码其实初始化了reqCtxModifiers这个请求上下文数组，数组的类型为接口，每一个元素表示一种认证方式，并实现了其modify方法。其中对于**admiral**的config方式进行了特殊处理。注意，这里的认证方式，指的是http请求发送时，认证信息的承载方式，而不是具体的认证实现。比如basicAuthReqCtxModifier描述了http的basic auth认证，从basic auth取得身份信息后，具体的身份验证要根据配置从db/ldap里check。
+上述代码其实初始化了reqCtxModifiers这个请求上下文切片，每一个元素表示了一种过滤的具体方式，并实现了其modify方法。比如`configCtxModifier`在上下文中增加了配置信息，`oidcCliReqCtxModifier`首先校验是否使用了oidc认证等。**注意各个元素的填充顺序**
+其中对于[admiral](https://vmware.github.io/admiral/) 的config方式进行了特殊处理，它是vmware的一个容器管理平台，暂且不用管。
 
 ## SessionCheck
 
@@ -66,7 +67,7 @@ func SessionCheck(ctx *beegoctx.Context) {
 
 ## SecurityFilter
 
-这个filter主要完成了对所有api的认证操作，其代码十分简单，即对之前init的ReqCtxModifier数组进行循环调用modify：
+这个filter主要完成了对所有api的认证操作，对之前init的ReqCtxModifier数组进行循环调用modify：
 ```
 	//nil handler
 	
@@ -76,11 +77,11 @@ func SessionCheck(ctx *beegoctx.Context) {
 		}
 	}
 ```
-当有一个modify返回true，则break。
+当有一个modify返回true，说明验证通过，直接break。
 
 ### basicAuthReqCtxModifier
 
-以最简单的basic auth的认证方式为例子，basic方式即使用http的basic auth作为认证信息的载体，具体实现如下：
+以http basic auth的认证方式为例子，basic方式即使用http的basic auth作为认证信息的载体，当之前modifier返回false，即没有使用诸如oidc的话，进入此函数。具体实现如下：
 ```
 func (b *basicAuthReqCtxModifier) Modify(ctx *beegoctx.Context) bool {
 	//从req中获取认证信息
@@ -91,7 +92,7 @@ func (b *basicAuthReqCtxModifier) Modify(ctx *beegoctx.Context) bool {
 		...
 	}
 
-	// 调用dao层从db进行认证
+	// 调用dao层认证
 	user, err := auth.Login(models.AuthModel{
 		Principal: username,
 		Password:  password,
@@ -104,7 +105,7 @@ func (b *basicAuthReqCtxModifier) Modify(ctx *beegoctx.Context) bool {
 	return true
 }
 ```
-上面的逻辑很清晰，而basic auth只是提供了认证信息，具体的认证逻辑和调用db/ldap还是其他方式来实现认证则是在Login中完成。在具体的Login操实现如下：
+注意，这里的认证方式，指的是http请求发送时，认证信息的承载方式，而不是具体的认证实现。比如basicAuthReqCtxModifier描述了http的basic auth认证，从basic auth取得身份信息后，具体的身份验证要根据配置从db/ldap里校验，即在Login中完成。具体的Login实现如下：
 ```
 func Login(m models.AuthModel) (*models.User, error) {
 	//从配置中获取认证模式，有基于db的/ldap/oidc等
@@ -133,5 +134,26 @@ func Login(m models.AuthModel) (*models.User, error) {
 ```
 上述代码通过authmode，获取对应的认证器authenticator来完成实际的认证过程，其中认证器authenticator的继承结构如下：
 ```
-db/ldap/oidc等具体authenticator-继承->DefaultAuthenticateHelper-实现->AuthenticateHelper
+db/ldap/authproxy等具体authenticator-继承->DefaultAuthenticateHelper-实现->AuthenticateHelper
 ```
+## ReadonlyFilter
+
+第三个注册的过滤器主要使用了whitelist来约束read-only模式下使用harbor的行为，当前部署模式下无需考虑：
+```
+func filter(req *http.Request, resp http.ResponseWriter) {
+	if !config.ReadOnly() {
+		return
+	}
+	
+	if matchRepoTagDelete(req) || matchRetag(req) {
+		resp.WriteHeader(http.StatusServiceUnavailable)
+		_, err := resp.Write([]byte("The system is in read only mode. Any modification is prohibited."))
+		if err != nil {
+			log.Errorf("failed to write response body: %v", err)
+		}
+	}
+}
+```
+
+qutation: 
+- https://zhuanlan.zhihu.com/p/61151082 harbor源码浅析

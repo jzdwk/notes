@@ -2,7 +2,7 @@
 
 harbor的业务认证位于core的filter中实现，参见[core-auth](harbor-core-auth)。此外，需要对docker login进行认证，并将认证结果返回给docker。
 
-docker login的详细实现请参考[docker-login](../docker/docker-login.md)。harbor在这里的主要所用是扮演了v2 registry的角色。
+docker login的认证标准可以[参考](https://docs.docker.com/registry/spec/auth/token/) 。harbor在这里的主要所用是扮演了[v2 registry](https://docs.docker.com/registry/) 的角色。
 
 ## registry配置
 
@@ -43,21 +43,14 @@ func (g generalCreator) Create(r *http.Request) (*models.Token, error) {
 	...
 	//获取请求的
 	pm, err := filter.GetProjectManager(r)
-	if err != nil {
-		return nil, fmt.Errorf("failed to  get project manager from request")
-	}
-
-	// for docker login
-	if !ctx.IsAuthenticated() {
-		if len(scopes) == 0 {
-			return nil, &unauthorizedError{}
-		}
-	}
+	...
+	//鉴权逻辑
 	access := GetResourceActions(scopes)
 	err = filterAccess(access, ctx, pm, g.filterMap)
-	if err != nil {
-		return nil, err
-	}
+	//鉴权通过后创建token
 	return MakeToken(ctx.GetUsername(), g.service, access)
 }
-``
+```
+
+
+

@@ -170,6 +170,7 @@ func (r *imageRouter) initRoutes() {
 PullImage函数在registryBackend接口中定义，由ImageService实现。在函数内部，经过解析image/tag以及auth信息，调用pullImageWithReference来进行,这个函数的主要作用是定义了两个chan,progressChan用于打印pull进度，writesDone是个无缓冲chan，用于标识完成pull。cancelFunc则定义了一组资源清理的逻辑，当使用goroutine读取进度progress过程中出错，则进行资源清理。最后，在进行了进一步的封装后，调用distribution.Pull函数。
 
 ```
+func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference.Named, platform *specs.Platform, metaHeaders map[string][]string, authConfig *types.AuthConfig, outStream io.Writer) error {
 	progressChan := make(chan progress.Progress, 100)
 	writesDone := make(chan struct{})
 	ctx, cancelFunc := context.WithCancel(ctx)
@@ -197,6 +198,7 @@ PullImage函数在registryBackend接口中定义，由ImageService实现。在�
 
 	err := distribution.Pull(ctx, ref, imagePullConfig)
 	<-writesDone
+}
 ```
 
 进入distribution.Pull函数，其中是一个解析过程，获取repo和endpoints，并根据解析的endpoints信息，得到一个v2Puller对象*（注意这个v2puller是在new中写死的？是否可以解耦）*,这个对象实现了Puller接口，代码如下：
@@ -205,7 +207,7 @@ PullImage函数在registryBackend接口中定义，由ImageService实现。在�
 	//根据ref信息解析出test/hello-world
 	repoInfo, err := imagePullConfig.RegistryService.ResolveRepository(ref)
 	....
-	//解析出test， 注意此时的endpoints为一个切片，原因？
+	//解析出test， 注意此时的endpoints为一个切片，原因？dns？
 	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
 	...
 	for _, endpoint := range endpoints {
@@ -218,7 +220,7 @@ PullImage函数在registryBackend接口中定义，由ImageService实现。在�
 		}
 ```
 
-再看v2puller对于pull的实现，首先根据之前的配置和参数，New了一个Repository对象，这个对象里主要是创建http client，并加入认证信息，以及根据endpoint进行了ping操作：
+这里使用了v2版本的puller。此处存在一个**认证授权的逻辑**，请参考[docker token](https://docs.docker.com/registry/spec/auth/token/) ，对于认证的详细步骤，请参考[docker-login](docker-login.md) 。再看v2puller对于pull的实现，首先根据之前的配置和参数，New了一个Repository对象，这个对象里主要是创建http client，并加入认证信息，以及根据endpoint进行了ping操作，返回的信息中携带了authZ server，这个信息封装进了p.repo：
 
 ```
 	p.repo, p.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "pull")
@@ -254,6 +256,7 @@ docker pull从整体上来说，做了以下工作：
 下面看一下pull的核心代码，首先，根据context生成一个manifest的service，[manifest](https://docs.docker.com/registry/spec/manifest-v2-2/) 主要用于描述一个镜像的组成信息，根据版本的不同(schema1/2,2通过引入manifest list，增加了多架构下的image描述)，其解析逻辑存在差异。在解析ref时，根据docker pull的参数的不同，分为了digest和tag两种，这也从侧面说明了pull的不同方式：
 
 ```
+func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform *specs.Platform) (tagUpdated bool, err error) {
     manSvc, err := p.repo.Manifests(ctx)
 	...
 	var (
@@ -271,9 +274,10 @@ docker pull从整体上来说，做了以下工作：
 	} else {
 		return false, fmt.Errorf("internal error: reference has neither a tag nor a digest: %s", reference.FamiliarString(ref))
 	}
+}
 ```
 
-上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息(docker pull mysql:5.7 or docker pull mysql@digest)。并返回一个manifest。注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
+上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息(docker pull mysql:5.7 or docker pull mysql@digest)。并返回一个manifest。**考虑在docker pull时，存在鉴权业务，在之前的实现中，通过调用NewV2Repository已经得到了authZ server地址，因此猜测在此处向该地址发送认证信息去鉴权，具体步骤带补充**。另外注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
 ```
 	...
 	//根据pull的参数，赋值digestOrTag

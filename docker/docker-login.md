@@ -129,7 +129,7 @@ func loginV2(authConfig *types.AuthConfig, endpoint APIEndpoint, userAgent strin
 }
 ```
 
-上述代码主要做了两件事，一是调用`v2AuthHTTPClient`封装一个loginClient，二是使用这个client向**authZ server** 发送授权请求，即**步骤3**。此处，向**authZ server**请求，就要知道其地址。进入v2AuthHTTPClient：
+上述代码主要做了两件事，一是调用`v2AuthHTTPClient`封装一个loginClient，二是使用这个client向**authZ server** 发送鉴权请求，即**步骤3**。此处，向**authZ server**请求，就要知道其地址。进入v2AuthHTTPClient：
 ```
 func v2AuthHTTPClient(endpoint *url.URL, authTransport http.RoundTripper, modifiers []transport.RequestModifier, creds auth.CredentialStore, scopes []auth.Scope) (*http.Client, bool, error) {
 	challengeManager, foundV2, err := PingV2Registry(endpoint, authTransport)
@@ -211,7 +211,7 @@ func PingV2Registry(endpoint *url.URL, transport http.RoundTripper) (challenge.M
 ```
 func ResponseChallenges(resp *http.Response) []Challenge {
 	if resp.StatusCode == http.StatusUnauthorized {
-		//registry 返回410时，处理header
+		//registry 返回401时，处理header
 		return parseAuthHeader(resp.Header)
 	}
 	return nil

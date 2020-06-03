@@ -25,6 +25,63 @@ auth:
 ```
 这个`realm`就是返回给docker的用于真正鉴权的地址。
 
+### 测试
+
+当在harbor的commone中将registry的配置文件relm项进行修改，改为自定义的地址，则docker的授权请求将发送至此地址，其内容为：
+
+1. docker login
+
+- http header: 4个k-v，User-Agent，Authoriztion，Accept-Encoding，Connection。其中Authoriztion的值为Basic base64(usr:pwd)
+- http url:/self-define/auth?account=user1&client_id=docker&offline_token=true&service=harbor-registry
+
+可以看到login时请求的认证信息
+
+2. docker pull
+
+- http header(未登录): 3个k-v，User-Agent，Authoriztion，Accept-Encoding，Connection。
+- http header(已登录): 4个k-v，User-Agent，Authoriztion，Accept-Encoding，Connection。其中Authoriztion的值为Basic base64(usr:pwd)
+- http url(未登录):/self-define/auth?scope=repository%3Ausr1test1%2Fbusybox%3Apull&service=harbor-registry
+- http url(已登录):/self-define/auth?account=user2&scope=repository%3Ausr1test1%2Fbusybox%3Apull&service=harbor-registry
+
+可以看到docker pull时携带的请求资源信息，包括了repo/repoInfo/操作(pull)，当已经登录，也会携带登录的信息，这个行为同样应用于docker push
+
+3. k8s docker pull
+
+当使用k8s资源对象创建pod时，pod的image如果为harbor私有镜像提供，则需要增加secret，例子如下：
+```
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: busy
+spec:
+  replicas: 1
+  selector:
+    app: busy
+  template:
+    metadata:
+      labels:
+        app: busy
+    spec:
+      containers:
+      - name: busy
+        image: myharbor.com/usr1test1/busybox:1.0
+      imagePullSecrets:
+      - name: harbor-key
+
+```
+其中imagePullSecrets中的secret定义如下：
+```
+kubectl  create secret docker-registry harbor-key \
+--docker-server=myharbor.com \
+--docker-username=user2 \
+--docker-password=<your-pword> \
+```
+此时，将有k8s调用docker的pull接口，最终发送给authZ的请求与docker pull一致：
+
+- http header(已登录): 4个k-v，User-Agent，Authoriztion，Accept-Encoding，Connection。其中Authoriztion的值为Basic base64(usr:pwd)
+- http url(已登录):/self-define/auth?account=user2&scope=repository%3Ausr1test1%2Fbusybox%3Apull&service=harbor-registry
+
+
 ## 鉴权
 
 查看habror中core的route。可看到对于token的处理函数定义：

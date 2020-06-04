@@ -14,7 +14,9 @@
 
 1. 在3级命令NewPullCommand中，首先取到了args\[0\],即`test/hello-world:1.0`这个值，并将其赋值给了remote域，然后进入RunPull函数：
 
-```
+```go
+func NewPullCommand(dockerCli command.Cli) *cobra.Command {
+	...
 	cmd := &cobra.Command{
 		Use:   "pull [OPTIONS] NAME[:TAG|@DIGEST]",
 		Short: "Pull an image or a repository from a registry",
@@ -24,11 +26,14 @@
 			return RunPull(dockerCli, opts)
 		},
 	}
+	...	
+}
 ```
 
 2. 进入RunPull，主要关注opts参数，在第一句就对这个remote做了解析,`distributionRef, err := reference.ParseNormalizedNamed(opts.remote)`,进入这个prase函数，可以看到其主要工作是解析remote后将其封装为一个Named接口，这个接口的实现有digestReference canonicalReference  taggedReference。代码的大致逻辑为：
 
-```
+```go
+func RunPull(cli command.Cli, opts PullOptions) error {
 	//合法性检查
 	...
 	//根据test/hello-world:1.0 解析中其中的仓库地址domamin，以及repo镜像/tag
@@ -51,12 +56,13 @@
 		return nil, fmt.Errorf("reference %s has no name", ref.String())
 	}
 	return named, nil
+}
 ```
 
 
 3. 解析完成后，将对registry的信息，以及认证信息做进一步的封装，封装的结构体如下：
 
-```
+```go
 type ImageRefAndAuth struct {
 	original   string
 	authConfig *types.AuthConfig
@@ -69,7 +75,7 @@ type ImageRefAndAuth struct {
 
 其具体实现的函数为`imgRefAndAuth, err := trust.GetImageReferencesAndAuth(ctx, nil, AuthResolver(cli), distributionRef.String())`,其中AuthResolver返回了一个函数func变量`func(ctx context.Context, index *registrytypes.IndexInfo) types.AuthConfig`,如下所示：
 
-```
+```go
 func AuthResolver(cli command.Cli) func(ctx context.Context, index *registrytypes.IndexInfo) types.AuthConfig {
 	return func(ctx context.Context, index *registrytypes.IndexInfo) types.AuthConfig {
 		return command.ResolveAuthConfig(ctx, cli, index)
@@ -80,7 +86,7 @@ func AuthResolver(cli command.Cli) func(ctx context.Context, index *registrytype
 因此，当AuthResolver被调用时，将根据传入的实际参数，调用command.ResolveAuthConfig(ctx, cli, index)，这个函数的大致逻辑为读取**docker的config.json**里内容，获取认证信息。(*思考？为何在GetImageReferencesAndAuth中使用函数变量，而不是在函数中直接调用呢？答：这样实现了认证信息的解耦，在GetImageReferencesAndAuth的形参中，只需要定义一个函数变量，规定其入参和返回值，而调用者根据实际情况，可选择传入AuthResolver的实现或者Othersolver，对于GetImageReferencesAndAuth内部，则不用关心。否则，其内部的调用逻辑将随着不同认证信息的获取方式改变而难以维护*)
 
 4. 之后，根据cli以及ImageRefAndAuthde的信息，调用`imagePullPrivileged`执行pull操作。在这个函数中，主要是对镜像信息ref和认证信息encodeAuth做了进一步的封装，即options：
-```
+```go
 	options := types.ImagePullOptions{
 		RegistryAuth:  encodedAuth,
 		PrivilegeFunc: requestPrivilege,
@@ -89,7 +95,9 @@ func AuthResolver(cli command.Cli) func(ctx context.Context, index *registrytype
 	}
 ```
 最后调用client的`ImagePull`函数进行请求的发送，核心的逻辑为首先向daemon的api请求`cli.post(ctx, "/images/create"`，如果需要认证，则调用注册的认证func PrivilegeFunc处理认证信息后重新发送请求：
-```
+```go
+func (cli *Client) ImagePull(ctx context.Context, refStr string, options types.ImagePullOptions) (io.ReadCloser, error){
+	...
 	resp, err := cli.tryImageCreate(ctx, query, options.RegistryAuth)
 	if errdefs.IsUnauthorized(err) && options.PrivilegeFunc != nil {
 		newAuthHeader, privilegeErr := options.PrivilegeFunc()
@@ -98,12 +106,14 @@ func AuthResolver(cli command.Cli) func(ctx context.Context, index *registrytype
 		}
 		resp, err = cli.tryImageCreate(ctx, query, newAuthHeader)
 	}
+	...
+}
 ```
 
 ## docker daemon
 
 docker daemon的api相关代码位于docker-ce/engine/api/server/router/\*，并根据不同的模块分为了container，network，image等包。根据client端的pull请求，定位到以下path定义：
-```
+```go
 func (r *imageRouter) initRoutes() {
 	r.routes = []router.Route{
 		// GET
@@ -125,7 +135,9 @@ func (r *imageRouter) initRoutes() {
 }
 ```
 进入对应的postImageCreate函数，这里主要进行了一些参数的解析，包括请求的image信息和auth信息，解析后直接调用后端的PullImage函数：
-```
+```go
+func (s *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	...
 	//解析请求参数
 	var (
 		image    = r.Form.Get("fromImage")  //hello-world
@@ -165,11 +177,12 @@ func (r *imageRouter) initRoutes() {
 	}
 
 	return nil
+}
 ```
 
 PullImage函数在registryBackend接口中定义，由ImageService实现。在函数内部，经过解析image/tag以及auth信息，调用pullImageWithReference来进行,这个函数的主要作用是定义了两个chan,progressChan用于打印pull进度，writesDone是个无缓冲chan，用于标识完成pull。cancelFunc则定义了一组资源清理的逻辑，当使用goroutine读取进度progress过程中出错，则进行资源清理。最后，在进行了进一步的封装后，调用distribution.Pull函数。
 
-```
+```go
 func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference.Named, platform *specs.Platform, metaHeaders map[string][]string, authConfig *types.AuthConfig, outStream io.Writer) error {
 	progressChan := make(chan progress.Progress, 100)
 	writesDone := make(chan struct{})
@@ -203,7 +216,8 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 
 进入distribution.Pull函数，其中是一个解析过程，获取repo和endpoints，并根据解析的endpoints信息，得到一个v2Puller对象*（注意这个v2puller是在new中写死的？是否可以解耦）*,这个对象实现了Puller接口，代码如下：
 
-```
+```go
+func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullConfig) error {
 	//根据ref信息解析出test/hello-world
 	repoInfo, err := imagePullConfig.RegistryService.ResolveRepository(ref)
 	....
@@ -218,17 +232,23 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 		if err := puller.Pull(ctx, ref, imagePullConfig.Platform); err != nil {
 			...error handler
 		}
+	}
+...
+}
 ```
 
-这里使用了v2版本的puller。此处存在一个**认证授权的逻辑**，请参考[docker token](https://docs.docker.com/registry/spec/auth/token/) ，对于认证的详细步骤，请参考[docker-login](docker-login.md) 。再看v2puller对于pull的实现，首先根据之前的配置和参数，New了一个Repository对象，这个对象里主要是创建http client，并加入认证信息，以及根据endpoint进行了ping操作，返回的信息中携带了authZ server，这个信息封装进了p.repo：
+这里使用了v2版本的puller。首先根据之前的配置和参数，New了一个Repository对象，这个对象里主要是创建http client，并加入认证信息，以及根据endpoint进行了**ping操作**，这个ping操作与[docker login](docker-login.md)一直。得到返回的信息中携带了authZ server，这个信息封装进了p.repo：
 
-```
+```go
+func (p *v2Puller) Pull(ctx context.Context, ref reference.Named, platform *specs.Platform) (err error) {
+	//NewV2Repository中首先调用了PingV2Registry，得到authZ地址
 	p.repo, p.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "pull")
-
+	
 	if err = p.pullV2Repository(ctx, ref, platform); err != nil {
 		...
 	}
 	return err
+}
 ```
 
 进入pullV2Repository,根据在image参数中是否含有tag走了不同的分支，不再赘述，这个函数最终又调用了pullV2Tag。这是pull过程的核心逻辑。在了解核心逻辑前，需要对docker image的各个概念以及存储有一个简单了解，[请移步](https://github.com/jzdwk/notes/blob/master/docker/docker-image-store.md)
@@ -253,9 +273,9 @@ docker pull从整体上来说，做了以下工作：
 
 9. 等所有的layer都下载完成后，整个image下载完成，就可以使用了
 
-下面看一下pull的核心代码，首先，根据context生成一个manifest的service，[manifest](https://docs.docker.com/registry/spec/manifest-v2-2/) 主要用于描述一个镜像的组成信息，根据版本的不同(schema1/2,2通过引入manifest list，增加了多架构下的image描述)，其解析逻辑存在差异。在解析ref时，根据docker pull的参数的不同，分为了digest和tag两种，这也从侧面说明了pull的不同方式：
+下面看一下pull的核心代码，首先，根据context生成一个manifest的service，[manifest](https://docs.docker.com/registry/spec/manifest-v2-2/) 主要用于描述一个镜像的组成信息，根据版本的不同(schema1/2,2通过引入manifest list，增加了多架构下的image描述)，其解析逻辑存在差异。在解析ref时，根据docker pull的参数的不同，分为了digest和tag两种，这也从侧面说明了pull的不同方式(**这里有一个关于认证授权的问题，上一步得到了一个authZ的地址，接下来需要从此处获取token才能pull镜像，那么这一步是在哪做的？**)：
 
-```
+```go
 func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform *specs.Platform) (tagUpdated bool, err error) {
     manSvc, err := p.repo.Manifests(ctx)
 	...
@@ -277,8 +297,9 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 }
 ```
 
-上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息(docker pull mysql:5.7 or docker pull mysql@digest)。并返回一个manifest。**考虑在docker pull时，存在鉴权业务，在之前的实现中，通过调用NewV2Repository已经得到了authZ server地址，因此猜测在此处向该地址发送认证信息去鉴权，具体步骤带补充**。另外注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
-```
+上面代码的重点是manSvc类型的Get函数，该函数的主要作用为向docker仓库发送一个http请求，请求中携带了image和tag or digest的信息(docker pull mysql:5.7 or docker pull mysql@digest)。并返回一个manifest。另外注意因为manifest的格式存在版本的不同，所以docker仓库在http respHeader中通过字段`Content-Type`进行了说明。
+```go
+func (ms *manifests) Get(ctx context.Context, dgst digest.Digest, options ...distribution.ManifestServiceOption) (distribution.Manifest, error) {
 	...
 	//根据pull的参数，赋值digestOrTag
 	for _, option := range options {
@@ -319,6 +340,7 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 		return m, nil
 	}
 	return nil, HandleErrorResponse(resp)
+}
 ```
 拿到manifest后，其内容类似于(manifest v2 schema2)：
 ```
@@ -362,7 +384,8 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 
 从中可以看到image基本信息以及layer信息。接下来就是解析manifest，并使用manifest的信息pull image：
 
-```
+```go
+func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform *specs.Platform) (tagUpdated bool, err error) {
 	...
 	//反序列化manifest，得到mediaType，并与docker daemon可支持的type做比对
 	if m, ok := manifest.(*schema2.DeserializedManifest); ok {
@@ -402,14 +425,18 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 	default:
 		return false, invalidManifestFormatError{}
 	}
+}
 ```
 在本环境下，manifest的版本为schemav2因此进入`p.pullSchema2(ctx, ref, v, platform)`函数。该函数的主要做了一个校验，当pull后的参数是digest时，保证manifest的digest和请求的一致，如果使用非digest的pull，则直接得到manifest的digest并返回。之后根据这个digest，调用函数pullSchema2Layers。首先第一句，如果这个digest在本地有，说明镜像在本地有，就不再继续，直接返回：
 
-```
+```go
+func (p *v2Puller) pullSchema2Layers(ctx context.Context, target distribution.Descriptor, layers []distribution.Descriptor, platform *specs.Platform) (id digest.Digest, err error) {
 	if _, err := p.config.ImageStore.Get(target.Digest); err == nil {
 		
 		return target.Digest, nil
 	}
+	...
+}
 ```
 
 函数`pullSchema2Layers(ctx context.Context, target distribution.Descriptor, layers []distribution.Descriptor, platform *specs.Platform)`的4个参数中，target即为manifest的config项，layers为layer项。接下来首先遍历image的所有layer，并封装为一个v2LayerDescriptor切片。后者的定义如下：
@@ -433,7 +460,7 @@ type v2LayerDescriptor struct {
 	downloadsDone := make(chan struct{})
 ```
 根据manifest里的config.digest,即镜像的sha256,去获取镜像的config信息,**这个config信息，就是在/var/lib/docker/image/imagedb/metadata里的信息**,写入configChan:
-```
+```go
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -449,7 +476,7 @@ type v2LayerDescriptor struct {
 	}()
 ```
 接下来，将进行layer的下载(暂时忽略windows的内容)，主要调用了RootFSDownloadManager接口的`Download`这个函数，由downloadManager实现：
-```
+```go
 	if p.config.DownloadManager != nil {
 		go func() {
 			var (
@@ -467,8 +494,9 @@ type v2LayerDescriptor struct {
 	}
 ```
 进入download内部，有4个入参，其中initialRootFS为一个空的rootfs结构，layers即层信息，progressOutput为要输出的内容。这个函数的实现是一个对于layer的for循环，根据每一个layer，在`l.Download(ctx, progressOutput)`中发送http get去获取layer数据，并将其写入`dm.blobStore.New()`的tmp目录中：
-```
-for _, l := range layers {
+```go
+func (dm *downloadManager) Download(ctx context.Context, initialRootFS image.RootFS, os string, layers []xfer.DownloadDescriptor, progressOutput progress.Output) (image.RootFS, func(), error) {
+	for _, l := range layers {
 		b, err := dm.blobStore.New()
 		...
 		rc, _, err := l.Download(ctx, progressOutput)
@@ -476,10 +504,12 @@ for _, l := range layers {
 		r := io.TeeReader(rc, b)
 		inflatedLayerData, err := archive.DecompressStream(r)
 		...
-}	
+	}	
+}
 ```
 进入`func (ld *layerDescriptor) Download(ctx context.Context, progressOutput pkgprogress.Output)`。这里首先通过一个newHTTPReadSeeker结构进行fetch，即下载layer，注意这里还封装了一个retry用于尝试多次获取，直到获取成功or超过5次，将返回的layer流rc写入tmp，在写入时，如果发现数据已经存在，即layer已经存在，直接返回：
-```
+```go
+func (ld *layerDescriptor) Download(ctx context.Context, progressOutput pkgprogress.Output) (io.ReadCloser, int64, error) {
 	rc, err := ld.fetcher.Fetch(ctx, ld.desc)
 	...
 	//根据layer的不同类型，得到对应的digest
@@ -491,9 +521,11 @@ for _, l := range layers {
 	ra, err := ld.is.ContentStore.ReaderAt(ctx, ld.desc)
 	...
 	return ioutil.NopCloser(content.NewReader(ra)), ld.desc.Size, nil
+}
 ```
 回到之前函数，当layer下载完成后，进行解压：
-```
+```go
+func (dm *downloadManager) Download(ctx context.Context, initialRootFS image.RootFS, os string, layers []xfer.DownloadDescriptor, progressOutput progress.Output) (image.RootFS, func(), error) {
 	for _, l := range layers {
 		...
 		defer inflatedLayerData.Close()
@@ -508,10 +540,11 @@ for _, l := range layers {
 		}
 		dm.blobs = append(dm.blobs, d)
 	}
-	return initialRootFS, nil, nil	
+	return initialRootFS, nil, nil
+}	
 ```
 并将layer信息封装至initialRootFs结构体，rootFS表示一个image的所有定义的文件结构，即image layers，后者的定义如下：
-```
+```go
 type RootFS struct {
 	Type    string         `json:"type"` 
 	DiffIDs []layer.DiffID `json:"diff_ids,omitempty"` //diff id，每个id代表一个layer
@@ -522,7 +555,9 @@ type RootFS struct {
 - 根据manifest中layer项描述的，从registry中download的各个layer以及digest
 - 根据manifest中config项的image digest，从registry中download的image的config信息(在../image/imagedb/metadata中)
 接下来，pull_v2函数将layer的digest和config中的diff进行比对，确保layer的正确性。
-```
+```go
+func (p *v2Puller) pullSchema2Layers(ctx context.Context, target distribution.Descriptor, layers []distribution.Descriptor, platform *specs.Platform) (id digest.Digest, err error) {
+	...
 	if configJSON == nil {
 		configJSON, configRootFS, _, err = receiveConfig(p.config.ImageStore, configChan, configErrChan)
 		...
@@ -543,6 +578,7 @@ type RootFS struct {
 	imageID, err := p.config.ImageStore.Put(configJSON)
 	...
 	return imageID, nil
+}
 ```
 都没有问题后，调用`p.config.ImageStore.Put(configJSON)`将config保存。至此,pull过程完毕并返回image id。
 

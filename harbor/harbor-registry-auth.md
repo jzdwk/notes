@@ -200,6 +200,40 @@ func MakeToken(username, service string, access []*token.ResourceActions) (*mode
 	}, nil
 }
 ```
-其中的makeTokenCore即根据入参创建jwt的token，为标准实现，需要注意的是access和pk内容。最终authZ service将token返回给docker(registry client)后，docker再将此token发送给registry完成请求。
+其中的makeTokenCore即根据入参创建jwt的token，为标准实现，生成的token内容为，其中的**Access**描述具体的权限，这个Access的描述也就是**实现鉴权的关键**：
+- Header；
+```json
+{
+	"Type":"JWT",
+	"SigningAlg":"RS256", //算法
+	"KeyID":"XXXX",
+	"X5c":null,
+	"RawJWK":null
+}
+```
+- Claims:
+```json
+{
+	"Issuer":"harbor-token-issuer",
+	"Subject":"user2",   //用户
+	"Audience":"harbor-registry",
+	"Expiration":"XXX",  //时间约束
+	"NotBefore":"XXX",
+	"IssuedAt":"XXX",
+	"JWTID":"XXX",
+	"Access":[
+		{
+			"Type":"repository",  //类型
+			"Class":null,
+			"Name":"repo/image"  //image描述
+			"Actions":["pull"]  //可列出的项有且只能是["pull","push","*"]
+		}
+	]
+}
+```
+- Signature，即HMAC(base64(Header)+base64(claims),pk)
+
+
+。最终authZ service将token返回给docker(registry client)后，docker再将此token发送给registry完成请求。
 
 

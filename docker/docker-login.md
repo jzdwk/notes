@@ -58,8 +58,8 @@ type AuthConfig struct {
 	Auth     string 
 	Email string 
 	ServerAddress string 
-	IdentityToken string //IdentityToken由authZ server返回，使用IdentityToken向registry请求
-	RegistryToken string //authZ Server返回的token，用于向registry发送
+	IdentityToken string //IdentityToken指的是认证token，其中不含有权限相关信息，由docker login请求后authZ server生成
+	RegistryToken string //authZ Server返回的token，包含了权限信息，用于docker push/pull操作
 }
 ```
 
@@ -249,7 +249,7 @@ func loginV2(authConfig *types.AuthConfig, endpoint APIEndpoint, userAgent strin
 }
 ```
 再次回到docker client端的runLogin函数，看到当auth请求返回，且IdentityToken不为空，则对token进行保存。
-```
+```go
 func runLogin(dockerCli command.Cli, opts loginOptions) error { //nolint: gocyclo
 	...
 	if response.IdentityToken != "" {

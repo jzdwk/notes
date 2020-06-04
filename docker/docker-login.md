@@ -49,7 +49,7 @@ func runLogin(dockerCli command.Cli, opts loginOptions) error { //nolint: gocycl
 }
 ```
 
-上述逻辑从docker login的参数中读取registry addr以及登录信息，并封装为authConfig结构，这个结构包含了授权所需的信息：
+上述逻辑从docker login的参数中读取registry addr以及登录信息，并封装为authConfig结构，这个结构包含了token信息：
 
 ```go
 type AuthConfig struct {
@@ -116,10 +116,10 @@ func loginV2(authConfig *types.AuthConfig, endpoint APIEndpoint, userAgent strin
 	endpointStr := strings.TrimRight(endpoint.URL.String(), "/") + "/v2/"
 	req, err := http.NewRequest(http.MethodGet, endpointStr, nil)
 	...
-	//向authZ server发送授权请求
+	//向authZ server发送认证请求
 	resp, err := loginClient.Do(req)
 	...
-	//说明授权成功，返回authZ server生成的token
+	//说明认证成功，返回authZ server生成的token
 	if resp.StatusCode == http.StatusOK {
 		return "Login Succeeded", credentialAuthConfig.IdentityToken, nil
 	}
@@ -237,7 +237,7 @@ func loginV2(authConfig *types.AuthConfig, endpoint APIEndpoint, userAgent strin
 	endpointStr := strings.TrimRight(endpoint.URL.String(), "/") + "/v2/"
 	req, err := http.NewRequest(http.MethodGet, endpointStr, nil)
 	...
-	//向authZ server发送授权请求
+	//向authZ server发送认证请求
 	resp, err := loginClient.Do(req)
 	...
 	//说明认证成功，返回authZ server生成的token

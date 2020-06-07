@@ -117,7 +117,7 @@ http {
         syslog-address: "tcp://127.0.0.1:1514"
         tag: "registry"
 ```
-事实上，harbor的大部分数据均位于/data下，针对数据挂载路径的配置位于`harbor.yaml`的data_volume字段中：
+harbor的大部分数据均位于/data下，针对数据挂载路径的配置位于`harbor.yaml`的data_volume字段中：
 ```
 # The default data volume
 data_volume: /data

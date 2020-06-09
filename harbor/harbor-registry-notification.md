@@ -294,6 +294,7 @@ func sendHookWithPolicies(policies []*models.NotificationPolicy, payload *notify
 ```
 
 通过前文的init可知，此时的handler为HTTPHandler，最终将调用
+
 ```go
 func (h *HTTPHandler) process(event *model.HookEvent) error {
 	j := &models.JobData{
@@ -308,21 +309,51 @@ func (h *HTTPHandler) process(event *model.HookEvent) error {
 	j.Parameters = map[string]interface{}{
 		"payload": string(payload),
 		"address": event.Target.Address,
-		// Users can define a auth header in http statement in notification(webhook) policy.
-		// So it will be sent in header in http request.
 		"auth_header":      event.Target.AuthHeader,
 		"skip_cert_verify": event.Target.SkipCertVerify,
 	}
 	return notification.HookManager.StartHook(event, j)
 }
 ```
-即webhook的处理过程。
+上述代码将push信息最终封装为一个job，向**job service**服务发送，具体的[job service](harbor-job-service.md)实现请移步，同时，设置了一个web hook的回调地址`/service/notifications/jobs/webhook/{id}`，当job被执行后调用：
+```go
+func (hm *DefaultManager) StartHook(event *model.HookEvent, data *models.JobData) error {
+	payload, err := json.Marshal(event.Payload)
+	...
+	t := time.Now()
+	id, err := hm.jobMgr.Create(&cModels.NotificationJob{
+		PolicyID:     event.PolicyID,
+		EventType:    event.EventType,
+		NotifyType:   event.Target.Type,
+		Status:       cModels.JobPending,
+		CreationTime: t,
+		UpdateTime:   t,
+		JobDetail:    string(payload),
+	})
+	...
+	//web hook 回调地址
+	statusHookURL := fmt.Sprintf("%s/service/notifications/jobs/webhook/%d", config.InternalCoreURL(), id)
+	data.StatusHook = statusHookURL
+	// submit hook job to jobservice
+	jobUUID, err := hm.client.SubmitJob(data)
+	...
+	if err = hm.jobMgr.Update(&cModels.NotificationJob{
+		ID:   id,
+		UUID: jobUUID,
+	}, "UUID"); err != nil {
+		log.Errorf("failed to update the notification job %d: %v", id, err)
+		return err
+	}
+	return nil
+}
+```
 
 综上，回顾image push过程，harbor通过**订阅-发布**模型，将具体事件和事件的处理逻辑解耦，两者通过在`core/notifier/topic/tipics.go`中初始化`handlersMap`完成关联，也就是订阅-发布中**Broker**的角色，整体的流程为：
 
 1. docker registry使用webhook通知harbor core的notification api
-2. api解析事件信息，dao记录log
-3. 根据事件类型(push)，dao记录push信息，随后map到具体的ImagePreprocessHandler
-4. handler处理业务逻辑，dao获取执行策略，将image push envent重新封装
-5. 重新map到具体的HttpHandler，调用webhook
+2. api解析事件信息，dao记录access log
+3. 根据事件类型(push)，dao记录push信息(repoRecord)，随后map到具体的ImagePreprocessHandler
+4. handler处理业务逻辑，具体为: dao获取执行策略(notificationPolicy)，将image push envent重新封装
+5. 重新map到具体的HttpHandler，封装为一个job(同时设置回调地址)后发送给job service
+6. 回调地址中处理后续业务
 

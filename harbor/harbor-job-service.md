@@ -40,7 +40,7 @@ func (d *DefaultClient) SubmitJob(jd *models.JobData) (string, error) {
 
 ## job service router
 
-job service为一个独立的服务，和core独立，job service的api定义位于`src/jobservice/api/router.go`：
+job service为一个独立的服务，和core独立，job service的api定义位于`src/jobservice/api/router.go`， 其api的handler使用了组件[gorilla](https://github.com/gorilla/) ：
 
 ```go
 func (br *BaseRouter) registerRoutes() {
@@ -191,7 +191,24 @@ func (w *basicWorker) Enqueue(jobName string, params job.Parameters, isUnique bo
 
 ## consume job
 
-对于上面的流程，当job入队后，需要消费者对job进行处理。此时，回过头看job service的main函数实现，代码位于`/src/jobservice/main.go`:
+对于上面的流程，当job入队后，需要消费者对job进行处理。根据gocraft的文档对[process job](https://github.com/gocraft/work#process-jobs) 的介绍，job消费的关键代码主要是注册handler以及redis pool的start。类似如下：
+```go
+	// Add middleware that will be executed for each job
+	pool.Middleware((*Context).Log) //类似责任链的传递
+	pool.Middleware((*Context).FindCustomer)
+
+	// Map the name of jobs to handler functions
+	pool.Job("send_email", (*Context).SendEmail)  //handler
+	// Customize options:
+	pool.JobWithOptions("export", work.JobOptions{Priority: 10, MaxFails: 1}, (*Context).Export)
+	// Start processing jobs
+	pool.Start()
+```
+
+### load config
+
+此时，回过头看job service的main函数实现，代码位于`/src/jobservice/main.go`:
+
 ```go
 func main() {
 	//加载jobservice的配置
@@ -275,8 +292,9 @@ loggers:
   - name: "STD_OUTPUT" # Same with above
     level: "INFO"root@myharbor:/home/jzd/harbor/harbor1.8.2-https/common/config/
 ```
+### job handler
 
-最主要的实现为函数`runtime.JobService.LoadAndRun(ctx, cancel)`:
+消费job最主要的实现为函数`runtime.JobService.LoadAndRun(ctx, cancel)`:
 
 ```go
 func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error) {
@@ -331,25 +349,224 @@ func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) 
 		// 根据之前的context/ns/redis pool/callback封装一个basicController
 		lcmCtl := lcm.NewController(rootContext, namespace, redisPool, hookCallback)
 ```
-上述代码依旧完成了进一步的封装和init，
+
+上述代码依旧完成了进一步的封装和init，继续看`loadAndRunRedisWorkerPool`，首先是job的registry:
 
 ```go
-		// Start the backend worker
-		backendWorker, err = bs.loadAndRunRedisWorkerPool(
-			rootContext,
-			namespace,
-			workerNum,
-			redisPool,
-			lcmCtl,
-		)
+// Load and run the worker worker
+func (bs *Bootstrap) loadAndRunRedisWorkerPool(
+	ctx *env.Context,
+	ns string,
+	workers uint,
+	redisPool *redis.Pool,
+	lcmCtl lcm.Controller,
+) (worker.Interface, error) {
+	redisWorker := cworker.NewWorker(ctx, ns, workers, redisPool, lcmCtl)
+	//注册job
+	if err := (
+		map[string]interface{}{redisWorker.RegisterJobs
+			// Only for debugging and testing purpose
+			job.SampleJob: (*sample.Job)(nil),
+			// Functional jobs
+			job.ImageScanJob:           (*sc.Job)(nil),
+			job.ImageScanAllJob:        (*all.Job)(nil),
+			job.ImageGC:                (*gc.GarbageCollector)(nil),
+			job.Replication:            (*replication.Replication)(nil),
+			job.ReplicationScheduler:   (*replication.Scheduler)(nil),
+			job.Retention:              (*retention.Job)(nil),
+			scheduler.JobNameScheduler: (*scheduler.PeriodicJob)(nil),
+			job.WebhookJob:             (*notification.WebhookJob)(nil),
+		});...
+	}
+
+	if err := redisWorker.Start(); err != nil {
+		return nil, err
+	}
+	return redisWorker, nil
+}
+```
+
+上述代码可以看到通过RegisterJobs向redisWorker中注册各种类型的job，因此猜测此处为各个job handler的注册处。查看`RegisterJobs`的实现：
+
+```go
+func (w *basicWorker) registerJob(name string, j interface{}) (err error) {
+	// nil & already exist hanlder
+	...
+	// Wrap job
+	redisJob := runner.NewRedisJob(j, w.context, w.ctl)
+	// Get more info from j
+	theJ := runner.Wrap(j)
+	// Put into the pool
+	w.pool.JobWithOptions( //gocraft的实现
+		name, //name就是在RegisterJobs的入参map中的key，即各种类型的job
+		work.JobOptions{
+			MaxFails: theJ.MaxFails(),
+			SkipDead: true,
+		},
+		// Use generic handler to handle as we do not accept context with this way.
+		func(job *work.Job) error {
+			return redisJob.Run(job)  //job handler
+		},
+	)
+	// Keep the name of registered jobs as known jobs for future validation
+	w.knownJobs.Store(name, j)
+	...
+	return nil
+}
+```
+
+代码中主要的工作就是调用`pool.JobWithOptions`向pool中注册了用于处理不同job的handler，即`redisJob.Run(job)`。进入具体实现:
+
+```go
+func (rj *RedisJob) Run(j *work.Job) (err error) {
+	var (
+		runningJob  job.Interface
+		execContext job.Context
+		tracker     job.Tracker
+		markStopped = bp(false)
+	)
+
+	...
+	jID := j.ID
+
+	if eID, yes := isPeriodicJobExecution(j); yes {
+		jID = eID
+	}
+	//根据jobId track的主要作用是调用redis的“HGETALL”取出job的信息并存入basicTracker.jobStats
+	if tracker, err = rj.ctl.Track(jID); err != nil {
+		//失败控制，避免无线循环
+		now := time.Now().Unix()
+		if j.FailedAt == 0 || now-j.FailedAt < 2*24*3600 {
+			j.Fails--
+		}
+		return
+	}
+
+	//返回redis中的job状态，并switch-case
+	jStatus := job.Status(tracker.Job().Info.Status)
+	switch jStatus {
+	case job.PendingStatus, job.ScheduledStatus:
+		break
+	case job.StoppedStatus:
+		//stop
+		markStopped = bp(true)
+		return nil
+	case job.ErrorStatus:
+		//没有达到次数，则调用tracker.reSet()
+		...
+		break
+	default:
+		//error
+	}
+	//定义defer 从redis中重新获取job状态，stop or success处理
+	defer func() {
 		if err != nil {
-			return errors.Errorf("load and run worker error: %s", err)
+			if er := tracker.Fail(); er != nil {
+				...
+			}
+			return
+		}
+		if latest, er := tracker.Status(); er == nil {
+			if latest == job.StoppedStatus {
+				// Logged
+				logger.Infof("Job %s:%s is stopped", tracker.Job().Info.JobName, tracker.Job().Info.JobID)
+				// Stopped job, no exit message printing.
+				markStopped = bp(true)
+				return
+			}
 		}
 
-		// Run daemon process of life cycle controller
-		// Ignore returned error
+		// Mark job status to success.
+		if er := tracker.Succeed(); er != nil {
+			logger.Errorf("Mark job status to success error: %s", er)
+		}
+	}()
+
+	// Defer to handle runtime error
+	defer func() {
+		if r := recover(); r != nil {
+			// Log the stack
+			buf := make([]byte, 1<<10)
+			size := runtime.Stack(buf, false)
+			err = errors.Errorf("runtime error: %s; stack: %s", r, buf[0:size])
+			logger.Errorf("Run job %s:%s error: %s", j.Name, j.ID, err)
+		}
+	}()
+
+	// Build job context
+	if rj.context.JobContext == nil {
+		rj.context.JobContext = impl.NewDefaultContext(rj.context.SystemContext)
+	}
+	if execContext, err = rj.context.JobContext.Build(tracker); err != nil {
+		return
+	}
+
+	// Defer to close logger stream
+	defer func() {
+		// Close open io stream first
+		if closer, ok := execContext.GetLogger().(logger.Closer); ok {
+			if er := closer.Close(); er != nil {
+				logger.Errorf("Close job logger failed: %s", er)
+			}
+		}
+	}()
+
+	// Wrap job
+	runningJob = Wrap(rj.job)
+	// 通过CAS 讲job的状态置为running
+	if err = tracker.Run(); err != nil {
+		return
+	}
+	// 调用run
+	err = runningJob.Run(execContext, j.Args)
+	// Handle retry
+	rj.retry(runningJob, j)
+	// Handle periodic job execution
+	if _, yes := isPeriodicJobExecution(j); yes {
+		if er := tracker.PeriodicExecutionDone(); er != nil {
+			// Just log it
+			logger.Error(er)
+		}
+	}
+
+	return
+}
+```
+
+可以看到，对于每一个job的handler，其实现为从redis中获取job的状态信息，并根据不同状态更新handler的执行(包括是否retry/返回/执行running)。而具体的执行位于代码`err = runningJob.Run(execContext, j.Args)`,可以看到针对不同的job类型，提供了不同的实现，包括了GC/Replication/Schedule/web hook等job，以web hook为例：
+
+```go
+// execute webhook job
+func (wj *WebhookJob) execute(ctx job.Context, params map[string]interface{}) error {
+	//获取job中的参数
+	payload := params["payload"].(string)
+	address := params["address"].(string)
+	req, err := http.NewRequest(http.MethodPost, address, bytes.NewReader([]byte(payload)))
+	...
+	if v, ok := params["auth_header"]; ok && len(v.(string)) > 0 {
+		req.Header.Set("Authorization", v.(string))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := wj.client.Do(req)
+	...
+	defer resp.Body.Close()
+	...
+	return nil
+}
+```
+
+可以看到web hook类型的job的回调逻辑，其中`payload/address`即为在[notification](harbor-registry-notification.md) 中的`func (h *HTTPHandler) process(event *model.HookEvent)`封装信息。
+
+最后，返回函数`func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error)`, 在执行完成
+
+中创建了worker，worker用于向redis pool中注册job的handler
+
+```go
+func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error){
+		...
+		//一个永真的同步循环从redis中Load job
 		if err = lcmCtl.Serve(); err != nil {
-			return errors.Errorf("start life cycle controller error: %s", err)
+			...
 		}
 
 		// Start agent

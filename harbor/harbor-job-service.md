@@ -557,9 +557,7 @@ func (wj *WebhookJob) execute(ctx job.Context, params map[string]interface{}) er
 
 可以看到web hook类型的job的回调逻辑，其中`payload/address`即为在[notification](harbor-registry-notification.md) 中的`func (h *HTTPHandler) process(event *model.HookEvent)`封装信息。
 
-最后，返回函数`func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error)`, 在执行完成
-
-中创建了worker，worker用于向redis pool中注册job的handler
+最后，返回函数`func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error)`。在完成job的handler后，剩下的工作主要是两部分，一是`agent.Serve()`,二是创建并拉起`apiServer服务`，即前文`router.go`中描述的api
 
 ```go
 func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error){
@@ -568,62 +566,52 @@ func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) 
 		if err = lcmCtl.Serve(); err != nil {
 			...
 		}
-
-		// Start agent
-		// Non blocking call
+		...
 		hookAgent.Attach(lcmCtl)
+		//
 		if err = hookAgent.Serve(); err != nil {
-			return errors.Errorf("start hook agent error: %s", err)
+			...
 		}
-	} else {
-		return errors.Errorf("worker backend '%s' is not supported", cfg.PoolConfig.Backend)
-	}
-
-	// Initialize controller
+	} ...
+	
+	//job service rest api init
 	ctl := core.NewController(backendWorker, manager)
-	// Start the API server
 	apiServer := bs.createAPIServer(ctx, cfg, ctl)
-
-	// Listen to the system signals
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, os.Kill)
-	terminated := false
-	go func(errChan chan error) {
-		defer func() {
-			// Gracefully shutdown
-			// Error happened here should not override the outside error
-			if er := apiServer.Stop(); er != nil {
-				logger.Error(er)
-			}
-			// Notify others who're listening to the system context
-			cancel()
-		}()
-
-		select {
-		case <-sig:
-			terminated = true
-			return
-		case err = <-errChan:
-			return
-		}
-	}(rootContext.ErrorChan)
-
-	node := ctx.Value(utils.NodeID)
-	// Blocking here
-	logger.Infof("API server is serving at %d with [%s] mode at node [%s]", cfg.Port, cfg.Protocol, node)
-	if er := apiServer.Start(); er != nil {
-		if !terminated {
-			// Tell the listening goroutine
-			rootContext.ErrorChan <- er
-		}
-	} else {
-		// In case
-		sig <- os.Interrupt
-	}
-
-	// Wait everyone exit
-	rootContext.WG.Wait()
-
+	...
+	//exit handler
+	...
 	return
 }
 ```
+其中的`agent.Serve()`用来处理在`hookCallback`填入`event channel`的event。那么这个callback在何处被调用？回到上文对于tracker逻辑的分析，执行`if er := tracker.Succeed()`后，当进行一个CAS调用出现status err后，将调用callback:
+```go
+func (bt *basicTracker) Succeed() error {
+	err := bt.UpdateStatusWithRetry(SuccessStatus)
+	if !errs.IsStatusMismatchError(err) {
+		...
+		if er := bt.fireHookEvent(SuccessStatus); err == nil && er != nil {
+			...
+		}
+	}
+	return err
+}
+
+// FireHookEvent fires the hook event
+func (bt *basicTracker) fireHookEvent(status Status, checkIn ...string) error {
+	...
+	change := &StatusChange{
+		JobID:    bt.jobID,
+		Status:   status.String(),
+		Metadata: bt.jobStats.Info,
+	}
+	...
+	//调用callback
+	if bt.callback != nil {
+		return bt.callback(bt.jobStats.Info.WebHookURL, change)
+	}
+	return nil
+}
+```
+
+## 总结
+

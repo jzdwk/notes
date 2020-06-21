@@ -83,7 +83,9 @@ func (n *NotificationHandler) Post() {
 
 上述代码注意一些编码方式：一是log的记录使用routine，二是dao层的使用统一采用了`o.Raw(sql, queryParam).QueryRows(&p)`接口，sql为原生写法，没有使用beego封装的`orm.NewQueryBuilder` 。这个思路与mybatis、springJDBC类似。
 
-## push event handle
+## event handle
+
+### push
 
 继续分析，通过action分支处理，首先是**push**处理：
 
@@ -241,7 +243,7 @@ func preprocessAndSendImageHook(value interface{}) error {
 	//将event.Data信息重新解析到imageEvent
 	imgEvent, err := resolveImageEventData(value)
 	...
-	//从NotificationPolicy中查询project相关的policy
+	//从NotificationPolicy中查询project相关的notification policy
 	policies, err := notification.PolicyMgr.GetRelatedPolices(imgEvent.Project.ProjectID, imgEvent.EventType)
 	...
 	//解析imageEvent，封装payload
@@ -357,3 +359,48 @@ func (hm *DefaultManager) StartHook(event *model.HookEvent, data *models.JobData
 5. 重新map到具体的HttpHandler，封装为一个job(同时设置回调地址)后发送给job service
 6. 回调地址中处理后续业务
 
+### pull
+
+同样的，对于pull，处理逻辑与post大致相同。发送job时间后，不同处在于对pull count字段进行了更新，不再赘述。
+
+## replication && scan
+
+当一个image被push之后，并且根据对应的事件handler进行push事件处理后，还有两个重要步骤，一个是**replication**，另一个就是**image scan**:
+```
+	//replication处理
+	go func() {
+			e := &repevent.Event{
+			Type: repevent.EventTypeImagePush,
+			Resource: &model.Resource{
+				Type: model.ResourceTypeImage,
+				Metadata: &model.ResourceMetadata{
+					Repository: &model.Repository{
+						Name: repository,
+						Metadata: map[string]interface{}{
+							"public": strconv.FormatBool(pro.IsPublic()),
+						},
+					},
+					Vtags: []string{tag},
+				},
+			},
+		}
+		if err := replication.EventHandler.Handle(e); err != nil {
+			log.Errorf("failed to handle event: %v", err)
+		}
+	}()
+
+	if autoScanEnabled(pro) {
+		artifact := &v1.Artifact{
+			NamespaceID: pro.ProjectID,
+			Repository:  repository,
+			Tag:         tag,
+			MimeType:    v1.MimeTypeDockerArtifact,
+			Digest:      event.Target.Digest,
+		}
+
+		if err := scan.DefaultController.Scan(artifact); err != nil {
+			log.Error(errors.Wrap(err, "registry notification: trigger scan when pushing automatically"))
+		}
+	}
+```
+详细分析请移步.

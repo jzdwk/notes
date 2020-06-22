@@ -179,10 +179,9 @@ func (c *controller) StartReplication(policy *model.Policy, resource *model.Reso
 以上代码首先通过一个chan来控制可执行的同步任务数，然后通过go routine开启任务，*思考？为什么这里使用了flowCtl对flow的执行进行了封装？* 最终的任务执行为调用copyFlow的Run方法： 	
 ```go
 func (c *copyFlow) Run(interface{}) (int, error) {
+	//初始化adapter
 	srcAdapter, dstAdapter, err := initialize(c.policy)
-	if err != nil {
-		return 0, err
-	}
+	...
 	var srcResources []*model.Resource
 	if len(c.resources) > 0 {
 		srcResources, err = filterResources(c.resources, c.policy.Filters)
@@ -225,4 +224,157 @@ func (c *copyFlow) Run(interface{}) (int, error) {
 	return schedule(c.scheduler, c.executionMgr, items)
 }
 ```
+Run函数的执行分为以下几步：
+1. 调用initialize，根据policy内容获取adapter。
+进入initialize内部:
+```go
+func initialize(policy *model.Policy) (adp.Adapter, adp.Adapter, error) {
+	var srcAdapter, dstAdapter adp.Adapter
+	var err error
+	//1. 根据policy中存放的目标registry的类型去获取对应的factory
+	srcFactory, err := adp.GetFactory(policy.SrcRegistry.Type)
+	...
+	//
+	srcAdapter, err = srcFactory.Create(policy.SrcRegistry)
+	...
+	// create the destination registry adapter
+	dstFactory, err := adp.GetFactory(policy.DestRegistry.Type)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get adapter factory for registry type %s: %v", policy.DestRegistry.Type, err)
+	}
+	dstAdapter, err = dstFactory.Create(policy.DestRegistry)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create adapter for destination registry %s: %v", policy.DestRegistry.URL, err)
+	}
+	log.Debug("replication flow initialization completed")
+	return srcAdapter, dstAdapter, nil
+}
+```
+上述代码首先根据policy中存放的目标registry的类型去获取对应的factory。factory接口用于创建不同registry的适配器接口，位于`replication/adapter/adapter.go`：
+```go
+type Factory interface {
+	Create(*model.Registry) (Adapter, error)
+	AdapterPattern() *model.AdapterPattern
+}
+```   
+factory的实现由支持的各个厂家registry提供，通过init初始化对应的factory，比如华为位于`src/replication/adapter/huawei/` :
+```go
+func init() {
+	err := adp.RegisterFactory(model.RegistryTypeHuawei, new(factory))
+	if err != nil {
+		log.Errorf("failed to register factory for Huawei: %v", err)
+		return
+	}
+	log.Infof("the factory of Huawei adapter was registered")
+}
+```
+下面以harbor自身为例，根据harbor的factory，adapter创建过程如下：
+```go
+func newAdapter(registry *model.Registry) (*adapter, error) {
+	//根据registry的http/s创建http transport
+	transport := util.GetHTTPTransport(registry.Insecure)
+	//Modifier接口用于对http请求内容进行更换/更新
+	modifiers := []modifier.Modifier{
+		&auth.UserAgentModifier{
+			UserAgent: adp.UserAgentReplication,
+		},
+	}
+	//根据认证信息，向modifier中增加认证相关的k-v对
+	if registry.Credential != nil {
+		var authorizer modifier.Modifier
+		if registry.Credential.Type == model.CredentialTypeSecret {
+			authorizer = common_http_auth.NewSecretAuthorizer(registry.Credential.AccessSecret)
+		} else {
+			authorizer = auth.NewBasicAuthCredential(
+				registry.Credential.AccessKey,
+				registry.Credential.AccessSecret)
+		}
+		modifiers = append(modifiers, authorizer)
+	}
+	//根据registry生成docker registry的adapter，此处涉及了docker registry的认证
+	dockerRegistryAdapter, err := native.NewAdapter(registry)
+	...
+	return &adapter{
+		registry: registry,
+		url:      registry.URL,
+		//这个client封装了http client以及设置的modifier
+		client: common_http.NewClient(
+			&http.Client{
+				Transport: transport,
+			}, modifiers...),
+		Adapter: dockerRegistryAdapter,
+	}, nil
+}
+```
+以上代码中着重关注`dockerRegistryAdapter, err := native.NewAdapter(registry)`，该函数主要工作是根据registry属性创建了credential以及根据token service地址封装了一个tokenAuthorizer，主要是用于获取token，docker auth流程可以[参考](harbor-registry-auth.md) ，这个tokenAuthorizer实现了modify接口，查看modify方法，可以看到tokenAuthorizer通过credential信息得到token后，添加至req的header:
+```go
+// add token to the request
+func (t *tokenAuthorizer) Modify(req *http.Request) error {
+	// only handle requests sent to registry
+	goon, err := t.filterReq(req)
+	...
+	// parse scopes from request
+	scopes, err := parseScopes(req)
+	var token *models.Token
+	// try to get token from cache if the request is for empty scope(login)
+	// or single scope
+	if len(scopes) <= 1 {
+		key := ""
+		if len(scopes) == 1 {
+			key = scopeString(scopes[0])
+		}
+		token = t.getCachedToken(key)
+	}
+
+	if token == nil {
+		//根据registry中的registry地址，发送credential信息，并得到token
+		token, err = t.generator.generate(scopes, t.registryURL.String())
+		...
+		// if the token is null(this happens if the registry needs no authentication), return
+		// directly. Or the token will be cached
+		...
+		// only cache the token for empty scope(login) or single scope request
+		if len(scopes) <= 1 {
+			key := ""
+			if len(scopes) == 1 {
+				key = scopeString(scopes[0])
+			}
+			t.updateCachedToken(key, token)
+		}
+	}
+
+	tk := token.GetToken()
+	...
+	req.Header.Add(http.CanonicalHeaderKey("Authorization"), fmt.Sprintf("Bearer %s", tk))
+	return nil
+}
+```
+最终调用`NewAdapterWithCustomizedAuthorizer(registry, authorizer)`,该函数根据中需要注意的就是根据加入的各个modifier对象去对req做扩充，最终返回一个Adapter实现：
+```go
+func NewAdapterWithCustomizedAuthorizer(registry *model.Registry, authorizer modifier.Modifier) (*Adapter, error) {
+	transport := util.GetHTTPTransport(registry.Insecure)
+	modifiers := []modifier.Modifier{
+		&auth.UserAgentModifier{
+			//harbor-replication-service
+			UserAgent: adp.UserAgentReplication,
+		},
+	}
+	//将authorizer加入modify
+	if authorizer != nil {
+		modifiers = append(modifiers, authorizer)
+	}
+	client := &http.Client{
+		Transport: registry_pkg.NewTransport(transport, modifiers...),
+	}
+	reg, err := registry_pkg.NewRegistry(registry.URL, client)
+	...
+	return &Adapter{
+		Registry: reg,
+		registry: registry,
+		client:   client,
+		clients:  map[string]*registry_pkg.Repository{},
+	}, nil
+}
+```
+
 

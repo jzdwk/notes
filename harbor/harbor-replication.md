@@ -224,8 +224,12 @@ func (c *copyFlow) Run(interface{}) (int, error) {
 	return schedule(c.scheduler, c.executionMgr, items)
 }
 ```
-Run函数的执行分为以下几步：
+### create adapter
+
+执行Run函数的第一步，为获取目标和源registry的adapter，adapter中适配了各个厂家的registry，其中封装了
+
 1. 调用initialize，根据policy内容获取adapter。
+
 进入initialize内部:
 ```go
 func initialize(policy *model.Policy) (adp.Adapter, adp.Adapter, error) {
@@ -376,5 +380,6 @@ func NewAdapterWithCustomizedAuthorizer(registry *model.Registry, authorizer mod
 	}, nil
 }
 ```
+docker 
 
 

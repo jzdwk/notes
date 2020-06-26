@@ -179,7 +179,7 @@ func (c *controller) StartReplication(policy *model.Policy, resource *model.Reso
 以上代码首先通过一个chan来控制可执行的同步任务数，然后通过go routine开启任务，*思考？为什么这里使用了flowCtl对flow的执行进行了封装？* 最终的任务执行为调用copyFlow的Run方法： 	
 ```go
 func (c *copyFlow) Run(interface{}) (int, error) {
-	//初始化adapter
+	//1. create adapter
 	srcAdapter, dstAdapter, err := initialize(c.policy)
 	...
 	var srcResources []*model.Resource
@@ -224,34 +224,31 @@ func (c *copyFlow) Run(interface{}) (int, error) {
 	return schedule(c.scheduler, c.executionMgr, items)
 }
 ```
-### create adapter
+1. **create adapter**
 
-执行Run函数的第一步，为获取目标和源registry的adapter，adapter中适配了各个厂家的registry，其中封装了
-
-1. 调用initialize，根据policy内容获取adapter。
-
-进入initialize内部:
+执行Run函数的第一步，为获取目标和源registry的adapter，adapter为适配器接口，其定义如下：
+```go
+type Adapter interface {
+	// Info return the information of this adapter
+	Info() (*model.RegistryInfo, error)
+	// PrepareForPush does the prepare work that needed for pushing/uploading the resources
+	// eg: create the namespace or repository
+	PrepareForPush([]*model.Resource) error
+	// HealthCheck checks health status of registry
+	HealthCheck() (model.HealthStatus, error)
+}
+```
+如果需要harbor支持某厂家的registry产品，就要定义adapter的实现。initialize函数根据policy的内容去获取对应的adapter，具体代码:
 ```go
 func initialize(policy *model.Policy) (adp.Adapter, adp.Adapter, error) {
 	var srcAdapter, dstAdapter adp.Adapter
 	var err error
-	//1. 根据policy中存放的目标registry的类型去获取对应的factory
+	//根据policy中存放的目标registry的类型（即厂家）去获取对应的factory
 	srcFactory, err := adp.GetFactory(policy.SrcRegistry.Type)
 	...
-	//
+	//根据不同厂家的factory生产adapter，这里就是个简单工厂
 	srcAdapter, err = srcFactory.Create(policy.SrcRegistry)
 	...
-	// create the destination registry adapter
-	dstFactory, err := adp.GetFactory(policy.DestRegistry.Type)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get adapter factory for registry type %s: %v", policy.DestRegistry.Type, err)
-	}
-	dstAdapter, err = dstFactory.Create(policy.DestRegistry)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create adapter for destination registry %s: %v", policy.DestRegistry.URL, err)
-	}
-	log.Debug("replication flow initialization completed")
-	return srcAdapter, dstAdapter, nil
 }
 ```
 上述代码首先根据policy中存放的目标registry的类型去获取对应的factory。factory接口用于创建不同registry的适配器接口，位于`replication/adapter/adapter.go`：
@@ -380,6 +377,251 @@ func NewAdapterWithCustomizedAuthorizer(registry *model.Registry, authorizer mod
 	}, nil
 }
 ```
-docker 
+dockerRegistryAdapter创建完成后，将其封装至harbor的adapter实现后，adapter的创建整体完成。由于各个adapter的创建过程大体相似，这里不再赘述。至此，create adapter完成。
+
+2. **resource**
+adapter创建完成后，接下来需要根据在policy中描述的filter信息获取需要执行同步的资源集合，即执行`fetchResources(adapter adp.Adapter, policy *model.Policy) ([]*model.Resource, error)`过程:
+```go
+func fetchResources(adapter adp.Adapter, policy *model.Policy) ([]*model.Resource, error) {
+	var resTypes []model.ResourceType
+	var filters []*model.Filter
+	//根据policy的定义，确定resource的类型集合，比如image/chart包
+	for _, filter := range policy.Filters {
+		if filter.Type != model.FilterTypeResource {
+			filters = append(filters, filter)
+			continue
+		}
+		resTypes = append(resTypes, filter.Value.(model.ResourceType))
+	}
+	if len(resTypes) == 0 {
+		//获取具体adapter实现的registry信息，包括了registry支持的资源等
+		info, err := adapter.Info()
+		...
+		resTypes = append(resTypes, info.SupportedResourceTypes...)
+	}
+
+	resources := []*model.Resource{}
+	for _, typ := range resTypes {
+		var res []*model.Resource
+		var err error
+		if typ == model.ResourceTypeImage {
+			// images
+			reg, ok := adapter.(adp.ImageRegistry)
+			...
+			//具体的fetch实现
+			res, err = reg.FetchImages(filters)
+		} else if typ == model.ResourceTypeChart {
+			// charts
+			reg, ok := adapter.(adp.ChartRegistry)
+			...
+			res, err = reg.FetchCharts(filters)
+		} else {
+			...
+		}
+		...
+		resources = append(resources, res...)
+	}
+	return resources, nil
+}
+```
+上述代码的重点为`reg, ok := adapter.(adp.ImageRegistry)&&res, err = reg.FetchImages(filters)`这两句，每个厂家的adapter中都包含了`native.Adapter`结构，此结构实现了ImageRegistry/ChartRegistry接口，每一个resource的最终对象对应了project。最终返回的resources定义如下：
+```go
+type Resource struct {
+	//资源类型
+	Type         ResourceType           `json:"type"`
+	//具体的资源描述
+	Metadata     *ResourceMetadata      `json:"metadata"`
+	//对应的registry
+	Registry     *Registry              `json:"registry"`
+	ExtendedInfo map[string]interface{} `json:"extended_info"`
+	// Indicate if the resource is a deleted resource
+	Deleted bool `json:"deleted"`
+	// indicate whether the resource can be overridden
+	Override bool `json:"override"`
+}
+```
+上述代码完成了srcResources对于policy中描述的资源的fetch，接下来继续对resource的字段进行赋值：
+```go
+	//将policy描述的源registry赋值给srcResource的Registry字段
+	srcResources = assembleSourceResources(srcResources, c.policy)
+	//将srcResource中描述的资源的各个信息赋值给dstResources，即同步后，源和目的registry的project/image/tag是相同的，
+	//另外将policy的destRegistry赋值给dstResources
+	dstResources := assembleDestinationResources(srcResources, c.policy)
+```
+
+3. **prepare**
+
+当adapter和resource都完成后，将进行同步前的prepare工作，prepare的工作由adapter接口的`PrepareForPush([]*model.Resource) error`函数完成，这个函数由各个厂家的adapter具体实现，主要作用就是调用各自的api，创建诸如project等资源对象，以harbor为例：
+```go
+func (a *adapter) PrepareForPush(resources []*model.Resource) error {
+	projects := map[string]*project{}
+	for _, resource := range resources {
+		...resource check
+		//
+		paths := strings.Split(resource.Metadata.Repository.Name, "/")
+		projectName := paths[0]
+		//如果是public项目，并且在map存在，进行合并
+		metadata := abstractPublicMetadata(resource.Metadata.Repository.Metadata)
+		pro, exist := projects[projectName]
+		if exist {
+			metadata = mergeMetadata(pro.Metadata, metadata)
+		}
+		projects[projectName] = &project{
+			Name:     projectName,
+			Metadata: metadata,
+		}
+	}
+	//调用harbor api, 创建project
+	for _, project := range projects {
+		pro := struct {
+			Name     string                 `json:"project_name"`
+			Metadata map[string]interface{} `json:"metadata"`
+		}{
+			Name:     project.Name,
+			Metadata: project.Metadata,
+		}
+		err := a.client.Post(a.getURL()+"/api/projects", pro)
+		...err handle
+		log.Debugf("project %s created", project.Name)
+	}
+	return nil
+}
+```
+
+此时，要同步的资源描述resource以及在各个厂家registry的db型描述都已就绪，在执行同步任务之前，对要同步的资源逐条（project为单位）封装至`ScheduleItem`,这个字段维护源和目的project的1/1关系。这一步是在`preprocess`完成：
+```go
+// Preprocess the resources and returns the item list that can be scheduled
+func (d *defaultScheduler) Preprocess(srcResources []*model.Resource, destResources []*model.Resource) ([]*ScheduleItem, error) {
+	//check resource
+	...
+	var items []*ScheduleItem
+	for index, srcResource := range srcResources {
+		destResource := destResources[index]
+		item := &ScheduleItem{
+			SrcResource: srcResource,
+			DstResource: destResource,
+		}
+		items = append(items, item)
+
+	}
+	return items, nil
+}
+```
+之后，创建task任务，用于向jobservice发送任务:
+```go
+func createTasks(mgr execution.Manager, executionID int64, items []*scheduler.ScheduleItem) error {
+	for _, item := range items {
+		//task类型
+		operation := "copy"
+		if item.DstResource.Deleted {
+			operation = "deletion"
+		}
+
+		task := &models.Task{
+			ExecutionID:  executionID,
+			Status:       models.TaskStatusInitialized,
+			ResourceType: string(item.SrcResource.Type),
+			SrcResource:  getResourceName(item.SrcResource),
+			DstResource:  getResourceName(item.DstResource),
+			Operation:    operation,
+		}
+		//db保存
+		id, err := mgr.CreateTask(task)
+		...
+		item.TaskID = id
+		log.Debugf("task record %d for the execution %d created", id, executionID)
+	}
+	return nil
+}
+```
+
+4. **schedule**
+
+最后，执行定义的items，具体的执行将交给[job service](harbor-job-service.md)完成：
+```go
+func schedule(scheduler scheduler.Scheduler, executionMgr execution.Manager, items []*scheduler.ScheduleItem) (int, error) {
+	//将封装job-service的具体job，并通过SubmitJob(j)提交任务。注意，每一个project对应着一个job
+	results, err := scheduler.Schedule(items)
+	...
+	allFailed := true
+	n := len(results)
+	for _, result := range results {
+		// if the task is failed to be submitted, update the status of the
+		// task as failure
+		now := time.Now()
+		if result.Error != nil {
+			log.Errorf("failed to schedule the task %d: %v", result.TaskID, result.Error)
+			if err = executionMgr.UpdateTask(&models.Task{
+				ID:      result.TaskID,
+				Status:  models.TaskStatusFailed,
+				EndTime: now,
+			}, "Status", "EndTime"); err != nil {
+				log.Errorf("failed to update the task status %d: %v", result.TaskID, err)
+			}
+			continue
+		}
+		allFailed = false
+		// if the task is submitted successfully, update the status, job ID and start time
+		if err = executionMgr.UpdateTaskStatus(result.TaskID, models.TaskStatusPending, 0, models.TaskStatusInitialized); err != nil {
+			log.Errorf("failed to update the task status %d: %v", result.TaskID, err)
+		}
+		if err = executionMgr.UpdateTask(&models.Task{
+			ID:        result.TaskID,
+			JobID:     result.JobID,
+			StartTime: now,
+		}, "JobID", "StartTime"); err != nil {
+			log.Errorf("failed to update the task %d: %v", result.TaskID, err)
+		}
+		log.Debugf("the task %d scheduled", result.TaskID)
+	}
+	// if all the tasks are failed, return err
+	if allFailed {
+		return n, errors.New("all tasks are failed")
+	}
+	return n, nil
+}
+```
+核心业务逻辑就是`results, err := scheduler.Schedule(items)`,代码中将为每一个item创建job，并submit:
+```go
+func (d *defaultScheduler) Schedule(items []*ScheduleItem) ([]*ScheduleResult, error) {
+	var results []*ScheduleResult
+	for _, item := range items {
+		result := &ScheduleResult{
+			TaskID: item.TaskID,
+		}
+		...
+		j := &models.JobData{
+			Metadata: &models.JobMetadata{
+				JobKind: job.KindGeneric,
+			},
+			StatusHook: fmt.Sprintf("%s/service/notifications/jobs/replication/task/%d", config.Config.CoreURL, item.TaskID),
+		}
+		//job的名称为 REPLICATION
+		j.Name = job.Replication
+		src, err := json.Marshal(item.SrcResource)
+		...
+		dest, err := json.Marshal(item.DstResource)
+		...
+		//job参数
+		j.Parameters = map[string]interface{}{
+			"src_resource": string(src),
+			"dst_resource": string(dest),
+		}
+		//将job提交给jobservice执行
+		id, joberr := d.client.SubmitJob(j)
+		...
+		result.JobID = id
+		results = append(results, result)
+	}
+	return results, nil
+}
+```
+
+## replication job
+
+
+
+
+
 
 

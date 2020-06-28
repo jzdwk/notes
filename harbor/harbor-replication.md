@@ -424,7 +424,35 @@ func fetchResources(adapter adp.Adapter, policy *model.Policy) ([]*model.Resourc
 	return resources, nil
 }
 ```
-上述代码的重点为`reg, ok := adapter.(adp.ImageRegistry)&&res, err = reg.FetchImages(filters)`这两句，每个厂家的adapter中都包含了`native.Adapter`结构，此结构实现了ImageRegistry/ChartRegistry接口，每一个resource的最终对象对应了project。最终返回的resources定义如下：
+上述代码的重点为`reg, ok := adapter.(adp.ImageRegistry)&&res, err = reg.FetchImages(filters)`**这两句，每个厂家的adapter中都存在匿名的`native.Adapter`结构，后者实现了ImageRegistry/ChartRegistry接口，因此，adapter可以类型转换为对应的接口，同时继承了native.Adapter的方法**，接口的定义如下：
+```go
+// ImageRegistry defines the capabilities that an image registry should have
+type ImageRegistry interface {
+	//获取Image信息，在harbor发送同步任务时用到
+	FetchImages(filters []*model.Filter) ([]*model.Resource, error)
+	//后续的接口都在job service处执行同步任务时调用
+	ManifestExist(repository, reference string) (exist bool, digest string, err error)
+	PullManifest(repository, reference string, accepttedMediaTypes []string) (manifest distribution.Manifest, digest string, err error)
+
+	PushManifest(repository, reference, mediaType string, payload []byte) error
+	// the "reference" can be "tag" or "digest", the function needs to handle both
+	DeleteManifest(repository, reference string) error
+	BlobExist(repository, digest string) (exist bool, err error)
+	PullBlob(repository, digest string) (size int64, blob io.ReadCloser, err error)
+	PushBlob(repository, digest string, size int64, blob io.Reader) error
+}
+
+// ChartRegistry defines the capabilities that a chart registry should have
+type ChartRegistry interface {
+	FetchCharts(filters []*model.Filter) ([]*model.Resource, error)
+	ChartExist(name, version string) (bool, error)
+	DownloadChart(name, version string) (io.ReadCloser, error)
+	UploadChart(name, version string, chart io.Reader) error
+	DeleteChart(name, version string) error
+}
+```
+
+每一个resource的最终对象对应了project。最终返回的resources定义如下：
 ```go
 type Resource struct {
 	//资源类型
@@ -592,6 +620,7 @@ func (d *defaultScheduler) Schedule(items []*ScheduleItem) ([]*ScheduleResult, e
 		...
 		j := &models.JobData{
 			Metadata: &models.JobMetadata{
+				//job类型为generic
 				JobKind: job.KindGeneric,
 			},
 			StatusHook: fmt.Sprintf("%s/service/notifications/jobs/replication/task/%d", config.Config.CoreURL, item.TaskID),
@@ -618,6 +647,218 @@ func (d *defaultScheduler) Schedule(items []*ScheduleItem) ([]*ScheduleResult, e
 ```
 
 ## replication job
+
+job service的工作分为两步，第一步为入队操作，第二步为消费队中元素。
+首先，
+harbor的各个组件通过post请求，将job任务发送至job service的api接口，然后，api接收job后执行消息入队，具体代码分析参考[job service](harbor-job-service.md)。在job service服务启动时，会注册消息的消费hander，具体的执行根据job类别的不同进入不同的实现，对于replication来说，最终的执行逻辑位于`jobservice/job/impl/replication/replication.go`的Run函数中：
+```go
+// Run gets the corresponding transfer according to the resource type
+// and calls its function to do the real work
+func (r *Replication) Run(ctx job.Context, params job.Parameters) error {
+	logger := ctx.GetLogger()
+	//解析获取要同步的src/dst
+	src, dst, err := parseParams(params)
+	...
+	//根据同步资源类型，得到创建trans对象的工厂
+	factory, err := transfer.GetFactory(src.Type)
+	...
+
+	stopFunc := func() bool {
+		cmd, exist := ctx.OPCommand()
+		if !exist {
+			return false
+		}
+		return cmd == job.StopCommand
+	}
+	trans, err := factory(ctx.GetLogger(), stopFunc)
+	...
+	return trans.Transfer(src, dst)
+}
+```
+这个函数的主要作用就是得到一个trans结构的factory,这个factory的设计和前文registry的adapter factory的设计思路一致，通过一个map来维持简单工厂集合。然后向这个factory中传入定制的stopFunc和logger两个组件，这样trans的实现就和依赖的logger和stop逻辑解耦，**如果一个组件是无状态的，那么可以将其定义为函数变量**。factory通过一个map得到，这个map在image/chart的init函数中被填充，具体如下：
+```go
+//以image为例子
+func init() {
+	//注册factory函数，类型为image
+	if err := trans.RegisterFactory(model.ResourceTypeImage, factory); err != nil {
+		log.Errorf("failed to register transfer factory: %v", err)
+	}
+}
+//factory的实现，
+func factory(logger trans.Logger, stopFunc trans.StopFunc) (trans.Transfer, error) {
+	return &transfer{
+		logger:    logger,
+		isStopped: stopFunc,
+	}, nil
+}
+```
+
+回过头继续看Run函数，具体的执行交给`trans.Transfer(src, dst)`，Transfer接口的Transfer分别由image的trans和chart的trans实现，通过刚才的factory创建出对应的trans。以image.trans为例子，进入实现：
+```go
+func (t *transfer) Transfer(src *model.Resource, dst *model.Resource) error {
+	// initialize
+	if err := t.initialize(src, dst); err != nil {
+		return err
+	}
+
+	// delete the repository on destination registry
+	if dst.Deleted {
+		return t.delete(&repository{
+			repository: dst.Metadata.GetResourceName(),
+			tags:       dst.Metadata.Vtags,
+		})
+	}
+	//封装repo
+	srcRepo := &repository{
+		repository: src.Metadata.GetResourceName(),
+		tags:       src.Metadata.Vtags,
+	}
+	dstRepo := &repository{
+		repository: dst.Metadata.GetResourceName(),
+		tags:       dst.Metadata.Vtags,
+	}
+	// copy the repository from source registry to the destination
+	return t.copy(srcRepo, dstRepo, dst.Override)
+}
+```
+首先第一步是initialize,这个initialize主要用于创建src和dst的registry对应的adapter：
+```go
+func (t *transfer) initialize(src *model.Resource, dst *model.Resource) error {
+	//调用前文的stopFunc，获取job状态，如果stop，直接返回
+	if t.shouldStop() {
+		return nil
+	}
+	// 获取src image的registry adapter
+	srcReg, err := createRegistry(src.Registry)
+	...
+	t.src = srcReg
+	t.logger.Infof("client for source registry [type: %s, URL: %s, insecure: %v] created",
+		src.Registry.Type, src.Registry.URL, src.Registry.Insecure)
+
+	// 获取dst image的registry adapter
+	dstReg, err := createRegistry(dst.Registry)
+	...
+	t.dst = dstReg
+	t.logger.Infof("client for destination registry [type: %s, URL: %s, insecure: %v] created",
+		dst.Registry.Type, dst.Registry.URL, dst.Registry.Insecure)
+	return nil
+}
+```
+createRegistry的实现中，其代码逻辑和前文章节的**execute replication的第一步create adapter**相同，都是通过src的type(这个tpye的字面值就是各个厂家)得到adapter factory，然后调用create创建。
+
+initialize函数返回后，Transfer函数的后续逻辑就是repo的封装，最终调用`t.copy(srcRepo, dstRepo, dst.Override)`:
+```go
+func (t *transfer) copy(src *repository, dst *repository, override bool) error {
+	//repo即 peoject/image
+	srcRepo := src.repository
+	dstRepo := dst.repository
+	...
+	var err error
+	for i := range src.tags {
+		if e := t.copyImage(srcRepo, src.tags[i], dstRepo, dst.tags[i], override); e != nil {
+			t.logger.Errorf(e.Error())
+			err = e
+		}
+	}
+	...
+	return nil
+}
+```
+其具体执行逻辑为在for中一个个同步tag级别的image,进入`copyImage`,:
+```go
+//入参的定义分别为：srcRepo 源rep, srcRef 源tag, destRepo 目标repo， detRef 目标tag，override 覆盖标志位
+func (t *transfer) copyImage(srcRepo, srcRef, dstRepo, dstRef string, override bool) error {
+	...
+	// 从源registry请求manifest描述，manifest中描述了image的具体layer
+	manifest, digest, err := t.pullManifest(srcRepo, srcRef)
+	...
+	// 从目标regisry上发送head请求查看repo+tag是否已存在，如果存在，返回摘要
+	exist, digest2, err := t.exist(dstRepo, dstRef)
+	...
+	// 如果存在，处理
+	if exist {
+		
+		if digest == digest2 {
+			...
+			return nil
+		}
+		// the same name image exists, but not allowed to override
+		if !override {
+			...
+			return nil
+		}
+		//存在，切能够覆盖，则走后续逻辑，不返回
+	}
+	
+	// copy contents between the source and destination registries
+	for _, content := range manifest.References() {
+		if err = t.copyContent(content, srcRepo, dstRepo); err != nil {
+			return err
+		}
+	}
+
+	// push the manifest to the destination registry
+	if err := t.pushManifest(manifest, dstRepo, dstRef); err != nil {
+		return err
+	}
+
+	...
+	return nil
+}
+```
+上述代码的主要工作分为两个部分，第一部分是根据sec/dst Registry的信息，从对应的registry上获取manifest信息。这里的调用为adapter继承的native.Adapter的方法。方法通过向registry发送对应的http请求完成；第二部分是根据获取的manifest描述，执行具体的cpoy操作，并将manifest post给目标registry，首先是image内容复制：
+```go
+//content即为各个layer的描述
+func (t *transfer) copyContent(content distribution.Descriptor, srcRepo, dstRepo string) error {
+	//得到layer的digest
+	digest := content.Digest.String()
+	switch content.MediaType {
+	// when the media type of pulled manifest is manifest list,
+	// the contents it contains are a few manifests
+	case schema2.MediaTypeManifest:
+		// as using digest as the reference, so set the override to true directly
+		return t.copyImage(srcRepo, digest, dstRepo, digest, true)
+	// handle foreign layer
+	case schema2.MediaTypeForeignLayer:
+		t.logger.Infof("the layer %s is a foreign layer, skip", digest)
+		return nil
+	// copy layer or image config
+	// the media type of the layer or config can be "application/octet-stream",
+	// schema1.MediaTypeManifestLayer, schema2.MediaTypeLayer, schema2.MediaTypeImageConfig
+	default:
+		return t.copyBlob(srcRepo, dstRepo, digest)
+	}
+}
+```
+这里的核心逻辑是copyBlob：
+```go
+// copy the layer or image config from the source registry to destination
+func (t *transfer) copyBlob(srcRepo, dstRepo, digest string) error {
+	if t.shouldStop() {
+		return nil
+	}
+	t.logger.Infof("copying the blob %s...", digest)
+	exist, err := t.dst.BlobExist(dstRepo, digest)
+	...
+	//调用native.Adapter的实现，里面的业务逻辑为调用registry api获取内容
+	size, data, err := t.src.PullBlob(srcRepo, digest)
+	...
+	defer data.Close()
+	//push
+	if err = t.dst.PushBlob(dstRepo, digest, size, data); err != nil {
+		t.logger.Errorf("failed to pushing the blob %s: %v", digest, err)
+		return err
+	}
+	t.logger.Infof("copy the blob %s completed", digest)
+	return nil
+}
+```
+copy逻辑没有我们想象的复杂，内部逻辑就是通过native.Adapter完成registry api的调用。这里可以参考[docker push](../docker/docker-image-push.md)和[docker pull](../docker/docker-image-pull.md)
+
+最后，manifest的push和image layer的实现相同，在`t.pushManifest(manifest, dstRepo, dstRef)`中完成，不再赘述。至此同步结束。
+
+
+
 
 
 

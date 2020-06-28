@@ -806,7 +806,7 @@ func (t *transfer) copyImage(srcRepo, srcRef, dstRepo, dstRef string, override b
 	return nil
 }
 ```
-上述代码的主要工作分为两个部分，第一部分是根据sec/dst Registry的信息，从对应的registry上获取manifest信息。这里的调用为adapter继承的native.Adapter的方法。方法通过向registry发送对应的http请求完成；第二部分是根据获取的manifest描述，执行具体的cpoy操作，并将manifest post给目标registry，首先是image内容复制：
+上述代码的主要工作分为两个部分，第一部分是根据sec/dst Registry的信息，从对应的registry上获取manifest信息。这里的调用为adapter继承的native.Adapter的方法。方法通过向[registry api](https://docs.docker.com/registry/spec/api/) 发送对应的http请求完成(**从native.Adapter对于接口的实现，以及各个厂商adapter都继承自这个adapter可以看出，所有厂商的核心registry都是docker registry**)；第二部分是根据获取的manifest描述，执行具体的cpoy操作，并将manifest post给目标registry，首先是image内容复制：
 ```go
 //content即为各个layer的描述
 func (t *transfer) copyContent(content distribution.Descriptor, srcRepo, dstRepo string) error {

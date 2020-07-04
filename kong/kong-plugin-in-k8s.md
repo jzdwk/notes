@@ -156,7 +156,7 @@ spec:
           servicePort: 80
 ```
 
-5. 使用访问，可以发现访问失效,原因在于当使用user的token访问后，kong将根据user找到对应的kongConsumer plain-user，plain-user引用的secret app-user-acl中定义的权限主体是app-user，而ingree中添加的acl中定义的授权资源为只有app-admin，故而授权失败。
+5. 使用访问，可以发现访问失效,原因在于当使用user的token访问后，kong将根据user找到对应的kongConsumer plain-user，plain-user引用的secret app-user-acl中定义的权限主体是app-user，而ingress中添加的acl中定义的授权资源为只有app-admin，故而授权失败。
 
 ```
 curl -i -H "Authorization: Bearer ${USER_JWT}" $PROXY_IP/get

@@ -327,7 +327,7 @@ func Init(closing, done chan struct{}) error {
 	return nil
 }
 ```
-上述代码初始化了replication相关的组件，这里可以看到，**包外可见函数`Init`内执行了左右相关manager/controller的创建**，并且创建的过程**面向接口**编程。具体的依赖关系在`NewXXXX`内部完成，并将返回值最终以**包外可见**的全局变量对外暴露。然后看一下`registry.NewHealthChecker(time.Minute*5, closing, done).Run()`:
+上述代码初始化了replication相关的组件，这里可以看到，**包外可见函数`Init`内执行了相关manager/controller的创建**，并且创建的过程**面向接口**编程。具体的依赖关系在`NewXXXX`内部完成，并将返回值最终以**包外可见**的全局变量对外暴露。然后看一下`registry.NewHealthChecker(time.Minute*5, closing, done).Run()`:
 ```go
 // Run performs health check for all registries regularly
 func (c *HealthChecker) Run() {
@@ -469,24 +469,44 @@ func SyncRegistry(pm promgr.ProjectManager) error {
 }
 ```
 
-log.Info("Init proxy")
-	if err := middlewares.Init(); err != nil {
-		log.Fatalf("init proxy error, %v", err)
+16. 初始化处理http请求的路径的proxyHandler，入口函数为`middlewares.Init()`，这个handler用于转义registry url，核心逻辑为：
+```go
+func New(urls ...string) http.Handler {
+	//获取registry url定义
+	var registryURL string
+	var err error
+	...
+	if len(urls) == 0 {
+		registryURL, err = config.RegistryURL()
+		...
+	} else {
+		registryURL = urls[0]
+	}
+	targetURL, err := url.Parse(registryURL)
+	...
+	return &proxyHandler{
+		//SingleHostReverseProxy根据targetURL，返回了一个封装了url处理的handler
+		//处理逻辑为当targetURL为/base，实际http请求为/dir时，将http请求转义为/base/dir
+		handler: httputil.NewSingleHostReverseProxy(targetURL),
 	}
 
+}
+```
+17. 执行project的quota同步，[project quota管理](https://goharbor.io/docs/2.0.0/administration/configure-project-quotas/) 在1.9版本之后支持。 从env中取出`SYNC_QUOTA`标志位，并进行同步处理，同步的逻辑为读取所有project，遍历每一个project，
+```go
+	...
 	syncQuota := os.Getenv("SYNC_QUOTA")
 	doSyncQuota, err := strconv.ParseBool(syncQuota)
-	if err != nil {
-		log.Errorf("Failed to parse SYNC_QUOTA: %v", err)
-		doSyncQuota = true
-	}
+	...
 	if doSyncQuota {
 		if err := quotaSync(); err != nil {
 			log.Fatalf("quota migration error, %v", err)
 		}
 	} else {
-		log.Infof("Because SYNC_QUOTA set false , no need to sync quota \n")
+		...
 	}
-
-	log.Infof("Version: %s, Git commit: %s", version.ReleaseVersion, version.GitCommit)
+```
+18. 最后，调用beego：
+```go
 	beego.Run()
+```

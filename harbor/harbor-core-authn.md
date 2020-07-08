@@ -79,7 +79,42 @@ func SessionCheck(ctx *beegoctx.Context) {
 ```
 当有一个modify返回true，说明验证通过，直接break，因此此处的Modifiers的遍历顺序取决于之前init的数组各元素顺序。
 
+### configCtxModifier
+
+首先执行的是configCtxModifier的Modify方法，这里是获取配置的认证模式，然后将\["harbor_auth_mode",XXX\]这样一个KV添加到req的context中：
+```go
+func (c *configCtxModifier) Modify(ctx *beegoctx.Context) bool {
+	m, err := config.AuthMode()
+	if err != nil {
+		log.Warningf("Failed to get auth mode, err: %v", err)
+	}
+	addToReqContext(ctx.Request, AuthModeKey, m)
+	return false
+}
+```
+
+### secretReqCtxModifier
+
+接着是执行secretReqCtxModifier的Modify方法，该方法会读取http头中的认证信息“Authorization”，并将这个信息连同secstore封装进一个secureContext中，并这个context和全局的project manager添加进req中。
+```go
+func (s *secretReqCtxModifier) Modify(ctx *beegoctx.Context) bool {
+	//解析出http头中的Authorization
+	scrt := secstore.FromRequest(ctx.Request)
+	...
+	pm := config.GlobalProjectMgr
+	securCtx := secret.NewSecurityContext(scrt, s.store)
+	//将secretContext和projectManager分别添加到req的context
+	//即，["harbor_security_context",securCtx]
+	//以及["harbor_project_manager",pm]
+	setSecurCtxAndPM(ctx.Request, securCtx, pm)
+
+	return true
+}
+```
+
 ### basicAuthReqCtxModifier
+
+接下来，便根据配置执行各个认证方式的Modify，如果没有配置这种认证（即从context中读取harbor_auth_mode的值），返回false，继续执行下一个。
 
 以http basic auth的认证方式为例子，basic方式即使用http的basic auth作为认证信息的载体，当之前modifier返回false，即没有使用诸如oidc的话，进入此函数。具体实现如下：
 ```

@@ -73,25 +73,12 @@ func (s *SecurityContext) Can(action rbac.Action, resource rbac.Resource) bool {
 			projectNamespace := rbac.NewProjectNamespace(projectID, isPublicProject)
 			//NewUser返回了一个visitor，这个visitor实现了rbac的User接口
 			user := project.NewUser(s, projectNamespace, s.GetProjectRoles(projectID)...)
+			//实际鉴权逻辑
 			return rbac.HasPermission(user, resource, action)
 		}
 	}
 	return false
 }
-```
-上述代码中，根据resource的描述，封装了一个RBAC模块的User接口实现`vistor`，*怀疑这里的vistor使用了访问者模式，待验证*：
-```go
-func NewUser(ctx visitorContext, namespace rbac.Namespace, projectRoles ...int) rbac.User {
-	return &visitor{
-		ctx:          ctx,   //securityContext
-		namespace:    namespace,	// projectNamespace，实现了rbac.Namespace接口
-		projectRoles: projectRoles, //s.GetProjectRoles(projectID)的返回，返回对于某个project，对应user持有的所有角色列表
-	}
-}
-```
-然后进入`rbac.HasPermission(user, resource, action)`，可以看到内部只有一句:
-```go
-	enforcerForUser(user).Enforce(user.GetUserName(), resource.String(), action.String())
 ```
 
 ## casbin
@@ -117,7 +104,7 @@ r={sub, obj,act}
 3. **matchers**
 Request和Policy文件中内容的匹配规则。比如：
 ```
-//请求的参数（实体、资源和方法）都相等，即在策略文件内容中能找到，那么返回策略结果(p.eft)。策略结果会保存在p.eft中。
+//请求的参数（实体、资源和方法）都相等，即在策略文件内容中能找到，那么返回策略结果(p.eft)；找不到即deny。策略结果会保存在p.eft中。
 m = r.sub == p.sub && r.act == p.act && r.obj == p.obj
 ```
 4. **effect**
@@ -130,9 +117,19 @@ e = some(where(p.eft == allow))
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 ```
 
+5. **role**
+进行role的定义，比如：
+```
+[role_definition]
+g = _, _
+g2 = _, _
+g3 = _, _, _
+```
+其中，g, g2, g3 表示不同的 RBAC 体系, _, _ 表示用户和角色 _, _, _ 表示用户, 角色, 域。role的定义被matchers调用，来确定policy，比如g(r.sub, p.sub)表示r和q的用户和角色相同。
+
 ### policy文件
 
-policy文件的内容为需要进行鉴权的请求描述，其格式按照model文件中policy中的定义描述，比如：
+policy文件的内容为需要进行鉴权的请求描述，其格式按照**model文件中policy**的定义描述，比如：
 ```
 //表示zeta这个sub 对数据data1 执行read操作，是allow的
 p, zeta, data1, read, allow
@@ -153,3 +150,334 @@ p, zeta, data2, write, allow
 因此，实现鉴权的关键就是定义出model文件以及policy文件内容。对于model文件，因为它其实是一个类似模板的通用配置，因此可在文件or直接的字符串中定义，对于policy，其描述了任意sub对于一个obj的操作act，因此在实际应用中，此数据可能来源于DB。
 
 ## harbor & casbin
+
+回到harbor的具体应用，其对casbin的调用位于`common/rbac/rbac.go`的函数`HasPermission`:
+```go
+//user即封装了secContext、project、projectRoles的vistor,resource即带访问的project描述，action即操作
+func HasPermission(user User, resource Resource, action Action) bool {
+	return enforcerForUser(user).Enforce(user.GetUserName(), resource.String(), action.String())
+}
+```
+上述代码中，User接口的实现位于`common/rbac/project/vistor.go`,其定义如下：
+```go
+func NewUser(ctx visitorContext, namespace rbac.Namespace, projectRoles ...int) rbac.User {
+	return &visitor{
+		ctx:          ctx,   //securityContext
+		namespace:    namespace,	// projectNamespace封装了projectID以及isPublic属性，实现了rbac.Namespace接口
+		projectRoles: projectRoles, //s.GetProjectRoles(projectID)的返回，返回对于某个project，对应user持有的所有角色列表（[]int形式）
+	}
+}
+```
+注意，这里User的含义不再是指账户or用户，而是**资源请求者**，里面包含了资源申请者描述以及待审批的资源描述。
+继续回到`HasPermission`中，其第一句`enforcerForUser(user)`内部
+```go
+func enforcerForUser(user User) *casbin.Enforcer {
+	//casbin的model文件
+	m := model.Model{}
+	//加载model文件
+	m.LoadModelFromText(modelText)
+	//Enforcer是进行鉴权和policy管理的核心接口，adapter用于不同的policy加载具体实现
+	e := casbin.NewEnforcer(m, &userAdapter{User: user})
+	//加载执行matcher策略需要的func
+	e.AddFunction("keyMatch2", keyMatch2Func)
+	return e
+}
+```
+### model
+
+在这里可以看到重要的**model文件**和**ploicy文件**的影子，首先是model文件，也就是一个字符串modelText:
+```
+# Request definition
+[request_definition]
+r = sub, obj, act
+
+# Policy definition
+[policy_definition]
+p = sub, obj, act, eft
+
+# Role definition , 只定义用户和角色（）
+[role_definition]
+g = _, _
+
+# Policy effect， 鉴权结果约束
+[policy_effect]
+e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
+
+# Matchers，匹配policy条目需要的匹配规则
+[matchers]
+m = g(r.sub, p.sub) && keyMatch2(r.obj, p.obj) && (r.act == p.act || p.act == '*')
+```
+
+### adapter
+
+继续查看`enforcerForUser`函数，当model定义完成后，执行NewEnforcer(m, &userAdapter{User: user})，Enforcer是进行鉴权和策略管理的核心接口，因此，策略加载的逻辑在userAdapter中实现。userAdapter中包含了匿名字段User接口，其具体实现就是上节中的vistor，代表资源申请者。userAdapter同时实现了casbin接口`persist.Adapter`:
+```go
+// Adapter is the interface for Casbin adapters.
+type Adapter interface {
+	// LoadPolicy loads all policy rules from the storage.
+	LoadPolicy(model model.Model) error
+	// SavePolicy saves all policy rules to the storage.
+	SavePolicy(model model.Model) error
+
+	// AddPolicy adds a policy rule to the storage.
+	// This is part of the Auto-Save feature.
+	AddPolicy(sec string, ptype string, rule []string) error
+	// RemovePolicy removes a policy rule from the storage.
+	// This is part of the Auto-Save feature.
+	RemovePolicy(sec string, ptype string, rule []string) error
+	// RemoveFilteredPolicy removes policy rules that match the filter from the storage.
+	// This is part of the Auto-Save feature.
+	RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error
+}
+```
+其实际实现的是LoadPolicy方法：
+```go
+func (a *userAdapter) LoadPolicy(model model.Model) error {
+	//获取user的所有policy定义
+	for _, line := range a.getUserAllPolicyLines() {
+		persist.LoadPolicyLine(line, model)
+	}
+	return nil
+}
+```
+因此可以看到核心语句为`getUserAllPolicyLines()`，继续进入实现：
+```go
+func (a *userAdapter) getUserAllPolicyLines() []string {
+	lines := []string{}
+	//如果没有认证，返回“anonymous”，否则返回securityContext中的username
+	username := a.GetUserName()
+	// returns empty policy lines if username is empty
+	//username为空直接返回，意味着policy为空，因此任何的请求都失败
+	if username == "" {
+		return lines
+	}
+	//1.获取User的policy
+	lines = append(lines, a.getUserPolicyLines()...)
+	//2.获取User对应的Role的policy
+	for _, role := range a.GetRoles() {
+		lines = append(lines, a.getRolePolicyLines(role)...)
+		//3.获取UserName和Role之间的policy
+		lines = append(lines, fmt.Sprintf("g, %s, %s", username, role.GetRoleName()))
+	}
+	return lines
+}
+```
+从上述代码可以看到，policy的内容主要由3部分组成：描述User的Policy,描述Role的Policy以及描述User和Role关系的Policy。
+
+1. **User Policy** 
+
+获取User Policy的函数入口位于`getUserPolicyLines`:
+```go
+func (a *userAdapter) getUserPolicyLines() []string {
+	lines := []string{}
+	...
+	for _, policy := range a.GetPolicies() {
+		//format为policy的合法格式
+		line := fmt.Sprintf("p, %s, %s, %s, %s", username, policy.Resource, policy.Action, policy.GetEffect())
+		lines = append(lines, line)
+	}
+	return lines
+}
+```
+而policy的加载最终由vistor的GetPloicies实现：
+```go
+func (v *visitor) GetPolicies() []*rbac.Policy {
+	if v.ctx.IsSysAdmin() {
+		//加载admin的policy
+		return GetAllPolicies(v.namespace)
+	}
+	if v.namespace.IsPublic() {
+		//加载public  project policy
+		return PoliciesForPublicProject(v.namespace)
+	}
+	return nil
+}
+```
+以admin为例:
+```go
+// GetAllPolicies returns all policies for namespace of the project
+func GetAllPolicies(namespace rbac.Namespace) []*rbac.Policy {
+	policies := []*rbac.Policy{}
+	//加载allPolicy
+	for _, policy := range allPolicies {
+		//将all policy的描述封装为rbac.Policy并添加进切片
+		policies = append(policies, &rbac.Policy{
+			Resource: namespace.Resource(policy.Resource),
+			Action:   policy.Action,
+			Effect:   policy.Effect,
+		})
+	}
+	return policies
+}
+```
+其中rbac.Policy的定义为：
+```go
+type Policy struct {
+	//资源描述，会调用namespace.Resource去format为类似 project/{pid}/label，其中的label即加载的policy数组定义的Rosource
+	Resource
+	//加载的policy数据中的action描述
+	Action
+	//默认allow
+	Effect
+}
+```
+再看加载的admin的policy的定义：
+```go
+allPolicies = []*rbac.Policy{
+		{Resource: rbac.ResourceSelf, Action: rbac.ActionRead},
+		{Resource: rbac.ResourceSelf, Action: rbac.ActionUpdate},
+		{Resource: rbac.ResourceSelf, Action: rbac.ActionDelete},
+		...
+	}
+```
+回到userAdapter的`getUserPolicyLines`，可知返回的user policy大致内容为：
+```
+p, zhangsan, porject/{pid}/label, read, allow
+```
+
+2. **Role Policy**
+
+role Policy的加载逻辑和User类似，首先获取user中的roleIDs，然后在rolePoliciesMap中加载对应的策略:
+```go
+func (a *userAdapter) getUserAllPolicyLines() []string {
+	...
+	lines = append(lines, a.getUserPolicyLines()...)
+	//a.GetRole获取a的所有Role
+	for _, role := range a.GetRoles() {
+		lines = append(lines, a.getRolePolicyLines(role)...)
+		lines = append(lines, fmt.Sprintf("g, %s, %s", username, role.GetRoleName()))
+	}
+	return lines
+}
+
+func (a *userAdapter) getRolePolicyLines(role Role) []string {
+	lines := []string{}
+	...
+	//加载role相关的policy
+	for _, policy := range role.GetPolicies() {
+		line := fmt.Sprintf("p, %s, %s, %s, %s", roleName, policy.Resource, policy.Action, policy.GetEffect())
+		lines = append(lines, line)
+	}
+	return lines
+}
+```
+其中role相关policy的定义如下：
+```go
+rolePoliciesMap = map[string][]*rbac.Policy{
+		"projectAdmin": {
+			{Resource: rbac.ResourceSelf, Action: rbac.ActionRead},
+			{Resource: rbac.ResourceSelf, Action: rbac.ActionUpdate},
+			{Resource: rbac.ResourceSelf, Action: rbac.ActionDelete},
+			...
+		}，
+		"master": {
+		...
+		}
+		...			
+```
+因此，role poicy的内容最终为：
+```
+p, projectAdmin, project/{pid}/label, allow
+```
+
+3. **UserName&Role Policy**
+
+继续回到getUserAllPolicyLines，可以看到同样的需要获取UserName和Role的关系：
+```go
+func (a *userAdapter) getUserAllPolicyLines() []string {
+	...
+	lines = append(lines, a.getUserPolicyLines()...)
+	//a.GetRole获取a的所有Role
+	for _, role := range a.GetRoles() {
+		lines = append(lines, a.getRolePolicyLines(role)...)
+		//获取username和role的关系
+		lines = append(lines, fmt.Sprintf("g, %s, %s", username, role.GetRoleName()))
+	}
+	return lines
+}
+
+func (role *visitorRole) GetRoleName() string {
+	switch role.roleID {
+	case common.RoleProjectAdmin:
+		return "projectAdmin"
+	case common.RoleMaster:
+		return "master"
+	case common.RoleDeveloper:
+		return "developer"
+	case common.RoleGuest:
+		return "guest"
+	default:
+		return ""
+	}
+}
+```
+即最终的policy内容为：
+```
+g, zhangsan, projectAdmin
+```
+至此，policy的内容加载完毕。
+
+## 鉴权
+
+回到函数HasPermission，在model和policy内容加载完成后，执行enforce：
+```go
+// HasPermission returns whether the user has action permission on resource
+func HasPermission(user User, resource Resource, action Action) bool {
+	return enforcerForUser(user).Enforce(user.GetUserName(), resource.String(), action.String())
+}
+```
+此时，假设zhangsan要对projectID=1的资源label进行delete操作（zhangsan为项目管理projectAdmin，project为公有，有权限），其涉及的步骤如下：
+1. req = zhangsan, project/1/label, delete
+2. 根据加载的policy中，存在以下条目：
+```
+p, projectAdmin, project/1/label, delete
+```
+3. 根据username和role关心，存在：
+```
+g, zhangsan, projectAdmin
+```
+4. 使用matchers的规则，将req匹配到对应的policy条目上，鉴权通过。
+
+### matchers
+
+在上述鉴权过程中，model文件中matchers定义和加载如下：
+```
+func enforcerForUser(user User) *casbin.Enforcer {
+	...
+	e.AddFunction("keyMatch2", keyMatch2Func)
+	return e
+}
+
+...
+# Matchers
+[matchers]
+m = g(r.sub, p.sub) && keyMatch2(r.obj, p.obj) && (r.act == p.act || p.act == '*')
+```
+其中keyMatch2Func内容为，主要工作就是对要操作的对象进行mathch：
+```go
+func keyMatch2Func(args ...interface{}) (interface{}, error) {
+	name1 := args[0].(string)
+	name2 := args[1].(string)
+	//name即project/{pid}/{subresource} ,例如project/1/label
+	return bool(keyMatch2(name1, name2)), nil
+}
+
+// keyMatch2 determines whether key1 matches the pattern of key2, its behavior most likely the builtin KeyMatch2
+// except that the match of ("/project/1/robot", "/project/1") will return false
+func keyMatch2(key1 string, key2 string) bool {
+	key2 = strings.Replace(key2, "/*", "/.*", -1)
+	re := regexp.MustCompile(`(.*):[^/]+(.*)`)
+	for {
+		if !strings.Contains(key2, "/:") {
+			break
+		}
+
+		key2 = re.ReplaceAllString(key2, "$1[^/]+$2")
+	}
+	return util.RegexMatch(key1, "^"+key2+"$")
+}
+```
+
+## 总结
+
+至此，harbor的鉴权过程分析完毕，总的来说，harbor通过casbin框架进行具体的鉴权操作。model的定义是预先配置好的，当鉴权请求到来后（securityContext中的Can调用），根据请求者身份和要操作的project，动态加载policy(从内存中，即预先定义的数组)，最终根据req和加载的policy，执行model中的鉴权规则。

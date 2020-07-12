@@ -5,7 +5,7 @@
 
 prepare中的逻辑并没有进行鉴权操作，只是类似filter的功能，和filter的不同是，filter的粒度更粗（当然可以根据正则细化），而prepare完成了在具体模块（project）的业务过滤。
 
-在harbor core中，使用了filter完成了[请求认证](harbor-core-authn) 相关的工作，在对具体的资源进行操作前，需要进行鉴权处理，确认当前的登录者对资源对象存在操作权限。
+在harbor core中，使用了filter完成了[请求认证](harbor-core-authn.md) 相关的工作，在对具体的资源进行操作前，需要进行鉴权处理，确认当前的登录者对资源对象存在操作权限。
 
 harbor的管理对象是project，因此，以delete project为角度切入，进行分析。
 

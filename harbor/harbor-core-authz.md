@@ -279,7 +279,7 @@ func (a *userAdapter) getUserPolicyLines() []string {
 	return lines
 }
 ```
-而policy的加载最终由vistor的GetPloicies实现：
+而policy的加载最终由vistor的GetPloicies实现，此时**加载的policy都针对公有项目or请求者是admin，对于公有项目，任何人可见可查询**：
 ```go
 func (v *visitor) GetPolicies() []*rbac.Policy {
 	if v.ctx.IsSysAdmin() {
@@ -337,7 +337,7 @@ p, zhangsan, porject/{pid}/label, read, allow
 
 2. **Role Policy**
 
-role Policy的加载逻辑和User类似，首先获取user中的roleIDs，然后在rolePoliciesMap中加载对应的策略:
+role Policy的加载逻辑和User类似，首先获取user中的roleIDs，然后在rolePoliciesMap中加载对应的策略,**，如果username对于该项目没有角色，则没有roleID，相应的不会加载role policy**,:
 ```go
 func (a *userAdapter) getUserAllPolicyLines() []string {
 	...
@@ -426,17 +426,29 @@ func HasPermission(user User, resource Resource, action Action) bool {
 	return enforcerForUser(user).Enforce(user.GetUserName(), resource.String(), action.String())
 }
 ```
-此时，假设zhangsan要对projectID=1的资源label进行delete操作（zhangsan为项目管理projectAdmin，project为公有，有权限），其涉及的步骤如下：
+
+### 场景1
+
+假设zhangsan要对projectID=1的资源label进行delete操作（zhangsan为项目管理projectAdmin，project为私有，有权限），其涉及的步骤如下：
 1. req = zhangsan, project/1/label, delete
 2. 根据加载的policy中，存在以下条目：
 ```
 p, projectAdmin, project/1/label, delete
 ```
-3. 根据username和role关心，存在：
+3. 根据username和role关系，存在：
 ```
 g, zhangsan, projectAdmin
 ```
 4. 使用matchers的规则，将req匹配到对应的policy条目上，鉴权通过。
+
+### 场景2
+
+假设zhangsan要对projectID=2的资源label进行delete操作（project为私有，zhangsan在该项目中无角色，因此无权限），其涉及的步骤如下：
+1. req = zhangsan, project/2/label, delete
+2. 根据加载的policy中，**由于私有项目，张三没有具体角色，因此即没有user policy也没有role policy**
+3. 同样也没有 username&role policy
+4. 使用matchers的规则，没有匹配的policy条目上，鉴权失败。
+
 
 ### matchers
 

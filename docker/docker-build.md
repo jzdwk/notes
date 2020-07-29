@@ -4,7 +4,9 @@
 
 ## client 
 
-docker build 同样是C/S方式实现，client端的代码位于`components/cli/cli/command/commands/commands.go`的`image.NewBuildCommand(dockerCli)`函数，最终进入`runBuild`函数：
+docker build同样是C/S方式实现，client端的主要作用就是根据命令，通过不同方式获取dockerfile文件以及其他配置信息。获取的方式有指定目录、指定URL和标准输入。获取文件后，在根据配置信息对dockerfile以及相关的目录进行压缩，成tar包后传输。
+
+client端的代码位于`components/cli/cli/command/commands/commands.go`的`image.NewBuildCommand(dockerCli)`函数，最终进入`runBuild`函数：
 
 ```go
 func runBuild(dockerCli command.Cli, options buildOptions) error {
@@ -37,11 +39,8 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 			return errors.Wrap(err, "Removing image ID file")
 		}
 	}
-```
-
-上面的代码没有核心逻辑，唯一注意的是`imageIDFile`以及`--iidfile`的*使用场景*。 通过不同途径去获取dockerfile，然后进行build的核心逻辑使用了switch-case实现：
-
-```go
+	...
+	//不同的dockerfile获取方式
 	switch {
 	case options.contextFromStdin():
 		// buildCtx is tar archive. if stdin was dockerfile then it is wrapped
@@ -59,47 +58,33 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 	case urlutil.IsGitURL(specifiedContext):
 		tempDir, relDockerfile, err = build.GetContextFromGitURL(specifiedContext, options.dockerfileName)
 	case urlutil.IsURL(specifiedContext):
+		//URL 方式，返回的是一个tar包，需要额外处理
 		buildCtx, relDockerfile, err = build.GetContextFromURL(progBuff, specifiedContext, options.dockerfileName)
 	default:
 		return errors.Errorf("unable to prepare context: path %q not found", specifiedContext)
 	}
-
-	if err != nil {
-		if options.quiet && urlutil.IsURL(specifiedContext) {
-			fmt.Fprintln(dockerCli.Err(), progBuff)
-		}
-		return errors.Errorf("unable to prepare context: %s", err)
-	}
-
-	if tempDir != "" {
-		defer os.RemoveAll(tempDir)
-		contextDir = tempDir
-	}
-
+```
+接下来主要是对dockerfile文件以及相关的文件进行操作，最终封装为buildctx进行post提交：
+```go
+	//buildctx为空表示从目录读取，同时读取ignore文件，打包时忽略
 	// read from a directory into tar archive
 	if buildCtx == nil {
 		excludes, err := build.ReadDockerignore(contextDir)
-		if err != nil {
-			return err
-		}
-
+		...
 		if err := build.ValidateContextDirectory(contextDir, excludes); err != nil {
 			return errors.Errorf("error checking context: '%s'.", err)
 		}
-
 		// And canonicalize dockerfile name to a platform-independent one
 		relDockerfile = archive.CanonicalTarNameForPath(relDockerfile)
-
 		excludes = build.TrimBuildFilesFromExcludes(excludes, relDockerfile, options.dockerfileFromStdin())
 		buildCtx, err = archive.TarWithOptions(contextDir, &archive.TarOptions{
 			ExcludePatterns: excludes,
 			ChownOpts:       &idtools.Identity{UID: 0, GID: 0},
 		})
-		if err != nil {
-			return err
-		}
+		...
 	}
 
+	//将tar包中的内容替换，返回新的tar包
 	// replace Dockerfile if it was added from stdin or a file outside the build-context, and there is archive context
 	if dockerfileCtx != nil && buildCtx != nil {
 		buildCtx, relDockerfile, err = build.AddDockerfileToBuildContext(dockerfileCtx, buildCtx)
@@ -110,7 +95,7 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
+	//替换TrustedReference 
 	var resolvedTags []*resolvedTag
 	if !options.untrusted {
 		translator := func(ctx context.Context, ref reference.NamedTagged) (reference.Canonical, error) {
@@ -130,31 +115,24 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 			dockerfileCtx = ioutil.NopCloser(bytes.NewBuffer(newDockerfile))
 		}
 	}
-
+	//压缩
 	if options.compress {
 		buildCtx, err = build.Compress(buildCtx)
-		if err != nil {
-			return err
-		}
+		...
 	}
 
-	// Setup an upload progress bar
-	progressOutput := streamformatter.NewProgressOutput(progBuff)
-	if !dockerCli.Out().IsTerminal() {
-		progressOutput = &lastProgressOutput{output: progressOutput}
-	}
-
+	...
 	// if up to this point nothing has set the context then we must have another
 	// way for sending it(streaming) and set the context to the Dockerfile
 	if dockerfileCtx != nil && buildCtx == nil {
 		buildCtx = dockerfileCtx
 	}
-
+	//最终封装为一个body
 	var body io.Reader
 	if buildCtx != nil {
 		body = progress.NewProgressReader(buildCtx, progressOutput, 0, "", "Sending build context to Docker daemon")
 	}
-
+	//build的配置信息
 	configFile := dockerCli.ConfigFile()
 	creds, _ := configFile.GetAllCredentials()
 	authConfigs := make(map[string]types.AuthConfig, len(creds))
@@ -166,7 +144,7 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 	buildOptions.Dockerfile = relDockerfile
 	buildOptions.AuthConfigs = authConfigs
 	buildOptions.RemoteContext = remote
-
+	//发送http请求
 	response, err := dockerCli.Client().ImageBuild(ctx, body, buildOptions)
 	if err != nil {
 		if options.quiet {
@@ -176,67 +154,6 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 		return err
 	}
 	defer response.Body.Close()
-
-	imageID := ""
-	aux := func(msg jsonmessage.JSONMessage) {
-		var result types.BuildResult
-		if err := json.Unmarshal(*msg.Aux, &result); err != nil {
-			fmt.Fprintf(dockerCli.Err(), "Failed to parse aux message: %s", err)
-		} else {
-			imageID = result.ID
-		}
-	}
-
-	err = jsonmessage.DisplayJSONMessagesStream(response.Body, buildBuff, dockerCli.Out().FD(), dockerCli.Out().IsTerminal(), aux)
-	if err != nil {
-		if jerr, ok := err.(*jsonmessage.JSONError); ok {
-			// If no error code is set, default to 1
-			if jerr.Code == 0 {
-				jerr.Code = 1
-			}
-			if options.quiet {
-				fmt.Fprintf(dockerCli.Err(), "%s%s", progBuff, buildBuff)
-			}
-			return cli.StatusError{Status: jerr.Message, StatusCode: jerr.Code}
-		}
-		return err
-	}
-
-	// Windows: show error message about modified file permissions if the
-	// daemon isn't running Windows.
-	if response.OSType != "windows" && runtime.GOOS == "windows" && !options.quiet {
-		fmt.Fprintln(dockerCli.Out(), "SECURITY WARNING: You are building a Docker "+
-			"image from Windows against a non-Windows Docker host. All files and "+
-			"directories added to build context will have '-rwxr-xr-x' permissions. "+
-			"It is recommended to double check and reset permissions for sensitive "+
-			"files and directories.")
-	}
-
-	// Everything worked so if -q was provided the output from the daemon
-	// should be just the image ID and we'll print that to stdout.
-	if options.quiet {
-		imageID = fmt.Sprintf("%s", buildBuff)
-		_, _ = fmt.Fprint(dockerCli.Out(), imageID)
-	}
-
-	if options.imageIDFile != "" {
-		if imageID == "" {
-			return errors.Errorf("Server did not provide an image ID. Cannot write %s", options.imageIDFile)
-		}
-		if err := ioutil.WriteFile(options.imageIDFile, []byte(imageID), 0666); err != nil {
-			return err
-		}
-	}
-	if !options.untrusted {
-		// Since the build was successful, now we must tag any of the resolved
-		// images from the above Dockerfile rewrite.
-		for _, resolved := range resolvedTags {
-			if err := TagTrusted(ctx, dockerCli, resolved.digestRef, resolved.tagRef); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	...
 }
 ```

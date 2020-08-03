@@ -64,9 +64,10 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 		return errors.Errorf("unable to prepare context: path %q not found", specifiedContext)
 	}
 ```
-接下来主要是对dockerfile文件以及相关的文件进行操作，最终封装为buildctx进行post提交：
+接下来主要是对dockerfile文件进行操作，并最终封装为buildctx进行post提交：
 ```go
-	//buildctx为空表示从目录读取，同时读取ignore文件，打包时忽略
+	//buildctx为空表示从目录读取，同时读取ignore文件，并在最终压缩为tar包时忽略。
+	//注意buildctx表示dockerfile对应的tar包，dockerfileCtx表示dockerfile文件
 	// read from a directory into tar archive
 	if buildCtx == nil {
 		excludes, err := build.ReadDockerignore(contextDir)
@@ -84,13 +85,11 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 		...
 	}
 
-	//将tar包中的内容替换，返回新的tar包
+	//将dockerfile的名称增加随机数,即.dockerfile.xxx,以及.dockerignore.xxxx，同时并返回新的tar包
 	// replace Dockerfile if it was added from stdin or a file outside the build-context, and there is archive context
 	if dockerfileCtx != nil && buildCtx != nil {
 		buildCtx, relDockerfile, err = build.AddDockerfileToBuildContext(dockerfileCtx, buildCtx)
-		if err != nil {
-			return err
-		}
+		...
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

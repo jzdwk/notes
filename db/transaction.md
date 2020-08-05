@@ -129,8 +129,60 @@ SessionA:SELECT ...FROM t WHERE c = 4 FOR UPDATE；
 SessionB:INSERT INTO t SELECT 6,5,11; 阻塞，因为所有范围都上了X LOCK；
 
 
+**注意**：**锁范围**都是**RR隔离级别**的行为，在**RC隔离级别**下，只会加行锁，即如果where条件匹配，就对该行加锁（具体加S/X锁看语句中的写法，FOR UPDATE、LOCK IN SHARE MODE）,没有匹配的就不加锁，对于范围查找（id<10）也是如此。
+
+### 关联查询的锁
+
+关联查询的加锁策略同单表相同，只是会在多表上加锁。假设有以下两张表
+- test:
+|id(主键)|b(索引)|c(常规列)|
+|--|--|--|
+|1|1|1|
+|5|3|2|
+|10|5|3|
+
+- test2:
+|id(主键)|b2(索引)|c2(常规列)|
+|--|--|--|
+|1|1|10|
+|5|3|30|
+
+**RC隔离级别**
+
+SessionA: SELECT test2.c2 from test2 inner join test on test2.b2 = test.b where test.id = 1;
+
+SessionB: UPDATE test set test.c = 9 where test.id =1 将阻塞，因为SessionA的关联查询条件匹配了test和test2中id=1的行，**RC下只在匹配行上加锁**，故阻塞。同理，UPDATE test2的id=1的行也会阻塞。
+
+SessionA:  SELECT test2.c2 from test2 inner join test on test2.b2 = test.b where test.c = 1;
+
+SessionB: UPDATE test set test.c = 9 where test.id =1 将阻塞，**因为查询条件上没有索引，因此会进行全表扫描，此时，将锁住test和test2的所有行**。
+
+**RR隔离级别**
+
+RR级别的加锁行为和RC类似，根据**查询条件确定加锁的范围**，如果查询条件是:
+
+1. 唯一/聚簇索引
+
+SessionA: SELECT test2.c2 from test2 inner join test on test2.b2 = test.b where test.id = 1;
+
+SessionB: UPDATE test set test.c = 9 where test.id =1 将阻塞，理由同RC的场景，但INSERT INTO test SELECT 2,2,2不阻塞，因为**Next-Key Lock**降级为**Record**
+
+2. 辅助索引
+
+SessionA: SELECT test2.c2 from test2 inner join test on test2.b2 = test.b where test.b = 3;
+
+SessionB: INSERT INTO test SELECT 2,2,2将阻塞，同样阻塞的还有INSERT INTO test2 SELECT 2,2,2，因为**Next-Key Lock**分别对b=3的记录加上了间隙锁。
+
+3. 无索引的查询
+
+SessionA: SELECT test2.c2 from test2 inner join test on test2.b2 = test.b where test.c = 2;
+
+SessionB: 此时的加锁策略为**查询条件如果为test表，则加锁test上所有行和间隙，对test表的所有操作将阻塞，但只对关联匹配的test2的对应行上加锁**
+
+### 其他
+
 **延伸**：考虑为什么查询列要加索引？答：1、减少IO 2、全表查锁表，索引覆盖查只锁一个范围。
 
 **另外**：InnoDB没有锁升级的概念（行锁->页锁->表锁），而是根据事务访问的页，采用位图方式管理锁。
 
-**注意**：**锁范围**都是**RR隔离级别**的行为，在**RC隔离级别**下，只会加行锁，即如果where条件匹配，就对该行加锁（具体加S/X锁看语句中的写法，FOR UPDATE、LOCK IN SHARE MODE）,没有匹配的就不加锁。
+**一些文章**： 加锁详解 https://www.cnblogs.com/crazylqy/p/7611069.html 关联查询讨论 https://www.zhihu.com/question/68258877

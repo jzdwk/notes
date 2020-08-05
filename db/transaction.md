@@ -42,21 +42,29 @@ IS/IX/S/X之间的兼容性自行百度。总结来说：
 ### 一致性非锁定读
 
 **行为**：如果读取的数据正在执行DELETE/UPDATE这种需要X LOCK 行锁资源的操作，如果使用一致性非锁定读，那么读操作不会等待X LOCK的释放。而是去读该行的一个**快照**。
+
 **目的**：可以极大提高数据库并发性。
+
 **实现**：InnoDB通过**多版本并发控制（MVCC）**实现。快照数据是当前行数据的一个历史版本，并且每行记录可以有不止一个快照。另外，这个快照由**回滚段(undo,回忆db引擎的表/段/区/页/行)**去实现，因此，快照数据本身没有开销。
 
 在RC以及RR（默认）的事务隔离级别下，InnoDB使用非锁定的一致性读。而这两种级别对应的读快照的行为不同：
+
 1. RC下，总是读取最新的一份快照，这样，在另一个事务提交数据后，因为最新的快照是另一个事务更新后的，所以会读到。因此RC叫做读已提交。
+
 2. RR下，总是读取此事务开始时的数据，此时，在另一个事务提交数据后，因为要读的快照是本次事务开始时的，所以不会读到另一个事务提交后的数据。因此RR叫做可重复读。*因此，RR通过MVCC解决了读场景下的幻读问题，但是没有解决写场景的幻读*
 
 **注意**：mysql默认的隔离级别是RR,但是大多数互联网项目设置的隔离级别为RC，[原因](https://zhuanlan.zhihu.com/p/59061106)：
+
 1. 最重要的，mysql主从复制的bug，binlog的statement模式
+
 2. 效率问题
 
 ### 一致性锁定读
 
 一致性非锁定读和一致性锁定读都是针对读场景，当用户在读场景下需要通过加锁来保证数据的一致性时(比如防止丢失更新)，使用：
+
 1. SELECT ... FOR UPDATE: 对读取的行增加一个X LOCK
+
 2. SELECT ... LOCK IN SHARE MODE: 对读取的行增加一个S LOCK
 
 ### 外键和锁
@@ -68,20 +76,61 @@ IS/IX/S/X之间的兼容性自行百度。总结来说：
 ### 锁种类（算法）
 
 1. **Record Lock**: 单条记录上的锁，**本质上锁住的是索引记录，即聚簇索引**，当表没有主键，InnoDB自己创建一个隐藏列。
+
 2. **Gap Lock**: 间隙锁，不包含记录本身
-3. **Next-Key Lock**: = Gap Lock+Record Lock, 锁定一个范围，范围的整体值为（小于查询条件的最接近值，查询条件],(查询条件，大于查询条件的最接近值)。**InnoDB对于行的查询都采用该算法**，该算法用于解决**幻读**问题。
 
-**Next-Key Lock**应用于**RR隔离级别**，对于查询加锁的场景（即对于查询语句使用FOR UPDATE加X锁，或LOCK IN SHARE MODE加X锁），假设表中只有1,2,5三行数据，有：
+3. **Next-Key Lock**: = Gap Lock+Record Lock, 锁定一个范围，范围的整体值为（小于查询条件的最接近值，查询条件],(查询条件，大于查询条件的最接近值)。**在RR隔离级别，InnoDB对于行的查询都采用该算法**，该算法用于解决**幻读**问题。
 
-1. 当查询的索引含有唯一属性，InnoDB对**Next-Key Lock**进行优化，降级为**Record Lock**。 
-比如：SessionA: SELECT ...FROM t WHERE id = 5 FOR UPDATE; 正常要锁（2，5）这个范围，但是降级后，只锁5
-	SessionB: INSERT INTO t SELECT 4; 不会阻塞。
-2. 当查询的是辅助索引，比如id = 5的行有b=3的列，b为辅助索引，此时，针对SELECT ... FROM t WHERE b = 3 FOR UPDATE;
-此时，**对于聚簇索引，对id=5加Record Lock,对于辅助索引，加上的是Nexy-Key Lock,即（1,3],(3,6)**,因此，以下语句都会阻塞：
-SELECT ... FROM t WHERE a = 5 LOCK IN SHARE MODE;
-INSERT INTO t SELECT 4,2;
-INSERT INTO t SELECT 6,5;
+**Next-Key Lock**应用于**RR隔离级别**，对于查询加锁的场景（即对于查询语句使用FOR UPDATE加X锁，或LOCK IN SHARE MODE加X锁），假设表设计如下：
+|id(主键)|b(索引)|c(常规列)|
+|--|--|--|
+|1|1|1|
+|5|3|4|
+|10|5|7|
+
+有以下几种情况：
+
+1. 当查询的索引含有**唯一**属性（**既包括唯一索引，也包括主键聚簇索引**），对于
+
+SessionA:SELECT ...FROM t WHERE id = 4 FOR UPDATE；
+
+SessionB:INSERT INTO t SELECT 3,2,1；
+
+SessionB将阻塞，原因在于SessionA中，id=4将锁id（1,5）这个范围。而SessionB要插入的id=3，因此阻塞。
+
+2. 当查询的索引含有唯一属性，对于
+
+SessionA:SELECT ...FROM t WHERE id = 5 FOR UPDATE；
+
+SessionB:INSERT INTO t SELECT 3,2,1；
+
+SessionB不会阻塞，原因在于InnoDB对**Next-Key Lock**进行优化，降级为**Record Lock**。 正常要锁（1，5）这个范围，但是降级后，只锁id=5的行，因此不会阻塞。
+
+3. 当查询的是辅助索引，比如id = 5的行有b=3的列，b为辅助索引，
+
+此时，针对SessionA : SELECT ... FROM t WHERE b = 3 FOR UPDATE;
+
+**对于聚簇索引，即对id=5将加Record Lock,对于辅助索引，加上的是Nexy-Key Lock,即（1,3],(3,5)**,因此，以下语句都会阻塞：
+
+SessionB:
+
+SELECT ... FROM t WHERE id = 5 LOCK IN SHARE MODE; 此语句因为 id = 5的行被加X LOCK，所以再查询时加S LOCK将阻塞。
+
+INSERT INTO t SELECT 4,2,1;  此语句将阻塞，因为SessionA根据Nexy-Key Lock锁定了（1,3],(3,5)这个范围，因此b=2的插入将阻塞。
+
+INSERT INTO t SELECT 6,5,1;  同上
+
+INSERT INTO t SELECT 7,0,1； 此语句不会阻塞，因为不在Session锁定的范围。
+
+4. 当查询的是没有索引的普通列，由于查询时要遍历整个表，所以**会对整个表进行加锁**，因此，Session任何的insert都对被阻塞：
+
+SessionA:SELECT ...FROM t WHERE c = 4 FOR UPDATE；
+
+SessionB:INSERT INTO t SELECT 6,5,11; 阻塞，因为所有范围都上了X LOCK；
+
 
 **延伸**：考虑为什么查询列要加索引？答：1、减少IO 2、全表查锁表，索引覆盖查只锁一个范围。
 
 **另外**：InnoDB没有锁升级的概念（行锁->页锁->表锁），而是根据事务访问的页，采用位图方式管理锁。
+
+**注意**：**锁范围**都是**RR隔离级别**的行为，在**RC隔离级别**下，只会加行锁，即如果where条件匹配，就对该行加锁（具体加S/X锁看语句中的写法，FOR UPDATE、LOCK IN SHARE MODE）,没有匹配的就不加锁。

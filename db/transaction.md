@@ -53,6 +53,8 @@ undo log的另一个作用是**MVCC**，当用户读取一条记录，如果该�
 MVCC是一致性非锁定读的实现，通过在每行记录我们自定义的字段外，还有数据库隐式定义的
 `DB_TRX_ID`,`DB_ROLL_PTR`,`DB_ROW_ID`字段
 
+**Innodb实现MVCC的方式是通过undo log， 因此以下结论都是建立在innodb的基础之上**
+
 1. `DB_TRX_ID` :最近修改(修改/插入)事务ID,记录创建这条记录/最后一次修改该记录的事务ID
 2. `DB_ROLL_PTR`:回滚指针，指向这条记录的上一个版本（存储于rollback segment里,即undo,）
 3. `DB_ROW_ID`:隐含的自增ID（隐藏主键），如果数据表没有主键，InnoDB会自动以DB_ROW_ID产生一个聚簇索引
@@ -73,7 +75,7 @@ undo log分为Insert和Update两种，delete可以看做是一种特殊的update
 
 2. 定位的undo log是一个链表，记录了多个并发事务的操作记录
 
-3. 根据事务的隔离级别RC/RR，在读取时选择匹配数据
+3. 根据事务的隔离级别RC/RR，在读取时选择匹配数据，匹配的依据是生成一个ReadView对象，RC生成时机为每次查询，RR则为事务开始时，而后根据ReadView的属性去做筛选。
 
 参考 https://www.cnblogs.com/rongdi/p/13378892.html
 

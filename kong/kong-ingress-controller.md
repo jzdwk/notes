@@ -20,7 +20,8 @@ kong ingress controller的入口位于cli/ingress-controller/main.go：
 进入parseFlags内部，可以看到其获取了kong client与kong服务通信的基本配置，并将这些信息封装为cliConfig结构体：
 
 ```
-flagSet := flagSet()
+func parseFlags() (cliConfig, error) {
+	flagSet := flagSet()
 
 	// glog
 	flag.Set("logtostderr", "true")
@@ -53,7 +54,9 @@ flagSet := flagSet()
 	if kongAdminTLSServerName != "" {
 		config.KongAdminTLSServerName = kongAdminTLSServerName
 	}
+}
 ```
+
 其中cliConfig的结构体如下：
 
 ```
@@ -105,6 +108,7 @@ type cliConfig struct {
 2. 在解析完client端的配置后，根据配置来创建两个client，一个是k8s的client，用于和k8s apiserver通信，另一个是kong client。首先，根据api server的APIServerHost和KubeConfigFilePath配置kubeClient，这里使用了[client-go](https://github.com/kubernetes/client-go) :
 
 ```
+func main(){
     ...
 	kubeCfg, kubeClient, err := createApiserverClient(cliConfig.APIServerHost,
 		cliConfig.KubeConfigFilePath)
@@ -122,6 +126,8 @@ type cliConfig struct {
 			metav1.GetOptions{})
 		...
 	}
+	...
+}
 ```
 
 注意上述代码除了kubeClient，额外处理了config中PublishService与WatchNamespace，当以上配置不为空，测试对应的k8s中是否设置。另外，createApiserverClient还返回了kubeCfg,这个kubeCfg结构体由client-go定义，主要存储了传递给kube client的信息，结构体如下：
@@ -239,6 +245,8 @@ type Config struct {
 
 根据配置信息创建kongClient，如果使用了TLS，则加载证书：
 ```
+func main(){
+	...
 	controllerConfig.KubeClient = kubeClient
 	defaultTransport := http.DefaultTransport.(*http.Transport)
 	var tlsConfig tls.Config
@@ -267,10 +275,13 @@ type Config struct {
 
 	kongClient, err := kong.NewClient(kong.String(cliConfig.KongAdminURL), c)
 	...
+}
 ```
 
 4. kongCient创建完成后，向kong admin api请求一些server端的配置信息并根据返回进行client的配置，首先请求api的根路径，api会返回kong server的所有配置信息：
 ```
+func main(){
+	...
 	//其实就是请求 http://kong_admin_url:port/
 	root, err := kongClient.Root(nil)
 	//根据返回配置client
@@ -302,17 +313,22 @@ type Config struct {
 		...
 	}
 	controllerConfig.Kong.Client = kongClient
+	...
+}
 ```
 
 5. 两个client初始化完毕后，将创建informer用于监听api server，首先根据之前的kubeClient创建一个coreInformerFactory，这个对象主要用于k8s自带的资源操作。
 
 ```
+func main(){
 	...
 	coreInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		kubeClient,
 		cliConfig.SyncPeriod,
 		informers.WithNamespace(cliConfig.WatchNamespace),
 	)
+	...
+}
 ```
 
 另外，由于在kong中定义了crd，同样需要对这些资源进行操作。所以，根据之前返回的kubeCfg，重新封装了一个ClientSet对象`confClient, _ := configurationclientv1.NewForConfig(kubeCfg)`，这个Clientset继承了client-go的client：
@@ -325,12 +341,16 @@ type Config struct {
 ```
 然后，根据这个clientset创建kongInformerFactory：
 ```
+func main(){
+	...
 	controllerConfig.KongConfigClient = confClient
 	kongInformerFactory := configurationinformer.NewSharedInformerFactoryWithOptions(
 		confClient,
 		cliConfig.SyncPeriod,
 		configurationinformer.WithNamespace(cliConfig.WatchNamespace),
 	)
+	...
+}
 ```
 然后是Knative的相关设置，Knative的[相关资料](https://knative.dev/docs/) 参考，内容待补充。
 ```
@@ -351,8 +371,8 @@ type Config struct {
 	}
 ```
 
-6. InformerFactory创建完毕后，
-
+6. InformerFactory创建完毕后，注册各种资源对象**待补充**
+```
 	var synced []cache.InformerSynced
 	updateChannel := channels.NewRingChannel(1024)
 	reh := controller.ResourceEventHandler{
@@ -498,4 +518,283 @@ type Config struct {
 	os.Exit(<-exitCh)
 ```
 
+## sync
 
+kong-ingress-controller的整体步骤为：
+
+1. 创建kong-ingress-controller的crd资源对象
+
+2. k8s apiserver watch到以后，controller根据上文的handler创建资源对象
+
+3. **crd创建好后，将crd定义的kong属性下发到kong服务，并创建相应的资源对象**
+
+回忆nginx ingress controller，最终ingress的配置将在nginx中添加对应的location等。同样，kong的流程也是如此。因此，需要一种机制去保证在crd到kong配置的下发过程中，k8s kong crd和kong之间的配置一致性。这个机制的提供者是[kong deck](https://github.com/Kong/deck) 
+
+首先进入main.go中最后的`kong.start()`：
+```
+func (n *KongController) Start() {
+	...
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-n.stopCh
+		cancel()
+	}()
+	var group errgroup.Group
+	group.Go(func() error {
+		n.elector.Run(ctx)
+		return nil
+	})
+	//goroutine启动同步队列
+	if n.syncStatus != nil {
+		group.Go(func() error {
+			n.syncStatus.Run()
+			return nil
+		})
+	}
+	//Run函数为处理逻辑
+	group.Go(func() error {
+		n.syncQueue.Run(time.Second, n.stopCh)
+		return nil
+	})
+	n.syncQueue.Enqueue(&networking.Ingress{})
+	...
+	}
+	//一个永真循环从update channel中读事件event，并入同步队列
+	for {
+		select {
+		case event := <-n.updateCh.Out():
+			if v := atomic.LoadUint32(&n.isShuttingDown); v != 0 {
+				return
+			}
+			if evt, ok := event.(Event); ok {
+				//
+				n.syncQueue.Enqueue(evt.Obj)
+				...
+			} else {
+				...
+			}
+		case <-n.stopCh:
+			return
+		}
+	}
+}
+```
+看到和同步相关的操作时通过一个同步队列完成，将接收的crd事件放入同步队列，另一个goroutine去处理，处理逻辑位于`n.syncQueue.Run(time.Second, n.stopCh)`.进入函数是一个period任务，处理逻辑位于`t.worker`：
+```
+func (t *Queue) worker() {
+	for {
+		//从同步队列取出event
+		key, quit := t.queue.Get()
+		...
+		ts := time.Now().UnixNano()
+
+		item := key.(Element)
+		//跳过最近同步的
+		...
+		//核心逻辑，t.sync(key)
+		if err := t.sync(key); err != nil {
+			t.queue.AddRateLimited(Element{
+				Key:       item.Key,
+				Timestamp: time.Now().UnixNano(),
+			})
+		} else {
+			t.queue.Forget(key)
+			t.lastSync = ts
+		}
+		t.queue.Done(key)
+	}
+}
+```
+可以看到，核心逻辑为`t.sync(key)`，这个sync方法是Queue结构体的一个函数变量，而Queue又是kongController结构体的一个字段，因此sync的注册位于main函数的`kong, err := controller.NewKongController(&controllerConfig, updateChannel,store)`，直接进入可以看到`	n.syncQueue = task.NewTaskQueue(n.syncIngress)`:
+```
+func NewTaskQueue(syncFn func(interface{}) error) *Queue {
+	return NewCustomTaskQueue(syncFn, nil)
+}
+
+// NewCustomTaskQueue ...
+func NewCustomTaskQueue(syncFn func(interface{}) error, fn func(interface{}) (interface{}, error)) *Queue {
+	q := &Queue{
+		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		sync:       syncFn,
+		workerDone: make(chan bool),
+		fn:         fn,
+	}
+	if fn == nil {
+		q.fn = q.defaultKeyFunc
+	}
+	return q
+}
+```
+因此，`n.syncIngress`就是sync方法的具体实现:
+```
+func (n *KongController) syncIngress(interface{}) error {
+	n.syncRateLimiter.Accept()
+	...
+	// If in-memory mode, each Kong instance runs with it's own controller
+	if !n.cfg.Kong.InMemory &&
+		!n.elector.IsLeader() {
+		return nil
+	}
+	// Sort ingress rules using the ResourceVersion field
+	ings := n.store.ListIngresses()
+	sort.SliceStable(ings, func(i, j int) bool {
+		ir := ings[i].ResourceVersion
+		jr := ings[j].ResourceVersion
+		return ir < jr
+	})
+	//重要函数，读取crd描述的kong配置
+	state, err := n.parser.Build()
+	...
+	//重要函数，执行同步
+	err = n.OnUpdate(state)
+	...
+	return nil
+}
+```
+上述代码的逻辑比较清晰，首先是拉取crd描述的kong配置，那么这个配置信息是从哪里来的？通过Build函数可知从`n.parse.store`中得到，因此回到`kongController`，可以看到store的创建位于:
+```
+func main(){
+	···
+	store := store.New(cacheStores, cliConfig.IngressClass)
+	kong, err := controller.NewKongController(&controllerConfig, updateChannel,
+		store)
+	···
+}
+```
+而这个cacheStores就是上面定义的各个crd时注册的：
+```
+func main(){
+	...
+	endpointsInformer := coreInformerFactory.Core().V1().Endpoints().Informer()
+	endpointsInformer.AddEventHandler(controller.EndpointsEventHandler{
+		UpdateCh: updateChannel,
+	})
+	cacheStores.Endpoint = endpointsInformer.GetStore()
+	informers = append(informers, endpointsInformer)
+	...
+}
+```
+
+继续回到sync逻辑。接下来调用`n.OnUpdate(state)`执行同步:
+```
+func (n *KongController) OnUpdate(state *parser.KongState) error {
+	targetContent, err := n.toDeckContent(state)
+	...
+	var shaSum []byte
+	// disable optimization if reverse sync is enabled
+	if !n.cfg.EnableReverseSync {
+		shaSum, err = generateSHA(targetContent)
+		if err != nil {
+			return err
+		}
+		//哈希比较diff
+		if reflect.DeepEqual(n.runningConfigHash, shaSum) {
+			return nil
+		}
+	}
+	if n.cfg.InMemory {
+		err = n.onUpdateInMemoryMode(targetContent)
+	} else {
+		//DB模式的更新
+		err = n.onUpdateDBMode(targetContent)
+	}
+	...
+	n.runningConfigHash = shaSum
+	return nil
+}
+```
+以DB模式为例：
+```
+func (n *KongController) onUpdateDBMode(targetContent *file.Content) error {
+	client := n.cfg.Kong.Client
+	//调用go-kong获取当前kong的所有资源对象信息，返回的结构体为KongRawState
+	rawState, err := dump.Get(client, dump.Config{
+		SelectorTags: n.getIngressControllerTags(),
+	})
+	...
+	//返回KongState的封装
+	currentState, err := state.Get(rawState)
+	...
+	//读取目标配置，并封装为KongState
+	rawState, err = file.Get(targetContent, file.RenderConfig{
+		CurrentState: currentState,
+		KongVersion:  n.cfg.Kong.Version,
+	})
+	...
+	targetState, err := state.Get(rawState)
+	...
+	//syncer主要维护2类对象，一类是描述kong状态的current和target，另一类的goroutine协作的chan
+	syncer, err := diff.NewSyncer(currentState, targetState)
+	...
+	syncer.SilenceWarnings = true
+	//client.SetDebugMode(true)
+	//调用同步器进行同步
+	_, errs := solver.Solve(nil, syncer, client, n.cfg.Kong.Concurrency, false)
+	...
+	return nil
+}
+```
+diff.NewSyncer返回了一个syncer对象，同时向registry注册了所有资源的同步需要的`Action接口`。最终同步的实现为`Solve方法`：
+```
+// Solve generates a diff and walks the graph.
+func Solve(doneCh chan struct{}, syncer *diff.Syncer,
+	client *kong.Client, parallelism int, dry bool) (Stats, []error) {
+	//普通CRUD封装
+	var r *crud.Registry
+	r = buildRegistry(client)
+
+	var stats Stats
+	recordOp := func(op crud.Op) {
+		switch op {
+		case crud.Create:
+			stats.CreateOps = stats.CreateOps + 1
+		case crud.Update:
+			stats.UpdateOps = stats.UpdateOps + 1
+		case crud.Delete:
+			stats.DeleteOps = stats.DeleteOps + 1
+		}
+	}
+	//同步逻辑，这个Run函数为并行执行，并通过wait group去同步
+	errs := syncer.Run(doneCh, parallelism, func(e diff.Event) (crud.Arg, error) {
+		var err error
+		var result crud.Arg
+		
+		c := e.Obj.(state.ConsoleString)
+		switch e.Op {
+		case crud.Create:
+			print.CreatePrintln("creating", e.Kind, c.Console())
+		case crud.Update:
+			diffString, err := getDiff(e.OldObj, e.Obj)
+			if err != nil {
+				return nil, err
+			}
+			print.UpdatePrintln("updating", e.Kind, c.Console(), diffString)
+		case crud.Delete:
+			print.DeletePrintln("deleting", e.Kind, c.Console())
+		default:
+			panic("unknown operation " + e.Op.String())
+		}
+
+		if !dry {
+			// sync mode
+			// fire the request to Kong
+			result, err = r.Do(e.Kind, e.Op, e)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// diff mode
+			// return the new obj as is
+			result = e.Obj
+		}
+		// record operation in both: diff and sync commands
+		recordOp(e.Op)
+
+		return result, nil
+	})
+	return stats, errs
+}
+```
+
+总的来说，sync的实现依托了go-client去获取全量的current kong state以及cache stores去获取target kong state。然后对两者进行比较，并同步。

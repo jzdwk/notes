@@ -88,7 +88,7 @@ spec:
     shortNames:
     - ct
 ```
-因此，crd的定义位于/artifacts/examples/crd.yaml中，内容为：
+因此，crd的定义位于`/artifacts/examples/crd.yaml`中，内容为：
 ```
 apiVersion: apiextensions.k8s.io/v1beta1 #注意此处的apiVersion
 kind: CustomResourceDefinition
@@ -103,11 +103,15 @@ spec:
   scope: Namespaced
 ```
 
+相应的，这个crd的内容校验位于`/artifacts/examples/crd-validation.yaml`。
+
 ### crd控制器实现
 
 1. 首先进入sample-controller的main函数，定义stop开关，并定义2个client，一个为kubeclient，另一个exampleclient：
 
 ```
+func main(){
+	...
 	klog.InitFlags(nil)
 	flag.Parse()
 	//一个无缓冲的channel作为开关
@@ -121,11 +125,13 @@ spec:
 	//定制client
 	exampleClient, err := clientset.NewForConfig(cfg)
 	...
+}
 ```
 
 进入`exampleClient, err := clientset.NewForConfig(cfg)`函数，主要逻辑如下：
 
 ```
+func NewForConfig(c *rest.Config) (*Clientset, error) {
 	configShallowCopy := *c
 	//rate limiter config
 	...
@@ -139,6 +145,7 @@ spec:
 	cs.DiscoveryClient, err = discovery.NewDiscoveryClientForConfig(&configShallowCopy)
 	...
 	return &cs, nil
+}
 ```
 
 上述代码中自定义了SamplecontrollerV1alpha1Client，这个client用于和samplecontroller.k8s.io.group提供的特性进行交互，即通过FoosGetter的foos函数得到foos实体，调用资源对象操作函数。

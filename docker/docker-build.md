@@ -91,10 +91,9 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 		buildCtx, relDockerfile, err = build.AddDockerfileToBuildContext(dockerfileCtx, buildCtx)
 		...
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	//替换TrustedReference 
+	//如果dockerfile中依赖的image为untrusted，即以image:tag方式声明，则替换为digest
 	var resolvedTags []*resolvedTag
 	if !options.untrusted {
 		translator := func(ctx context.Context, ref reference.NamedTagged) (reference.Canonical, error) {
@@ -108,25 +107,18 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 		} else if dockerfileCtx != nil {
 			// if there was not archive context still do the possible replacements in Dockerfile
 			newDockerfile, _, err := rewriteDockerfileFromForContentTrust(ctx, dockerfileCtx, translator)
-			if err != nil {
-				return err
-			}
+			...
 			dockerfileCtx = ioutil.NopCloser(bytes.NewBuffer(newDockerfile))
 		}
 	}
-	//压缩
+	//压缩，如果option指定的话
 	if options.compress {
 		buildCtx, err = build.Compress(buildCtx)
 		...
 	}
 
 	...
-	// if up to this point nothing has set the context then we must have another
-	// way for sending it(streaming) and set the context to the Dockerfile
-	if dockerfileCtx != nil && buildCtx == nil {
-		buildCtx = dockerfileCtx
-	}
-	//最终封装为一个body
+	//最终封装为一个body,这个body中其实就是dockerfile的内容
 	var body io.Reader
 	if buildCtx != nil {
 		body = progress.NewProgressReader(buildCtx, progressOutput, 0, "", "Sending build context to Docker daemon")
@@ -154,5 +146,130 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 	}
 	defer response.Body.Close()
 	...
+}
+```
+可以看到client端的所有操作都是围绕dockerfile，并最终将dockerfile内容以及build的选项一起post给daemon。其中的build的选项在http头的`X-Registry-Config`,dockerfile在http body，类型为`headers.Set("Content-Type", "application/x-tar")`。
+
+## daemon
+
+daemon对于docker build的api入口位于`engine/api/server/router/build/build.go`中的`initRoutes的`方法。进入执行函数：
+```
+func (br *buildRouter) postBuild(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	var (
+		notVerboseBuffer = bytes.NewBuffer(nil)
+		version          = httputils.VersionFromContext(ctx)
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	//body里为dockerfile
+	body := r.Body
+	var ww io.Writer = w
+	...
+	output := ioutils.NewWriteFlusher(ww)
+	defer output.Close()
+	errf := func(err error) error {
+		...error handler
+	}
+	//根据client请求中携带的build option，封装到buildOptions结构体。
+	buildOptions, err := newImageBuildOptions(ctx, r)
+	...
+	//output progress等处理
+	...
+	//核心调用
+	imgID, err := br.backend.Build(ctx, backend.BuildConfig{
+		Source:         body,  //dockerfile
+		Options:        buildOptions, //build option
+		ProgressWriter: buildProgressWriter(out, wantAux, createProgressReader), //stdout
+	})
+	...
+	// Everything worked so if -q was provided the output from the daemon
+	// should be just the image ID and we'll print that to stdout.
+	if buildOptions.SuppressOutput {
+		fmt.Fprintln(streamformatter.NewStdoutWriter(output), imgID)
+	}
+	return nil
+}
+```
+上述代码主要对req请求中的body和header里携带的build option进行解析，最终调用`backend`的`Build`函数：
+```go
+//config中封装了body,option
+func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string, error) {
+	options := config.Options
+	useBuildKit := options.Version == types.BuilderBuildKit
+	tagger, err := NewTagger(b.imageComponent, config.ProgressWriter.StdoutFormatter, options.Tags)
+	...
+	var build *builder.Result
+	if useBuildKit {
+		build, err = b.buildkit.Build(ctx, config)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		//核心逻辑
+		build, err = b.builder.Build(ctx, config)
+		...
+	}
+	...
+	//处理imageID
+	var imageID = build.ImageID
+	if options.Squash {
+		if imageID, err = squashBuild(build, b.imageComponent); err != nil {
+			return "", err
+		}
+		if config.ProgressWriter.AuxFormatter != nil {
+			if err = config.ProgressWriter.AuxFormatter.Emit("moby.image.id", types.BuildResult{ID: imageID}); err != nil {
+				return "", err
+			}
+		}
+	}
+	if !useBuildKit {
+		stdout := config.ProgressWriter.StdoutFormatter
+		fmt.Fprintf(stdout, "Successfully built %s\n", stringid.TruncateID(imageID))
+	}
+	if imageID != "" {
+		err = tagger.TagImages(image.ID(imageID))
+	}
+	return imageID, err
+}
+```
+上述代码的核心逻辑就是`build, err = b.builder.Build(ctx, config)`,
+
+```go
+func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (*builder.Result, error) {
+	...
+	//根据config从网络或者本地目录等获取dockerfile内容
+	source, dockerfile, err := remotecontext.Detect(config)
+	...
+	defer func() {
+		if source != nil {
+			if err := source.Close(); err != nil {
+				logrus.Debugf("[BUILDER] failed to remove temporary context: %v", err)
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	
+	if src, err := bm.initializeClientSession(ctx, cancel, config.Options); err != nil {
+		return nil, err
+	} else if src != nil {
+		source = src
+	}
+	//
+	builderOptions := builderOptions{
+		Options:        config.Options,
+		ProgressWriter: config.ProgressWriter,
+		Backend:        bm.backend,
+		PathCache:      bm.pathCache,
+		IDMapping:      bm.idMapping,
+	}
+	//builder结构体封装
+	b, err := newBuilder(ctx, builderOptions)
+	if err != nil {
+		return nil, err
+	}
+	//builder构造
+	return b.build(source, dockerfile)
 }
 ```

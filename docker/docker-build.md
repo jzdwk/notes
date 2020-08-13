@@ -1,6 +1,8 @@
 # docker build
 
-[docker build](https://docs.docker.com/engine/reference/commandline/build/) 的作用为根据dockerfile文件，创建镜像。其中dockerfile的位置可以位于当前目录/指定目录/URL
+[docker build](https://docs.docker.com/engine/reference/commandline/build/) 的作用为根据dockerfile文件，创建镜像。
+
+其中dockerfile的位置可以位于当前目录/指定目录/URL，具体的语法[参考官方](https://docs.docker.com/engine/reference/builder/) 
 
 ## client 
 
@@ -190,6 +192,9 @@ func (br *buildRouter) postBuild(ctx context.Context, w http.ResponseWriter, r *
 	return nil
 }
 ```
+
+### requset handler
+
 上述代码主要对req请求中的body和header里携带的build option进行解析，最终调用`backend`的`Build`函数：
 ```go
 //config中封装了body,option
@@ -233,6 +238,8 @@ func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string
 }
 ```
 上述代码的核心逻辑就是`build, err = b.builder.Build(ctx, config)`,
+
+### build
 
 ```go
 func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (*builder.Result, error) {
@@ -306,7 +313,6 @@ func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*buil
 	//docker build --label的处理，将label加入最后一个阶段的stage的command中
 	// Add 'LABEL' command specified by '--label' option to the last stage
 	buildLabelOptions(b.options.Labels, stages)
-	dockerfile.PrintWarnings(b.Stderr)
 	//执行构建
 	dispatchState, err := b.dispatchDockerfileWithCancellation(stages, metaArgs, dockerfile.EscapeToken, source)
 	...
@@ -317,8 +323,22 @@ func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*buil
 	return &builder.Result{ImageID: dispatchState.imageID, FromImage: dispatchState.baseImage}, nil
 }
 ```
-上述代码首先解析dockerfile的内容，并返回一个**stages**数组，这个数组的每一个元素代表了build的一个阶段，可以简单理解为dockerfile中的每一个小节。`instructions.Parse(dockerfile.AST)`方法比较简单，遍历dockerfile中的各项，并添加command，：
+其中docker build target的作用为执行[多阶段build](https://docs.docker.com/develop/develop-images/multistage-build/) 这里暂时不考虑。
+
+#### stage&command parse
+
+上述代码首先解析dockerfile的内容，并返回一个**stages**数组，这个数组的每一个元素代表了build的一个*阶段*，那么这个阶段是什么东西？具体来看parse函数：
 ```go
+stage的结构定义如下，可以看到
+// Stage represents a single stage in a multi-stage build
+type Stage struct {
+	Name       string //阶段名称
+	Commands   []Command //携带的命令
+	BaseName   string 
+	SourceCode string
+	Platform   string
+}
+
 / Parse a Dockerfile into a collection of buildable stages.
 // metaArgs is a collection of ARG instructions that occur before the first FROM.
 func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error) {
@@ -349,62 +369,171 @@ func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error) 
 	}
 	return stages, metaArgs, nil
 }
+```
+上述代码遍历了dockerfile的每小节（即每一个dockerfile命令），经过`ParseInstruction`的解析，返回stage或者command接口，`ParseInstruction`的功能就是解析过程为一个switch-case，每一个case就是dockerfile里的一个关键字,以`FROM`和`COPY`为例：
 
+1. FROM 
+
+```go
 // ParseInstruction converts an AST to a typed instruction (either a command or a build stage beginning when encountering a FROM statement)
 //各种关键字的处理，有些表示Command，有些表示了一个阶段stage
 func ParseInstruction(node *parser.Node) (interface{}, error) {
 	req := newParseRequestFromNode(node)
 	switch node.Value {
-	case command.Env:
-		return parseEnv(req)
-	case command.Maintainer:
-		return parseMaintainer(req)
-	case command.Label:
-		return parseLabel(req)
-	case command.Add:
-		return parseAdd(req)
-	case command.Copy:
-		return parseCopy(req)
+	...
 	case command.From:
 		return parseFrom(req)
-	case command.Onbuild:
-		return parseOnBuild(req)
-	case command.Workdir:
-		return parseWorkdir(req)
-	case command.Run:
-		return parseRun(req)
-	case command.Cmd:
-		return parseCmd(req)
-	case command.Healthcheck:
-		return parseHealthcheck(req)
-	case command.Entrypoint:
-		return parseEntrypoint(req)
-	case command.Expose:
-		return parseExpose(req)
-	case command.User:
-		return parseUser(req)
-	case command.Volume:
-		return parseVolume(req)
-	case command.StopSignal:
-		return parseStopSignal(req)
-	case command.Arg:
-		return parseArg(req)
-	case command.Shell:
-		return parseShell(req)
+	...
 	}
-
 	return nil, &UnknownInstruction{Instruction: node.Value, Line: node.StartLine}
 }
+
+func parseFrom(req parseRequest) (*Stage, error) {
+	stageName, err := parseBuildStageName(req.args)
+	if err != nil {
+		return nil, err
+	}
+
+	flPlatform := req.flags.AddString("platform", "")
+	if err := req.flags.Parse(); err != nil {
+		return nil, err
+	}
+
+	code := strings.TrimSpace(req.original)
+	return &Stage{
+		BaseName:   req.args[0],
+		Name:       stageName,
+		SourceCode: code,
+		Commands:   []Command{},
+		Platform:   flPlatform.Value,
+	}, nil
+
+}
 ```
-stage的结构定义如下，可以看到
+FROM的解析返回的是一个**stage**，其中`parseBuildStageName`返回了stage的name，回忆在`FROM`的[语法](https://docs.docker.com/engine/reference/builder/#from) 中，后跟image name，因此该stage的名称就是image name或自定义的image name。
+
+2. COPY
 ```go
-// Stage represents a single stage in a multi-stage build
-type Stage struct {
-	Name       string //阶段名称
-	Commands   []Command //携带参数
-	BaseName   string //
-	SourceCode string
-	Platform   string
+// ParseInstruction converts an AST to a typed instruction (either a command or a build stage beginning when encountering a FROM statement)
+//各种关键字的处理，有些表示Command，有些表示了一个阶段stage
+func ParseInstruction(node *parser.Node) (interface{}, error) {
+	req := newParseRequestFromNode(node)
+	switch node.Value {
+	...
+	case command.Copy:
+		return parseCopy(req)
+	...
+	}
+	return nil, &UnknownInstruction{Instruction: node.Value, Line: node.StartLine}
 }
 
+func parseCopy(req parseRequest) (*CopyCommand, error) {
+	if len(req.args) < 2 {
+		return nil, errNoDestinationArgument("COPY")
+	}
+	flChown := req.flags.AddString("chown", "")
+	flFrom := req.flags.AddString("from", "")
+	if err := req.flags.Parse(); err != nil {
+		return nil, err
+	}
+	return &CopyCommand{
+		SourcesAndDest:  SourcesAndDest(req.args),
+		From:            flFrom.Value,
+		withNameAndCode: newWithNameAndCode(req),
+		Chown:           flChown.Value,
+	}, nil
+}
+```
+COPY的解析返回了一个Command接口，`COPY`的[主要作用](https://docs.docker.com/engine/reference/builder/#copy) 就是将源目录的内容CPOY进容器的目标目录，最终返回的`CopyCommand`包含了源、目的目录，以及COPY使用到的可选的`chown`等功能。
+
+通过查看`func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error)`的所有case，发现**stage**表示了一个`FROM`的操作，而**command**表示了再FROM之后，dockerfile中的各个关键字`CPOY`、`ADD`、`LABEL`等等命令的描述，因此`func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error)`的最终返回为一个包含了多个Command的Stage以及通过ARG配置的metaArgs。
+
+#### build impl
+
+因此回到函数`func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*builder.Result, error) `:
+```go
+func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*builder.Result, error) {
+	defer b.imageSources.Unmount()
+	...
+	//构建的具体实现
+	dispatchState, err := b.dispatchDockerfileWithCancellation(stages, metaArgs, dockerfile.EscapeToken, source)
+	if err != nil {
+		return nil, err
+	}
+	if dispatchState.imageID == "" {
+		buildsFailed.WithValues(metricsDockerfileEmptyError).Inc()
+		return nil, errors.New("No image was generated. Is your Dockerfile empty?")
+	}
+	return &builder.Result{ImageID: dispatchState.imageID, FromImage: dispatchState.baseImage}, nil
+}
+```
+进入build的实现函数`dispatchDockerfileWithCancellation`:
+```go
+//入参中，parseResult 即stage对象，metaArgs为ARG参数，source为dockerfile内容
+func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.Stage, metaArgs []instructions.ArgCommand, escapeToken rune, source builder.Source) (*dispatchState, error) {
+	dispatchRequest := dispatchRequest{}
+	buildArgs := NewBuildArgs(b.options.BuildArgs)
+	//要处理的command数，stage为FROM，即len为1,如果没有ARG，此时的total为1
+	totalCommands := len(metaArgs) + len(parseResult)
+	currentCommandIndex := 1
+	//遍历stage中的Command,即那些COPY/ADD命令
+	for _, stage := range parseResult {
+		totalCommands += len(stage.Commands)
+	}
+	//shelx
+	shlex := shell.NewLex(escapeToken)
+	for _, meta := range metaArgs {
+		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, &meta)
+
+		err := processMetaArg(meta, shlex, buildArgs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	stagesResults := newStagesBuildResults()
+
+	for _, stage := range parseResult {
+		if err := stagesResults.checkStageNameAvailable(stage.Name); err != nil {
+			return nil, err
+		}
+		dispatchRequest = newDispatchRequest(b, escapeToken, source, buildArgs, stagesResults)
+
+		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, stage.SourceCode)
+		if err := initializeStage(dispatchRequest, &stage); err != nil {
+			return nil, err
+		}
+		dispatchRequest.state.updateRunConfig()
+		fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(dispatchRequest.state.imageID))
+		for _, cmd := range stage.Commands {
+			select {
+			case <-b.clientCtx.Done():
+				logrus.Debug("Builder: build cancelled!")
+				fmt.Fprint(b.Stdout, "Build cancelled\n")
+				buildsFailed.WithValues(metricsBuildCanceled).Inc()
+				return nil, errors.New("Build cancelled")
+			default:
+				// Not cancelled yet, keep going...
+			}
+
+			currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, cmd)
+
+			if err := dispatch(dispatchRequest, cmd); err != nil {
+				return nil, err
+			}
+			dispatchRequest.state.updateRunConfig()
+			fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(dispatchRequest.state.imageID))
+
+		}
+		if err := emitImageID(b.Aux, dispatchRequest.state); err != nil {
+			return nil, err
+		}
+		buildArgs.MergeReferencedArgs(dispatchRequest.state.buildArgs)
+		if err := commitStage(dispatchRequest.state, stagesResults); err != nil {
+			return nil, err
+		}
+	}
+	buildArgs.WarnOnUnusedBuildArgs(b.Stdout)
+	return dispatchRequest.state, nil
+}
 ```

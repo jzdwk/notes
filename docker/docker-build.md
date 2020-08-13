@@ -153,7 +153,7 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 ## daemon
 
 daemon对于docker build的api入口位于`engine/api/server/router/build/build.go`中的`initRoutes的`方法。进入执行函数：
-```
+```go
 func (br *buildRouter) postBuild(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	var (
 		notVerboseBuffer = bytes.NewBuffer(nil)
@@ -240,22 +240,11 @@ func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (
 	//根据config从网络或者本地目录等获取dockerfile内容
 	source, dockerfile, err := remotecontext.Detect(config)
 	...
-	defer func() {
-		if source != nil {
-			if err := source.Close(); err != nil {
-				logrus.Debugf("[BUILDER] failed to remove temporary context: %v", err)
-			}
-		}
-	}()
-
+	//io close
+	...
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	
-	if src, err := bm.initializeClientSession(ctx, cancel, config.Options); err != nil {
-		return nil, err
-	} else if src != nil {
-		source = src
-	}
+	...
 	//
 	builderOptions := builderOptions{
 		Options:        config.Options,
@@ -266,10 +255,156 @@ func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (
 	}
 	//builder结构体封装
 	b, err := newBuilder(ctx, builderOptions)
-	if err != nil {
-		return nil, err
-	}
+	...
 	//builder构造
 	return b.build(source, dockerfile)
 }
+```
+整体逻辑就是首先new一个builder对象，然后调用builder的build方法，其中builder的定义如下：
+```go
+// Builder is a Dockerfile builder
+// It implements the builder.Backend interface.
+type Builder struct {
+	options *types.ImageBuildOptions //docker build的option命令集合，即buildOptions
+
+	Stdout io.Writer	//I/O相关，用于在std打印
+	Stderr io.Writer
+	Aux    *streamformatter.AuxFormatter
+	Output io.Writer
+
+	docker    builder.Backend
+	clientCtx context.Context
+
+	idMapping        *idtools.IdentityMapping
+	disableCommit    bool
+	imageSources     *imageSources
+	pathCache        pathCache
+	containerManager *containerManager
+	imageProber      ImageProber
+	platform         *specs.Platform
+}
+```
+继续进入` b.build(source, dockerfile)`方法：
+```go
+// Build runs the Dockerfile builder by parsing the Dockerfile and executing
+// the instructions from the file.
+//source即dockerfile内容  dockerfile即文件名
+func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*builder.Result, error) {
+	defer b.imageSources.Unmount()
+	//首先，对docker build的ARG命令进行解析，返回一个dockerfile中的阶段集合stages和ARG的参数metaArgs
+	stages, metaArgs, err := instructions.Parse(dockerfile.AST)
+	...
+	//对应docker build --target命令，如果target不为空，取出在dockerfile中对应的阶段，并对stages剪裁
+	if b.options.Target != "" {
+		targetIx, found := instructions.HasStage(stages, b.options.Target)
+		if !found {
+			buildsFailed.WithValues(metricsBuildTargetNotReachableError).Inc()
+			return nil, errdefs.InvalidParameter(errors.Errorf("failed to reach build target %s in Dockerfile", b.options.Target))
+		}
+		stages = stages[:targetIx+1]
+	}
+	//docker build --label的处理，将label加入最后一个阶段的stage的command中
+	// Add 'LABEL' command specified by '--label' option to the last stage
+	buildLabelOptions(b.options.Labels, stages)
+	dockerfile.PrintWarnings(b.Stderr)
+	//执行构建
+	dispatchState, err := b.dispatchDockerfileWithCancellation(stages, metaArgs, dockerfile.EscapeToken, source)
+	...
+	if dispatchState.imageID == "" {
+		buildsFailed.WithValues(metricsDockerfileEmptyError).Inc()
+		return nil, errors.New("No image was generated. Is your Dockerfile empty?")
+	}
+	return &builder.Result{ImageID: dispatchState.imageID, FromImage: dispatchState.baseImage}, nil
+}
+```
+上述代码首先解析dockerfile的内容，并返回一个**stages**数组，这个数组的每一个元素代表了build的一个阶段，可以简单理解为dockerfile中的每一个小节。`instructions.Parse(dockerfile.AST)`方法比较简单，遍历dockerfile中的各项，并添加command，：
+```go
+/ Parse a Dockerfile into a collection of buildable stages.
+// metaArgs is a collection of ARG instructions that occur before the first FROM.
+func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error) {
+	for _, n := range ast.Children {
+		//解析每一个节点，解析过程为一个switch-case，每一个case就是dockerfile里的一个关键字
+		cmd, err := ParseInstruction(n)
+		...
+		//先把ARG加进去，他位于FROM之前
+		if len(stages) == 0 {
+			// meta arg case
+			if a, isArg := cmd.(*ArgCommand); isArg {
+				metaArgs = append(metaArgs, *a)
+				continue
+			}
+		}
+		//根据cmd的类型构造stage
+		switch c := cmd.(type) {
+		case *Stage:
+			stages = append(stages, *c)
+		case Command:
+			stage, err := CurrentStage(stages)
+			...
+			stage.AddCommand(c)
+		default:
+			return nil, nil, errors.Errorf("%T is not a command type", cmd)
+		}
+
+	}
+	return stages, metaArgs, nil
+}
+
+// ParseInstruction converts an AST to a typed instruction (either a command or a build stage beginning when encountering a FROM statement)
+//各种关键字的处理，有些表示Command，有些表示了一个阶段stage
+func ParseInstruction(node *parser.Node) (interface{}, error) {
+	req := newParseRequestFromNode(node)
+	switch node.Value {
+	case command.Env:
+		return parseEnv(req)
+	case command.Maintainer:
+		return parseMaintainer(req)
+	case command.Label:
+		return parseLabel(req)
+	case command.Add:
+		return parseAdd(req)
+	case command.Copy:
+		return parseCopy(req)
+	case command.From:
+		return parseFrom(req)
+	case command.Onbuild:
+		return parseOnBuild(req)
+	case command.Workdir:
+		return parseWorkdir(req)
+	case command.Run:
+		return parseRun(req)
+	case command.Cmd:
+		return parseCmd(req)
+	case command.Healthcheck:
+		return parseHealthcheck(req)
+	case command.Entrypoint:
+		return parseEntrypoint(req)
+	case command.Expose:
+		return parseExpose(req)
+	case command.User:
+		return parseUser(req)
+	case command.Volume:
+		return parseVolume(req)
+	case command.StopSignal:
+		return parseStopSignal(req)
+	case command.Arg:
+		return parseArg(req)
+	case command.Shell:
+		return parseShell(req)
+	}
+
+	return nil, &UnknownInstruction{Instruction: node.Value, Line: node.StartLine}
+}
+```
+stage的结构定义如下，可以看到
+```go
+// Stage represents a single stage in a multi-stage build
+type Stage struct {
+	Name       string //阶段名称
+	Commands   []Command //携带参数
+	BaseName   string //
+	SourceCode string
+	Platform   string
+}
+
 ```

@@ -208,6 +208,10 @@ SessionB:INSERT INTO t SELECT 6,5,11; 阻塞，因为所有范围都上了X LOCK
 
 **注意**：**锁范围**都是**RR隔离级别**的行为，在**RC隔离级别**下，只会加行锁，即如果where条件匹配，就对该行加锁（具体加S/X锁看语句中的写法，FOR UPDATE、LOCK IN SHARE MODE）,没有匹配的就不加锁，对于范围查找（id<10）也是如此。
 
+
+**对于postgresql，在RR级别下的两个Session同时更新一条记录的表现和mysql是不同的。首先都会对目标加X Lock,但是mysql上，后提交的事务会读取之前事务的值，然后操作，而postgresql直接报错。换句话说，postgresql的RR级别不允许幻读，而mysql允许。**
+
+
 ### 关联查询的锁
 
 关联查询的加锁策略同单表相同，只是会在多表上加锁。假设有以下两张表test和test2：

@@ -480,8 +480,9 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 	for _, stage := range parseResult {
 		totalCommands += len(stage.Commands)
 	}
-	//shelx
+	//shelx，shell的执行器
 	shlex := shell.NewLex(escapeToken)
+	//处理ARG参数
 	for _, meta := range metaArgs {
 		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, &meta)
 
@@ -490,21 +491,25 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 			return nil, err
 		}
 	}
-
+	//stagesResults内部封装了一个map[string]*container.Config类型的indexed
 	stagesResults := newStagesBuildResults()
-
+	//遍历stage，即每一个FROM的段
 	for _, stage := range parseResult {
+		//首先check各个stage的Name是否已经在stagesResults的map中，即stage重名
 		if err := stagesResults.checkStageNameAvailable(stage.Name); err != nil {
 			return nil, err
 		}
+		//封装一个dispatchRequst，内部即入参定义
 		dispatchRequest = newDispatchRequest(b, escapeToken, source, buildArgs, stagesResults)
 
 		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, stage.SourceCode)
+		//initializeStage，根据dispatchRequest中封装的builder，得到baseImage，并调用Get获取这个image,返回的是封装了各种Image属性的build.Image,之后将这个image赋值给stage
 		if err := initializeStage(dispatchRequest, &stage); err != nil {
 			return nil, err
 		}
 		dispatchRequest.state.updateRunConfig()
 		fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(dispatchRequest.state.imageID))
+		//处理各个command
 		for _, cmd := range stage.Commands {
 			select {
 			case <-b.clientCtx.Done():
@@ -515,9 +520,9 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 			default:
 				// Not cancelled yet, keep going...
 			}
-
+			//当前待执行commandIndex
 			currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, cmd)
-
+			//
 			if err := dispatch(dispatchRequest, cmd); err != nil {
 				return nil, err
 			}
@@ -537,3 +542,8 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 	return dispatchRequest.state, nil
 }
 ```
+上述代码中，主要做了以下几步：
+1. 处理ARG参数
+2. 遍历Stage,处理每一个Stage
+3. 对于每一个Stage，首先调用`func initializeStage(d dispatchRequest, cmd *instructions.Stage) error`，这函数的主要作用是初始化`base image`
+4. 在一个stage中，遍历各个command，执行`func dispatch(d dispatchRequest, cmd instructions.Command) (err error)`

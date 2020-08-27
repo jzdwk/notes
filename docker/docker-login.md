@@ -2,6 +2,7 @@
 
 docker的login过程可以参照docker官方的[认证文档](https://docs.docker.com/registry/spec/auth/token/)
 对于docker login来说，整体的流程为：
+![image](../images/docker/docker-login.jpg)
 
 1. docker client接收到用户输入的 docker login 命令，通过调用registry服务中的auth方法,registry在loginV2方法中对请求进行认证
 2. 此时的请求中并没有包含token信息，认证会失败，返回401错误，同时在header中返回去哪里请求authZ server地址

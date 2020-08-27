@@ -16,7 +16,7 @@
 
 docker整体的结构如下：
 
-![Image text](https://github.com/jzdwk/notes/blob/master/docker/docker%20struct.png)
+![image](../images/docker/docker-struct.png)
 
 ## docker client
 

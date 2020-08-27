@@ -543,7 +543,96 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 }
 ```
 上述代码中，主要做了以下几步：
-1. 处理ARG参数
+
+1. 处理ARG参数，ARG主要就是给FROM提供值
+
 2. 遍历Stage,处理每一个Stage
+
 3. 对于每一个Stage，首先调用`func initializeStage(d dispatchRequest, cmd *instructions.Stage) error`，这函数的主要作用是初始化`base image`
+
 4. 在一个stage中，遍历各个command，执行`func dispatch(d dispatchRequest, cmd instructions.Command) (err error)`
+
+因此，进入`func dispatch(d dispatchRequest, cmd instructions.Command) (err error)`:
+```go
+func dispatch(d dispatchRequest, cmd instructions.Command) (err error) {
+	//check platform
+	runConfigEnv := d.state.runConfig.Env
+	//添加ENV设置
+	envs := append(runConfigEnv, d.state.buildArgs.FilterAllowed(runConfigEnv)...)
+
+	if ex, ok := cmd.(instructions.SupportsSingleWordExpansion); ok {
+		err := ex.Expand(func(word string) (string, error) {
+			return d.shlex.ProcessWord(word, envs)
+		})
+		if err != nil {
+			return errdefs.InvalidParameter(err)
+		}
+	}
+
+	defer func() {
+		//resource clean
+		...
+	}()
+	//重要，各个命令的处理函数
+	switch c := cmd.(type) {
+	...
+	case *instructions.MaintainerCommand:
+		return dispatchMaintainer(d, c)
+	...
+	case *instructions.AddCommand:
+		return dispatchAdd(d, c)
+	...
+	case *instructions.RunCommand:
+		return dispatchRun(d, c)
+	case *instructions.CmdCommand:
+		return dispatchCmd(d, c)
+	...
+	case *instructions.VolumeCommand:
+		return dispatchVolume(d, c)
+	...
+	}
+	return errors.Errorf("unsupported command type: %v", reflect.TypeOf(cmd))
+}
+```
+由上述代码可以看到，dispatcher最主要的功能就是通过switch-case去处理各个命令。以几个典型的命令为例
+
+- **MAINTAINER**：简单的添加一个image作者的注释，其处理函数`dispatchMaintainer(d, c)`内部调用了`d.builder.commit(d.state, "MAINTAINER "+c.Maintainer)`:
+```go
+func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
+	...
+	//对dispatchState中的runConfig进行值copy，并返回，copy的runConfig中内容都是在执行命令时需要的
+	runConfigWithCommentCmd := copyRunConfig(dispatchState.runConfig, withCmdComment(comment, dispatchState.operatingSystem))
+	...
+	//创建
+	id, err := b.probeAndCreate(dispatchState, runConfigWithCommentCmd)
+	//error handler 
+	...
+	return b.commitContainer(dispatchState, id, runConfigWithCommentCmd)
+}
+```
+继续进入`probeAndCreate`函数：
+```go
+func (b *Builder) probeAndCreate(dispatchState *dispatchState, runConfig *container.Config) (string, error) {
+	//首先查看缓存，如果有在之前相同的构建，则直接返回
+	if hit, err := b.probeCache(dispatchState, runConfig); err != nil || hit {
+		return "", err
+	}
+	//否则，根据runConfig创建
+	return b.create(runConfig)
+}
+```
+这个函数中的两步，主要先关注create逻辑，docker对于build过程中的缓存后面分析。继续进入`create`:
+```go
+func (b *Builder) create(runConfig *container.Config) (string, error) {
+	//build info print
+	...
+	//window flag
+	...
+	//配置要build的container的配置
+	hostConfig := hostConfigFromOptions(b.options, isWCOW)
+	//创建container，关键
+	container, err := b.containerManager.Create(runConfig, hostConfig)
+	...
+	return container.ID, nil
+}
+```

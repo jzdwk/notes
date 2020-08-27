@@ -20,7 +20,7 @@ Creating nginx             ... done
 
 各个组件的交互如下图所示：
 
-![struct-image](harbor-struct.png)
+![image](../images/harbor/harbor-struct.png)
 
 各个组件的作用为：
 

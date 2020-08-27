@@ -2,6 +2,8 @@
 
 主要介绍一下kong的各个资源对象的概念，并随着深入补充一下用例。
 
+![image](../images/kong/kong-GS-overview.png)
+
 ## admin api
 
 kong admin api是所有kong资源/配置管理的入口,按照部署方式分为[普通版](https://docs.konghq.com/2.0.x/admin-api/)和[DB-less版](https://docs.konghq.com/2.0.x/db-less-admin-api/)。在k8s部署后，通过svc看到admin的端口号，默认为：
@@ -204,3 +206,5 @@ target表示一个标识后端服务，带有**端口的ip地址/主机名**的�
 ### 注意
 
 因为upstream维护target更改的历史记录，所以不能直接对target进行删除或修改。若要禁用target，需要发布一个权重为0的新target;或者，使用DELETE方法来完成。
+
+

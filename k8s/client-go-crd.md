@@ -3,6 +3,7 @@
 ## client-go 
 
 client-go是k8s的sdk，整体架构如下图所示：
+![image](../images/k8s/client-go-controller-interaction.jpeg)
 
 ### client-go component
 

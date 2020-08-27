@@ -10,7 +10,7 @@
 
 - 原子性atomicity：要么都做，要么都不做。
 
-- 一致性consistency:事务将数据库从一种合法状态转变为一下种合法状态。**注意**，一致性约束由用户定义，一致性的实现可以在DB层完成，也可以在业务层完成。比如重名判断，在表中加唯一约束后重名将由DB报错，事务回滚；表中无约束，业务层判重后，业务报错，事务回滚。而作为DB本身，其只负责ACID中的AID。
+- 一致性consistency:事务将数据库从一种合法状态转变为一下种合法状态，从事务的开始到结束，事务的**完整性约束（实体完整性，参照完整性）**没有被破坏。**注意**，一致性约束由用户定义，一致性的实现可以在DB层完成，也可以在业务层完成。比如重名判断，在表中加唯一约束后重名将由DB报错，事务回滚；表中无约束，业务层判重后，业务报错，事务回滚。而作为DB本身，其只负责ACID中的AID。
 
 - 隔离性isolation：MVCC、Record Lock、Next-key Lock都是InnoDB实现隔离性的手段。
 
@@ -32,53 +32,21 @@
 
 ### 实现
 
-事务的隔离性由MVCC、LOCK来实现；原子性、一致性和持久性由redo/undo log完成。
+- 事务的原子性，由undo log、redo log实现
+
+- 事务的一致性由业务实现
+
+- 事务的隔离性由Lock、MVCC实现
+
+- 事务的持久性，由redo log 实现
 
 #### redo log
 
-重做日志redo log用来**保证事务的持久性**，由缓冲redo log buffer和redo log file组成，前者是易失的，后者是持久的。redo log是顺序写的，将缓冲写入file需要调用一次**fsync**。另外，用户可以通过`innodb_flush_log_at_trx_commit`来控制redo log落盘策略(0,1,2)。
-
-rego log的其他信息参考： https://zhuanlan.zhihu.com/p/86538338  https://zhuanlan.zhihu.com/p/35355751  https://zhuanlan.zhihu.com/p/161077344
+redo log的详细笔记[参考](redo-log.md)
 
 #### undo log
 
-undo log主要用来进行事务的回滚。undo存放在db内部**特殊的segment中，称为undu段**。 这里注意，undo log**并不能将DB恢复事务执行前的物理状态，而只能恢复到执行前的逻辑状态**。这里的物理状态比如页号等。比如A执行了INSERT 10W的记录的事务，这个事务会导致DB分配一个新的段，表空间会增大。然而ROLL BACK后，表空间并不会缩小（因为事务的并发性，比如B事务ROLL BACK后，不能删除A事务需要的物理段、页）。因此回滚的实现，**是在逻辑上做反向操作，比如用DELETE回滚INSERT，用INSERT回滚SELETE，用UPDATE回滚UPDATE**
-
-undo log的另一个作用是**MVCC**，当用户读取一条记录，如果该记录被其他事务占用，该事务将通过undo读取之前的行版本信息。
-
-#### MVCC和undo log
-
-- MVCC
-
-MVCC是一致性非锁定读的实现，通过在每行记录我们自定义的字段外，还有数据库隐式定义的
-`DB_TRX_ID`,`DB_ROLL_PTR`,`DB_ROW_ID`字段
-
-**Innodb实现MVCC的方式是通过undo log， 因此以下结论都是建立在innodb的基础之上**
-
-1. `DB_TRX_ID` :最近修改(修改/插入)事务ID,记录创建这条记录/最后一次修改该记录的事务ID
-2. `DB_ROLL_PTR`:回滚指针，指向这条记录的上一个版本（存储于rollback segment里,即undo,）
-3. `DB_ROW_ID`:隐含的自增ID（隐藏主键），如果数据表没有主键，InnoDB会自动以DB_ROW_ID产生一个聚簇索引
-
-新增一个事务时事务id会增加，trx_id能够表示事务开始的先后顺序。
-
-- Undo log
-
-undo log分为Insert和Update两种，delete可以看做是一种特殊的update，即在记录上修改删除标记。update undo log记录了数据之前的数据信息，通过这些信息可以还原到之前版本的状态:
-
-1. 当进行插入操作时，生成的Insert undo log在事务提交后即可删除，因为其他事务不需要这个undo log。
-
-2. 进行删除修改操作时，会生成对应的undo log，并将当前数据记录中的`db_roll_ptr`指向新的undo log。
-
-- 结论
-
-1. 数据表`DB_TRX_ID`中记录的，都是最近提交的事务记录，并通过这一行去定位到undo log
-
-2. 定位的undo log是一个链表，记录了多个并发事务的操作记录
-
-3. 根据事务的隔离级别RC/RR，在读取时选择匹配数据，匹配的依据是生成一个ReadView对象，RC生成时机为每次查询，RR则为事务开始时，而后根据ReadView的属性去做筛选。
-
-参考 https://www.cnblogs.com/rongdi/p/13378892.html
-
+undo log的详细笔记[参考](undo-log.md)
 
 ## latch
 

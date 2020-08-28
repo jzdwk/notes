@@ -152,15 +152,15 @@ struct ReadView {
 
 正常情况:
 
-![Image mvcc](https://github.com/jzdwk/notes/blob/master/images/db/readview-mvcc.png)
+![Image mvcc](../images/db/readview-mvcc.png)
 
 证明**up_limit_id**为已提交的最大事务ID+1是错误的:
 
-![Image text](../images/db/readview-mvcc-2.png)
+![Image mvcc-2](../images/db/readview-mvcc-2.png)
 
 **up_limit_id**变为trx_ids中最小的事务ID:
 
-![Image text](../images/db/readview-mvcc-3.png)
+![Image mvcc-3](../images/db/readview-mvcc-3.png)
 
 
 ### 结论

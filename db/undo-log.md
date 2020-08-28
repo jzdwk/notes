@@ -152,7 +152,7 @@ struct ReadView {
 
 正常情况:
 
-![Image text](../images/db/readview-mvcc.png)
+![Image text](https://raw.githubusercontent.com/jzdwk/notes/master/images/db/readview-mvcc.png)
 
 证明**up_limit_id**为已提交的最大事务ID+1是错误的:
 

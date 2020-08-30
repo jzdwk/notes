@@ -205,7 +205,7 @@ imagedb目录中存放了镜像信息。在imagedb下有两个子目录，**meta
 
 - **config**: 未来根据这个image启动container时，config里面的配置就是运行container时的默认参数。
 
-- **container**: 此处为一个容器ID，执行docker build构建镜像时，可以看见是不断地生成新的container，然后提交为新的image，此处的容器ID即生成该镜像时临时容器的ID
+- **container**: 此处为一个容器ID，执行docker build构建镜像时，可以看见是不断地生成新的container，然后提交为新的image，此处的容器ID即生成该镜像时`临时容器`的ID
 
 - **container_config**：上述临时容器的配置，可以对比containner_config与config的内容，字段完全一致，验证了config的作用。
 

@@ -636,3 +636,233 @@ func (b *Builder) create(runConfig *container.Config) (string, error) {
 	return container.ID, nil
 }
 ```
+create函数最终调用`func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.ContainerCreateCreatedBody, error)`：
+```go
+type createOpts struct {
+	params                  types.ContainerCreateConfig
+	managed                 bool   //false
+	ignoreImagesArgsEscaped bool   //true
+}
+
+func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.ContainerCreateCreatedBody, error) {
+。	...
+	os := runtime.GOOS
+	//如果base image不为空，根据image描述得到image对象，并将image对象的os赋值给os
+	if opts.params.Config.Image != "" {
+		img, err := daemon.imageService.GetImage(opts.params.Config.Image)
+		if err == nil {
+			os = img.OS
+		}
+	} else {
+		...
+		//window handle
+	}
+	//验证环境配置，包括了os描述，容器的宿主机配置HostConfig以及build中的命令，比如ENV WORKDIR
+	warnings, err := daemon.verifyContainerSettings(os, opts.params.HostConfig, opts.params.Config, false)
+	...
+	//验证网络，需支持IPv4
+	err = verifyNetworkingConfig(opts.params.NetworkingConfig)
+	...
+	err = daemon.adaptContainerSettings(opts.params.HostConfig, opts.params.AdjustCPUShares)
+	...
+	//create
+	container, err := daemon.create(opts)
+	...
+	containerActions.WithValues("create").UpdateSince(start)
+	...
+	return containertypes.ContainerCreateCreatedBody{ID: container.ID, Warnings: warnings}, nil
+}
+```
+对于base image的各种配置信息，可以参考[docker image store](docker-image-store.md)中描述的镜像信息(imagedb/content/image_sha256)。继续看`func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr error) `:
+```go
+//opt就是build时的各种参数配置封装
+func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr error) {
+	var (
+		container *container.Container
+		img       *image.Image
+		imgID     image.ID
+		err       error
+	)
+
+	os := runtime.GOOS
+	//base image有值，则从imageService中读取image对象，此处的调用和docker pull相同
+	if opts.params.Config.Image != "" {
+		img, err = daemon.imageService.GetImage(opts.params.Config.Image)
+		...
+		if img.OS != "" {
+			os = img.OS
+		} else {
+			// default to the host OS except on Windows with LCOW
+			if runtime.GOOS == "windows" && system.LCOWSupported() {
+				os = "linux"
+			}
+		}
+		imgID = img.ID()
+		...
+	} else {
+		if runtime.GOOS == "windows" {
+			os = "linux" // 'scratch' case.
+		}
+	}
+	...
+	//将base image的容器配置和当前build镜像的容器配置进行merge	
+	//merge的原则是：
+	//1. 如果当前build中没有被配置某项，则使用base image的对应项
+	//2. 如果当前build对某项进行了配置，base image中有同样配置则合并，否则将base image中对应的配置项也加入当前build
+	//3.项包括了User(容器内运行命令的角色)/ExposePort/Env/Labels/Entrypoint/Healthcheck/WorkingDir/Volumes/StopSignal
+	if err := daemon.mergeAndVerifyConfig(opts.params.Config, img); err != nil {
+		return nil, errdefs.InvalidParameter(err)
+	}
+	//如果没有指定日志配置，使用默认设置
+	if err := daemon.mergeAndVerifyLogConfig(&opts.params.HostConfig.LogConfig); err != nil {
+		return nil, errdefs.InvalidParameter(err)
+	}
+	//内部通过base := daemon.newBaseContainer(id)创建容器对象，返回的container只是一个包含了基本信息的Container(含有新生成的name和id)
+	if container, err = daemon.newContainer(opts.params.Name, os, opts.params.Config, opts.params.HostConfig, imgID, opts.managed); err != nil {
+		return nil, err
+	}
+	...
+	//TODO
+	if err := daemon.setSecurityOptions(container, opts.params.HostConfig); err != nil {
+		return nil, err
+	}
+	
+	container.HostConfig.StorageOpt = opts.params.HostConfig.StorageOpt
+
+	// Fixes: https://github.com/moby/moby/issues/34074 and
+	// https://github.com/docker/for-win/issues/999.
+	// Merge the daemon's storage options if they aren't already present. We only
+	// do this on Windows as there's no effective sandbox size limit other than
+	// physical on Linux.
+	if runtime.GOOS == "windows" {
+		if container.HostConfig.StorageOpt == nil {
+			container.HostConfig.StorageOpt = make(map[string]string)
+		}
+		for _, v := range daemon.configStore.GraphOptions {
+			opt := strings.SplitN(v, "=", 2)
+			if _, ok := container.HostConfig.StorageOpt[opt[0]]; !ok {
+				container.HostConfig.StorageOpt[opt[0]] = opt[1]
+			}
+		}
+	}
+
+	// Set RWLayer for container after mount labels have been set
+	//重要，创建完container的基本信息后，执行CreateLayer去创建image的读写层
+	rwLayer, err := daemon.imageService.CreateLayer(container, setupInitLayer(daemon.idMapping))
+	...
+	
+}
+```
+上述代码在执行完基本的config后，创建container对象，并创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md).进入`CreateLayer`:
+```go
+//name即新image，parent即从Base image中读取的image id，opts封装了build的各种配置
+func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWLayerOpts) (_ RWLayer, err error) {
+	var (
+		storageOpt map[string]string
+		initFunc   MountInit
+		mountLabel string
+	)
+
+	if opts != nil {
+		mountLabel = opts.MountLabel
+		storageOpt = opts.StorageOpt
+		initFunc = opts.InitFunc
+	}
+
+	ls.locker.Lock(name)
+	defer ls.locker.Unlock(name)
+
+	ls.mountL.Lock()
+	_, ok := ls.mounts[name]
+	ls.mountL.Unlock()
+	if ok {
+		return nil, ErrMountNameConflict
+	}
+
+	var pid string
+	var p *roLayer
+	if string(parent) != "" {
+		p = ls.get(parent)
+		if p == nil {
+			return nil, ErrLayerDoesNotExist
+		}
+		pid = p.cacheID
+
+		// Release parent chain if error
+		defer func() {
+			if err != nil {
+				ls.layerL.Lock()
+				ls.releaseLayer(p)
+				ls.layerL.Unlock()
+			}
+		}()
+	}
+
+	m := &mountedLayer{
+		name:       name,
+		parent:     p,
+		mountID:    ls.mountID(name),
+		layerStore: ls,
+		references: map[RWLayer]*referencedRWLayer{},
+	}
+
+	if initFunc != nil {
+		pid, err = ls.initMount(m.mountID, pid, mountLabel, initFunc, storageOpt)
+		if err != nil {
+			return
+		}
+		m.initID = pid
+	}
+
+	createOpts := &graphdriver.CreateOpts{
+		StorageOpt: storageOpt,
+	}
+
+	if err = ls.driver.CreateReadWrite(m.mountID, pid, createOpts); err != nil {
+		return
+	}
+	if err = ls.saveMount(m); err != nil {
+		return
+	}
+
+	return m.getReference(), nil
+}
+
+```
+```go
+	container.RWLayer = rwLayer
+
+	rootIDs := daemon.idMapping.RootPair()
+
+	if err := idtools.MkdirAndChown(container.Root, 0700, rootIDs); err != nil {
+		return nil, err
+	}
+	if err := idtools.MkdirAndChown(container.CheckpointDir(), 0700, rootIDs); err != nil {
+		return nil, err
+	}
+
+	if err := daemon.setHostConfig(container, opts.params.HostConfig); err != nil {
+		return nil, err
+	}
+
+	if err := daemon.createContainerOSSpecificSettings(container, opts.params.Config, opts.params.HostConfig); err != nil {
+		return nil, err
+	}
+
+	var endpointsConfigs map[string]*networktypes.EndpointSettings
+	if opts.params.NetworkingConfig != nil {
+		endpointsConfigs = opts.params.NetworkingConfig.EndpointsConfig
+	}
+	// Make sure NetworkMode has an acceptable value. We do this to ensure
+	// backwards API compatibility.
+	runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
+
+	daemon.updateContainerNetworkSettings(container, endpointsConfigs)
+	if err := daemon.Register(container); err != nil {
+		return nil, err
+	}
+	stateCtr.set(container.ID, "stopped")
+	daemon.LogContainerEvent(container, "create")
+	return container, nil
+}
+```

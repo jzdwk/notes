@@ -753,49 +753,21 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	
 }
 ```
-上述代码在执行完基本的config后，创建container对象，并创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md).进入`CreateLayer`:
+上述代码在执行完基本的config后，创建container对象，并创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md). 进入`CreateLayer`:
 ```go
 //name即新image，parent即从Base image中读取的image id，opts封装了build的各种配置
 func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWLayerOpts) (_ RWLayer, err error) {
-	var (
-		storageOpt map[string]string
-		initFunc   MountInit
-		mountLabel string
-	)
-
-	if opts != nil {
-		mountLabel = opts.MountLabel
-		storageOpt = opts.StorageOpt
-		initFunc = opts.InitFunc
-	}
-
-	ls.locker.Lock(name)
-	defer ls.locker.Unlock(name)
-
-	ls.mountL.Lock()
-	_, ok := ls.mounts[name]
-	ls.mountL.Unlock()
-	if ok {
-		return nil, ErrMountNameConflict
-	}
-
+	//lock by name
+	...
 	var pid string
 	var p *roLayer
+	
 	if string(parent) != "" {
+		//得到base image的layer
 		p = ls.get(parent)
-		if p == nil {
-			return nil, ErrLayerDoesNotExist
-		}
+		...
 		pid = p.cacheID
-
-		// Release parent chain if error
-		defer func() {
-			if err != nil {
-				ls.layerL.Lock()
-				ls.releaseLayer(p)
-				ls.layerL.Unlock()
-			}
-		}()
+		...
 	}
 
 	m := &mountedLayer{
@@ -805,19 +777,11 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 		layerStore: ls,
 		references: map[RWLayer]*referencedRWLayer{},
 	}
-
-	if initFunc != nil {
-		pid, err = ls.initMount(m.mountID, pid, mountLabel, initFunc, storageOpt)
-		if err != nil {
-			return
-		}
-		m.initID = pid
-	}
-
+	...
 	createOpts := &graphdriver.CreateOpts{
 		StorageOpt: storageOpt,
 	}
-
+	
 	if err = ls.driver.CreateReadWrite(m.mountID, pid, createOpts); err != nil {
 		return
 	}

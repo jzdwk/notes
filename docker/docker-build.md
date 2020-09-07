@@ -800,7 +800,21 @@ type Driver interface {
 	DiffDriver // DiffDriver用于实现graph diffs，即diff layer的计算
 }
 ```
-以19.03默认的overlay2为例，查看其`CreateReadWrite`实现：
+以19.03默认的overlay2为例，查看其`CreateReadWrite`实现，首先是overlay2的Driver struct定义：
+```go
+type Driver struct {
+	home          string
+	uidMaps       []idtools.IDMap
+	gidMaps       []idtools.IDMap
+	ctr           *graphdriver.RefCounter
+	quotaCtl      *quota.Control
+	options       overlayOptions
+	naiveDiff     graphdriver.DiffDriver
+	supportsDType bool
+	locker        *locker.Locker
+}
+```
+然后是绑定的create方法：
 ```go
 // CreateReadWrite creates a layer that is writable for use as a container
 // file system.
@@ -817,9 +831,98 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 		}
 		opts.StorageOpt["size"] = strconv.FormatUint(d.options.quota.Size, 10)
 	}
+	//直接调用create
 	return d.create(id, parent, opts)
 }
+//driver create实现
+func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
+	//container的当前目录，即.../layer_id/，位于/var/lib/docker/overlay2/{layer_id}/
+	dir := d.dir(id)
+	//映射root/group，docker提供了rootless模式，https://docs.docker.com/engine/security/rootless/
+	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
+	...
+	root := idtools.Identity{UID: rootUID, GID: rootGID}
+	//在overlay2下创建container目录，并赋权，其中MkdirAndChown和MkDirAllAndChown分别调用system.Mkdir(),MkdirAll(),前者可以创建多级目录
+	if err := idtools.MkdirAllAndChown(path.Dir(dir), 0700, root); err != nil {
+		return err
+	}
+	if err := idtools.MkdirAndChown(dir, 0700, root); err != nil {
+		return err
+	}
+	...
+	//err handler
+	//overlay2 storage opt，管理
+	if opts != nil && len(opts.StorageOpt) > 0 {
+		driver := &Driver{}
+		if err := d.parseStorageOpt(opts.StorageOpt, driver); err != nil {
+			return err
+		}
+
+		if driver.options.quota.Size > 0 {
+			// Set container disk quota limit
+			if err := d.quotaCtl.SetQuota(dir, driver.options.quota); err != nil {
+				return err
+			}
+		}
+	}
+	//../lib/docker/overlay2/{container_id}/diff目录
+	if err := idtools.MkdirAndChown(path.Join(dir, diffDirName), 0755, root); err != nil {
+		return err
+	}
+	
+	//创建一个软连接，让连接 overlay2/l/{link_id} -> 指向overlay2/{layer_id}/diff/，后者的diff里其实就是类似 /var,/sbin,/etc
+	等目录
+	lid := generateID(idLength)
+	if err := os.Symlink(path.Join("..", id, diffDirName), path.Join(d.home, linkDir, lid)); err != nil {
+		return err
+	}
+	//将上述软连接link_id 写入文件 ../overlay2/{layer_id}/link
+	// Write link id to link file
+	if err := ioutil.WriteFile(path.Join(dir, "link"), []byte(lid), 0644); err != nil {
+		return err
+	}
+	...
+	//如果没有parant image，直接就返回了，否则
+	
+	//创建work目录，位于../overlay2/{layer_id}/work
+	if err := idtools.MkdirAndChown(path.Join(dir, workDirName), 0700, root); err != nil {
+		return err
+	}
+	//在父镜像的../overlay2/{layer_id}里，创建一个committed文件,
+	if err := ioutil.WriteFile(path.Join(d.dir(parent), "committed"), []byte{}, 0600); err != nil {
+		return err
+	}
+	
+	lower, err := d.getLower(parent)
+	...
+	if lower != "" {
+		if err := ioutil.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0666); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 ```
+[docker overlay2](https://docs.docker.com/storage/storagedriver/overlayfs-driver/) 的存储设计可以参考官方文档。所有的和layer相关的数据都存储在`/var/lib/docker/overlay2/...`目录中。
+
+该目录的`/l/..`中，保存了和layer(layer_id)一一对应的link，目的在于缩短参数，避免达到mount命令的参数大小限制，建立连接后的目录如下：
+```
+$ ls -l /var/lib/docker/overlay2/l
+
+total 20
+lrwxrwxrwx 1 root root 72 Jun 20 07:36 6Y5IM2XC7TSNIJZZFLJCS6I4I4 -> ../3a36935c9df35472229c57f4a27105a136f5e4dbef0f87905b2e506e494e348b/diff
+lrwxrwxrwx 1 root root 72 Jun 20 07:36 B3WWEFKBG3PLLV737KZFIASSW7 -> ../4e9fa83caff3e8f4cc83693fa407a4a9fac9573deaf481506c102d484dd1e6a1/diff
+lrwxrwxrwx 1 root root 72 Jun 20 07:36 JEYMODZYFCZFYSDABYXD5MF6YO -> ../eca1e4e1694283e001f200a667bb3cb40853cf2d1b12c29feda7422fed78afed/diff
+lrwxrwxrwx 1 root root 72 Jun 20 07:36 NFYKDW6APBCCUCTOUSYDH4DXAT -> ../223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7/diff
+lrwxrwxrwx 1 root root 72 Jun 20 07:36 UL2MW33MSE3Q5VYIKBRN4ZAGQP -> ../e8876a226237217ec61c4baf238a32992291d059fdac95ed6303bdff3f59cff5/diff
+```
+可以看到，/l目录下的每一个标识符都指向一个layer的diff
+
+
+
+
+
 
 ```go
 	container.RWLayer = rwLayer

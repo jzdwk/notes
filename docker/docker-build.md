@@ -793,7 +793,33 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 	return m.getReference(), nil
 }
 ```
-上述代码主要封装了一个mount对象，并调用具体driver的`CreateReadWrite`接口。这个接口的实现视docker使用的不同驱动而定。对于docker的驱动和`graphdriver`,参考[存储驱动](http://dockone.io/article/1765) 以及[docker storage driver](https://docs.docker.com/storage/storagedriver/select-storage-driver/)
+上述代码主要封装了一个mount对象，并调用具体driver的`CreateReadWrite`接口。这个接口的实现视docker使用的不同驱动而定。对于docker的驱动和`graphdriver`,参考[存储驱动](http://dockone.io/article/1765) 以及[docker storage driver](https://docs.docker.com/storage/storagedriver/select-storage-driver/)。 所有的存储驱动都要实现Driver接口，接口位于../daemon/graphdriver/driver.go，该接口包含了:
+```go
+type Driver interface {
+	ProtoDriver //ProtoDriver定义了docker存储所需的基本方法，因为有些驱动（vfs）不使用union概念，所以不存在diff layer
+	DiffDriver // DiffDriver用于实现graph diffs，即diff layer的计算
+}
+```
+以19.03默认的overlay2为例，查看其`CreateReadWrite`实现：
+```go
+// CreateReadWrite creates a layer that is writable for use as a container
+// file system.
+func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
+	...
+	if opts == nil {
+		opts = &graphdriver.CreateOpts{
+			StorageOpt: map[string]string{},
+		}
+	}
+	if _, ok := opts.StorageOpt["size"]; !ok {
+		if opts.StorageOpt == nil {
+			opts.StorageOpt = map[string]string{}
+		}
+		opts.StorageOpt["size"] = strconv.FormatUint(d.options.quota.Size, 10)
+	}
+	return d.create(id, parent, opts)
+}
+```
 
 ```go
 	container.RWLayer = rwLayer

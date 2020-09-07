@@ -40,10 +40,61 @@ drwx------ 2 root root 4096 Jun 20 07:36 l
 $ ls -l /var/lib/docker/overlay2/l
 
 total 20
+//link_id ---> layer/diff
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 6Y5IM2XC7TSNIJZZFLJCS6I4I4 -> ../3a36935c9df35472229c57f4a27105a136f5e4dbef0f87905b2e506e494e348b/diff
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 B3WWEFKBG3PLLV737KZFIASSW7 -> ../4e9fa83caff3e8f4cc83693fa407a4a9fac9573deaf481506c102d484dd1e6a1/diff
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 JEYMODZYFCZFYSDABYXD5MF6YO -> ../eca1e4e1694283e001f200a667bb3cb40853cf2d1b12c29feda7422fed78afed/diff
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 NFYKDW6APBCCUCTOUSYDH4DXAT -> ../223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7/diff
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 UL2MW33MSE3Q5VYIKBRN4ZAGQP -> ../e8876a226237217ec61c4baf238a32992291d059fdac95ed6303bdff3f59cff5/diff
 ```
-可以看到，/l目录下的每一个标识符都指向一个layer的diff目录。对于层`3a36935c9df`
+可以看到，/l目录下的每一个标识符都指向一个layer的**diff目录**，这个diff目录中就保存了该层的只读目录。对于最底层（根layer）`3a36935c9df`,其目录下内容为：
+```
+$ ls /var/lib/docker/overlay2/3a36935c9df35472229c57f4a27105a136f5e4dbef0f87905b2e506e494e348b/
+diff  link
+$ cat /var/lib/docker/overlay2/3a36935c9df35472229c57f4a27105a136f5e4dbef0f87905b2e506e494e348b/link
+6Y5IM2XC7TSNIJZZFLJCS6I4I4
+
+$ ls  /var/lib/docker/overlay2/3a36935c9df35472229c57f4a27105a136f5e4dbef0f87905b2e506e494e348b/diff
+bin  boot  dev  etc  home  lib  lib64  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+```
+该目录下的diff保存了该层的所有只读层信息，可以看到常见的/bin,/boot,/dev等等。另一个link文件存储了link_id。
+
+再看上层的layer`223c286417`:
+```
+$ ls /var/lib/docker/overlay2/223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7
+diff  link  lower  merged  work   //多出了lower merged和work
+
+$ cat /var/lib/docker/overlay2/223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7/lower
+l/6Y5IM2XC7TSNIJZZFLJCS6I4I4 //lower中内容指向了parent层的link_id
+
+$ ls /var/lib/docker/overlay2/223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7/diff/
+etc  sbin  usr  var
+```
+除了和上一层相同的`/diff  /link`外，多出了`/lower` ,这个lower中的内容指向了父layer的link id，比如例子的`6Y5IM2XC7TSNIJZZFLJCS6I4I4`。而`/merger`目录用于结合本层layer和父层layer，主要目的是为container提供统一的fs视图。
+
+## overlay2上的读写
+
+overlayFS工作在两个层，`lowerdir`和`upperdir`，lowerdir就是当前容器layer的父layer，是只读的image layer，upperdir即容器本层，即可读写的container layer。
+
+### 读场景
+
+- 当文件不存在于container layer时，将读取image layer.
+
+- 当文件只存在于container layer时，将直接读取。
+
+- 当文件在image layer和container layer上，则优先读取container layer.
+
+### 写场景
+
+- 当第一次写文件时，如果文件不存在，则会执行`copy_up`操作，从image layer将目标文件copy到container layer后进行操作
+
+- 删除文件或者目录是，如果删除的是文件，通过在container layer创建一个` whiteout file`使文件不可访问;如果是目录，则创建`opaque directory`来屏蔽目标目录的访问。
+
+- 重命名一个目录时，需要满足**目标和源目录都必须在container layer**
+
+## overlayFS的问题
+
+- open(2):由于`copy_up`机制，当进行两次的读操作，且目标位于image layer时，会有`fd1=open("foo", O_RDONLY) ;fd2=open("foo", O_RDWR);fd1 != fd2;`原因在于，fd1返回只读的file，所以fd1的引用为image layer，而fd2返回的是可读写layer，所以fd2的引用为container layer.
+
+- rename(2):OverlayFS并不完全支持rename(2)的系统调用.
+

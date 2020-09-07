@@ -754,5 +754,10 @@ docker image目录下的repositories.json是一个总的*索引文件*，记录�
 1. 根据chainId，在layerdb中定位实际的layer存储位置、size、tar包
 2. 根据diff_id，在distribution中，得到仓库相关的digest信息，用于pull/push操作。
 
+参考：
+
+[docker image store](https://docs.docker.com/storage/storagedriver/)
+[image overlay存储](https://segmentfault.com/a/1190000017579626)
+
 
 

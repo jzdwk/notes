@@ -596,7 +596,7 @@ func dispatch(d dispatchRequest, cmd instructions.Command) (err error) {
 ```
 由上述代码可以看到，dispatcher最主要的功能就是通过switch-case去处理各个命令。以几个典型的命令为例
 
-- **MAINTAINER**：简单的添加一个image作者的注释，其处理函数`dispatchMaintainer(d, c)`内部调用了`d.builder.commit(d.state, "MAINTAINER "+c.Maintainer)`:
+- **MAINTAINER**：简单的添加一个image作者的注释，需要注意的是，**内部实现是，只是增加了MAINTARINER后，便调用了builder.commit，说明这个命令会生成一个新的layer层**继续看`d.builder.commit(d.state, "MAINTAINER "+c.Maintainer)`:
 ```go
 func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
 	...
@@ -769,7 +769,7 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 		pid = p.cacheID
 		...
 	}
-
+	//创建待一个mount的layer
 	m := &mountedLayer{
 		name:       name,
 		parent:     p,
@@ -782,6 +782,7 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 		StorageOpt: storageOpt,
 	}
 	
+	//具体的createRW实现
 	if err = ls.driver.CreateReadWrite(m.mountID, pid, createOpts); err != nil {
 		return
 	}
@@ -791,8 +792,9 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 
 	return m.getReference(), nil
 }
-
 ```
+上述代码主要封装了一个mount对象，并调用具体driver的`CreateReadWrite`接口。这个接口的实现视docker使用的不同驱动而定。对于docker的驱动和`graphdriver`,参考[存储驱动](http://dockone.io/article/1765) 以及[docker storage driver](https://docs.docker.com/storage/storagedriver/select-storage-driver/)
+
 ```go
 	container.RWLayer = rwLayer
 

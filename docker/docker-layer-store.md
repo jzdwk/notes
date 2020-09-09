@@ -70,7 +70,7 @@ l/6Y5IM2XC7TSNIJZZFLJCS6I4I4 //lower中内容指向了parent层的link_id
 $ ls /var/lib/docker/overlay2/223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7/diff/
 etc  sbin  usr  var
 ```
-除了和上一层相同的`/diff  /link`外，多出了`/lower` ,这个lower中的内容指向了父layer的link id，比如例子的`6Y5IM2XC7TSNIJZZFLJCS6I4I4`。而`/merger`目录用于结合本层layer和父层layer，主要目的是为container提供统一的fs视图。
+除了和上一层相同的`/diff  /link`外，多出了`/lower` ,这个lower中的内容指向了父layer的link id，比如例子的`6Y5IM2XC7TSNIJZZFLJCS6I4I4`。而`/merged`目录用于结合本层layer和父层layer，主要目的是为container提供统一的fs视图。
 
 ## overlay2上的读写
 

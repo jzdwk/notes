@@ -934,7 +934,7 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	if err := daemon.setHostConfig(container, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
-
+	//和os相关的匹配值
 	if err := daemon.createContainerOSSpecificSettings(container, opts.params.Config, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
@@ -943,11 +943,11 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	if opts.params.NetworkingConfig != nil {
 		endpointsConfigs = opts.params.NetworkingConfig.EndpointsConfig
 	}
-	// Make sure NetworkMode has an acceptable value. We do this to ensure
-	// backwards API compatibility.
+	//设置container的默认network
 	runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
 
 	daemon.updateContainerNetworkSettings(container, endpointsConfigs)
+	//向daemon注册这个临时的container
 	if err := daemon.Register(container); err != nil {
 		return nil, err
 	}
@@ -956,3 +956,15 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	return container, nil
 }
 ```
+当这个container创建完成后，将逐层返回container对象或者container的ID，直到`../builder/dockerfile/internals.go`后，执行一次commit操作：
+```go
+func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
+	//container create
+	...
+	//container commit
+	return b.commitContainer(dispatchState, id, runConfigWithCommentCmd)
+}
+```
+这个commitContainer将调用Backend接口的`CommitBuildStep(backend.CommitConfig) (image.ID, error)`.
+
+

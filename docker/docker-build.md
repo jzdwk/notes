@@ -212,6 +212,7 @@ func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string
 	tagger, err := NewTagger(b.imageComponent, config.ProgressWriter.StdoutFormatter, options.Tags)
 	...
 	var build *builder.Result
+	//在docker 18.09之后，支持buildkit工具，具体参考https://docs.docker.com/develop/develop-images/build_enhancements/
 	if useBuildKit {
 		build, err = b.buildkit.Build(ctx, config)
 		if err != nil {
@@ -452,7 +453,7 @@ func parseCopy(req parseRequest) (*CopyCommand, error) {
 	}, nil
 }
 ```
-COPY的解析返回了一个Command接口，`COPY`的[主要作用](https://docs.docker.com/engine/reference/builder/#copy) 就是将源目录的内容CPOY进容器的目标目录，最终返回的`CopyCommand`包含了源、目的目录，以及COPY使用到的可选的`chown`等功能。
+COPY的解析返回了一个Command接口，`COPY`的[主要作用](https://docs.docker.com/engine/reference/builder/#copy) 就是将源目录的内容COPY进容器的目标目录，最终返回的`CopyCommand`包含了源、目的目录，以及COPY使用到的可选的`chown`等功能。
 
 通过查看`func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error)`的所有case，发现**stage**表示了一个`FROM`的操作，而**command**表示了再FROM之后，dockerfile中的各个关键字`CPOY`、`ADD`、`LABEL`等等命令的描述，因此`func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error)`的最终返回为一个包含了多个Command的Stage以及通过ARG配置的metaArgs。
 
@@ -762,7 +763,7 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 }
 ```
 
-上述代码在执行完基本的config后，创建container对象，并给这个container创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md). 注意，这个container是一个**临时的container(ephemeral containers)，即docker会通过这个container对象去操作读写层中的各项目录，进行目录挂载，link等操作，最后将这个临时的container commit为image，并remove**。具体可参考[docker file best practice](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#create-ephemeral-containers)
+上述代码在执行完基本的config后，创建container对象，并给这个container创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md). 注意，这个container是一个**临时的container(ephemeral containers)，即docker会通过这个container对象去操作读写层中的各项目录，进行目录挂载，link等操作，最后将这个临时的container commit为image layer，并remove，然后继续执行下一条命令，循环往复**。具体可参考[docker file best practice](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#create-ephemeral-containers)
 
 进入`CreateLayer`:
 ```go
@@ -973,6 +974,101 @@ func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
 	return b.commitContainer(dispatchState, id, runConfigWithCommentCmd)
 }
 ```
-这个commitContainer将调用Backend接口的`CommitBuildStep(backend.CommitConfig) (image.ID, error)`.
+这个commitContainer将调用Backend接口的`CommitBuildStep(backend.CommitConfig) (image.ID, error)`.此处的实现为imageService：
+```go
+// CommitBuildStep is used by the builder to create an image for each step in
+// the build.
+//
+// This method is different from CreateImageFromContainer:
+//   * it doesn't attempt to validate container state
+//   * it doesn't send a commit action to metrics
+//   * it doesn't log a container commit event
+//
+// This is a temporary shim. Should be removed when builder stops using commit.
+func (i *ImageService) CommitBuildStep(c backend.CommitConfig) (image.ID, error) {
+	container := i.containers.Get(c.ContainerID)
+	...
+	c.ContainerMountLabel = container.MountLabel
+	c.ContainerOS = container.OS
+	c.ParentImageID = string(container.ImageID)
+	return i.CommitImage(c)
+}
+```
+如函数上的注释所述，CommitBuildStep是用于为image build过程的每一步生成一个image，即image layer。继续看`CommitImage`函数：
+```go
+// CommitImage creates a new image from a commit config
+func (i *ImageService) CommitImage(c backend.CommitConfig) (image.ID, error) {
+	//获取os对应的layer store对象
+	layerStore, ok := i.layerStores[c.ContainerOS]
+	...
+	//首先根据临时的container id以及mount label获取读写层
+	rwTar, err := exportContainerRw(layerStore, c.ContainerID, c.ContainerMountLabel)
+	...
+	var parent *image.Image
+	//parent image
+	if c.ParentImageID == "" {
+		//如果这个镜像没有parent image,则使用rootfs
+		parent = new(image.Image)
+		parent.RootFS = image.NewRootFS()
+	} else {
+		parent, err = i.imageStore.Get(image.ID(c.ParentImageID))
+		...
+	}
+	//create layer
+	l, err := layerStore.Register(rwTar, parent.RootFS.ChainID())
+	...
+	defer layer.ReleaseAndLog(layerStore, l)
+	//构造child config，即当前layer的config
+	cc := image.ChildConfig{
+		ContainerID:     c.ContainerID,
+		Author:          c.Author,
+		Comment:         c.Comment,
+		ContainerConfig: c.ContainerConfig,
+		Config:          c.Config,
+		DiffID:          l.DiffID(),
+	}
+	config, err := json.Marshal(image.NewChildImage(parent, cc, c.ContainerOS))
+	...
+	//create image
+	id, err := i.imageStore.Create(config)
+	...
+	if c.ParentImageID != "" {
+		if err := i.imageStore.SetParent(id, image.ID(c.ParentImageID)); err != nil {
+			return "", err
+		}
+	}
+	return id, nil
+}
+```
+上述代码主要有3步构成：
+1. 获取读写层
+2. 创建layer
+3. 创建image
+
+首先是读写层的获取：
+```go
+func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.ReadCloser, err error) {
+	//此处由不同的驱动实现，对于overlay2，就是根据layerId，首先读取../overlay2/{layerID}下的各个目录
+	//比如diff，lower等，并根据committed文件确定是否为read only，拼装mount命令，并最终执行mount系统调用
+	rwlayer, err := layerStore.GetRWLayer(id)
+	...
+	// TODO: this mount call is not necessary as we assume that TarStream() should
+	// mount the layer if needed. But the Diff() function for windows requests that
+	// the layer should be mounted when calling it. So we reserve this mount call
+	// until windows driver can implement Diff() interface correctly.
+	_, err = rwlayer.Mount(mountLabel)
+	...
+	archive, err := rwlayer.TarStream()
+	...
+	return ioutils.NewReadCloserWrapper(archive, func() error {
+			archive.Close()
+			err = rwlayer.Unmount()
+			layerStore.ReleaseRWLayer(rwlayer)
+			return err
+		}),
+		nil
+}
+```
+
 
 

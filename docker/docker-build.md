@@ -4,6 +4,14 @@
 
 其中dockerfile的位置可以位于当前目录/指定目录/URL，具体的语法[参考官方](https://docs.docker.com/engine/reference/builder/) 
 
+docker build的整体过程可以描述为：
+
+1. docker 从基础镜像（即FROM）运行一个container,并创建container layer
+2. 执行dockerfile中的一条指令，对container做出修改
+3. 执行类似docker commit操作，将这次修改作为一个新的image layer
+4. docker再基于刚提交的image layer，构建一个新的container layer，并运行container
+5. 执行dockerfile中的下一条指令，直至dockerfile中的所有指令结束。
+
 ## client 
 
 docker build同样是C/S方式实现，client端的主要作用就是根据命令，通过不同方式获取dockerfile文件以及其他配置信息。获取的方式有指定目录、指定URL和标准输入。获取文件后，在根据配置信息对dockerfile以及相关的目录进行压缩，成tar包后传输。

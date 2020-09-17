@@ -1048,16 +1048,22 @@ func (i *ImageService) CommitImage(c backend.CommitConfig) (image.ID, error) {
 首先是读写层的获取：
 ```go
 func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.ReadCloser, err error) {
-	//此处由不同的驱动实现，对于overlay2，就是根据layerId，首先读取../overlay2/{layerID}下的各个目录
-	//比如diff，lower等，并根据committed文件确定是否为read only，拼装mount命令，并最终执行mount系统调用
+	//根据container layer的id获取读写层 
 	rwlayer, err := layerStore.GetRWLayer(id)
 	...
 	// TODO: this mount call is not necessary as we assume that TarStream() should
 	// mount the layer if needed. But the Diff() function for windows requests that
 	// the layer should be mounted when calling it. So we reserve this mount call
 	// until windows driver can implement Diff() interface correctly.
+	// 这个Mount接口最终委托给graphdriver，由.../daemon/graphdriver/driver.go的ProtoDriver接口的Get方法完成
+	// 对于不同的驱动，需要实现这个接口，在overlay2中的实现由函数
+	// 		func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr error) 
+	// 完成，位于.../daemon/graphdriver/overlay2/overlay.go。
+	// 其内部实现即读取主机/overlay2目录下在该container layer id下的各个目录，然后使用系统调用mount
 	_, err = rwlayer.Mount(mountLabel)
+	
 	...
+	//返回一个tar包
 	archive, err := rwlayer.TarStream()
 	...
 	return ioutils.NewReadCloserWrapper(archive, func() error {
@@ -1069,6 +1075,66 @@ func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.R
 		nil
 }
 ```
+接下来是调用layerStore的Register去注册这个layer，这一步主要是去在image和layer目录下创建目录和文件：
+```go
+func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descriptor distribution.Descriptor) (Layer, error) {
+	...
+	//获取父镜像层
+	if string(parent) != "" {
+		p = ls.get(parent)
+		...
+		//父image的cache id，即layerdb中的cacheID,指向了overlay2中的一个layer目录
+		pid = p.cacheID
+		// Release parent chain if error
+		...
+	}
+
+	// 创建一个新的readonly layer
+	layer := &roLayer{
+		parent:         p,
+		cacheID:        stringid.GenerateRandomID(),
+		referenceCount: 1,
+		layerStore:     ls,
+		references:     map[Layer]struct{}{},
+		descriptor:     descriptor,
+	}
+	//根据父镜像层和cacheID创建Layer,
+	//这里同样需要驱动（overlay2）根据实现ProtoDriver接口
+	//在overlay2的实现中，这个create主要根据cacheID,创建../overlay2/{cacheID}目录，并link
+	if err = ls.driver.Create(layer.cacheID, pid, nil); err != nil {
+		return nil, err
+	}
+	//通过创建一个tmp文件去开启一个事务
+	tx, err := ls.store.StartTransaction()
+	//接下来将计算..iamge/layerdb目录下需要的信息
+	//包括计算layer的大小、diff_id、tar-split.json.gz等
+	...
+	if err = ls.applyTar(tx, ts, pid, layer); err != nil {
+		return nil, err
+	}
+	//layer的chainID
+	if layer.parent == nil {
+		layer.chainID = ChainID(layer.diffID)
+	} else {
+		layer.chainID = createChainIDFromParent(layer.parent.chainID, layer.diffID)
+	}
+	if err = storeLayer(tx, layer); err != nil {
+		return nil, err
+	}
+	...
+	if existingLayer := ls.getWithoutLock(layer.chainID); existingLayer != nil {
+		// Set error for cleanup, but do not return the error
+		err = errors.New("layer already exists")
+		return existingLayer.getReference(), nil
+	}
+	if err = tx.Commit(layer.chainID); err != nil {
+		return nil, err
+	}
+	ls.layerMap[layer.chainID] = layer
+	return layer.getReference(), nil
+}
+```
+最后一步，创建image，无非就是在image的iamgedb目录下生成需要的信息
 
 
 

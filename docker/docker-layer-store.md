@@ -35,6 +35,8 @@ drwx------ 2 root root 4096 Jun 20 07:36 l
 
 5. 最后，根据文件cache-id中的layer_id中的描述，在层存储目录`.../docker/overlay2/{layer_id}/...`中定位layer
 
+docker image与docker layer的存储可参考图![image](../images/docker/docker-image-layer-store.png)
+
 另外，在`/l/..`中，保存了和layer(layer_id)一一对应的link，目的在于缩短参数，避免达到mount命令的参数大小限制，建立连接后的目录如下：
 ```
 $ ls -l /var/lib/docker/overlay2/l

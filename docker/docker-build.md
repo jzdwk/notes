@@ -1134,7 +1134,72 @@ func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descr
 	return layer.getReference(), nil
 }
 ```
-最后一步，创建image，无非就是在image的iamgedb目录下生成需要的信息
+最后一步，创建image，无非就是在image的iamgedb目录下生成需要的信息。在`CommitBuildStep`中，执行完`CommitImage`的前两步(上文两步)，将首先生成一个`ChildConfig`对象用于保存本层的config：
+```go
+cc := image.ChildConfig{
+		ContainerID:     c.ContainerID,
+		Author:          c.Author,
+		Comment:         c.Comment,
+		ContainerConfig: c.ContainerConfig,
+		Config:          c.Config,
+		DiffID:          l.DiffID(),
+	}
+	config, err := json.Marshal(image.NewChildImage(parent, cc, c.ContainerOS))
+```
+然后执行image的`Create`:
+```go
+//config文件即childImage的config，也就是在docker的imagedb目录中保存的以iamgeID为文件名的文件内容
+func (is *store) Create(config []byte) (ID, error) {
+	var img Image
+	err := json.Unmarshal(config, &img)
+	...
+	// Must reject any config that references diffIDs from the history
+	// which aren't among the rootfs layers.
+	rootFSLayers := make(map[layer.DiffID]struct{})
+	for _, diffID := range img.RootFS.DiffIDs {
+		rootFSLayers[diffID] = struct{}{}
+	}
+
+	layerCounter := 0
+	for _, h := range img.History {
+		if !h.EmptyLayer {
+			layerCounter++
+		}
+	}
+	if layerCounter > len(img.RootFS.DiffIDs) {
+		return "", errors.New("too many non-empty layers in History section")
+	}
+	//将config文件写入../imagedb目录的content/sha256/{imageID}中
+	dgst, err := is.fs.Set(config)
+	...
+	imageID := IDFromDigest(dgst)
+	...
+	if _, exists := is.images[imageID]; exists {
+		return imageID, nil
+	}
+	layerID := img.RootFS.ChainID()
+	var l layer.Layer
+	if layerID != "" {
+		if !system.IsOSSupported(img.OperatingSystem()) {
+			return "", system.ErrNotSupportedOperatingSystem
+		}
+		l, err = is.lss[img.OperatingSystem()].Get(layerID)
+		...
+	}
+	imageMeta := &imageMeta{
+		layer:    l,
+		children: make(map[ID]struct{}),
+	}
+	is.images[imageID] = imageMeta
+	if err := is.digestSet.Add(imageID.Digest()); err != nil {
+		delete(is.images, imageID)
+		return "", err
+	}
+	return imageID, nil
+}
+```
+至此，对于整体的一个commitLayer过程完结。docker在build过程中，将根据docker file中的命令以及对各个命令的prase过程不停地执行prase->run cmd->mount->create rw layer->commit layer。直到最后一条命令执行完成，整个image构建完成。
+
 
 
 

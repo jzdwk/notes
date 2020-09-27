@@ -20,7 +20,7 @@ func runBuild(dockerCli command.Cli, options buildOptions) error {
 	}
 	...
 ```
-上述代码首先判断是否使用了[build kit](https://docs.docker.com/develop/develop-images/build_enhancements/) 作为构建工具，改工具在18.09版本后支持。用于更高性能的镜像build。使用buildkit的构建将执行`runBuildBuildKit`,这里暂时忽略。
+上述代码首先判断是否使用了[build kit](https://docs.docker.com/develop/develop-images/build_enhancements/) 作为构建工具，工具在**18.09**版本后支持。用于更高性能的镜像build，可通过在`/etc/docker/daemon.json`设置`{ "features": { "buildkit": true } }`触发 。使用buildkit的构建将执行`runBuildBuildKit`,这里暂时忽略。
 
 ```go
 	//变量定义

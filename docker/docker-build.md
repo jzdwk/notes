@@ -4,6 +4,14 @@
 
 其中dockerfile的位置可以位于当前目录/指定目录/URL，具体的语法[参考官方](https://docs.docker.com/engine/reference/builder/) 
 
+docker build的整体过程可以描述为：
+
+1. docker 从基础镜像（即FROM）运行一个container,并创建container layer
+2. 执行dockerfile中的一条指令，对container做出修改
+3. 执行类似docker commit操作，将这次修改作为一个新的image layer
+4. docker再基于刚提交的image layer，构建一个新的container layer，并运行container
+5. 执行dockerfile中的下一条指令，直至dockerfile中的所有指令结束。
+
 ## client 
 
 docker build同样是C/S方式实现，client端的主要作用就是根据命令，通过不同方式获取dockerfile文件以及其他配置信息。获取的方式有指定目录、指定URL和标准输入。获取文件后，在根据配置信息对dockerfile以及相关的目录进行压缩，成tar包后传输。
@@ -204,6 +212,7 @@ func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string
 	tagger, err := NewTagger(b.imageComponent, config.ProgressWriter.StdoutFormatter, options.Tags)
 	...
 	var build *builder.Result
+	//在docker 18.09之后，支持buildkit工具，具体参考https://docs.docker.com/develop/develop-images/build_enhancements/
 	if useBuildKit {
 		build, err = b.buildkit.Build(ctx, config)
 		if err != nil {
@@ -444,7 +453,7 @@ func parseCopy(req parseRequest) (*CopyCommand, error) {
 	}, nil
 }
 ```
-COPY的解析返回了一个Command接口，`COPY`的[主要作用](https://docs.docker.com/engine/reference/builder/#copy) 就是将源目录的内容CPOY进容器的目标目录，最终返回的`CopyCommand`包含了源、目的目录，以及COPY使用到的可选的`chown`等功能。
+COPY的解析返回了一个Command接口，`COPY`的[主要作用](https://docs.docker.com/engine/reference/builder/#copy) 就是将源目录的内容COPY进容器的目标目录，最终返回的`CopyCommand`包含了源、目的目录，以及COPY使用到的可选的`chown`等功能。
 
 通过查看`func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error)`的所有case，发现**stage**表示了一个`FROM`的操作，而**command**表示了再FROM之后，dockerfile中的各个关键字`CPOY`、`ADD`、`LABEL`等等命令的描述，因此`func Parse(ast *parser.Node) (stages []Stage, metaArgs []ArgCommand, err error)`的最终返回为一个包含了多个Command的Stage以及通过ARG配置的metaArgs。
 
@@ -754,7 +763,7 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 }
 ```
 
-上述代码在执行完基本的config后，创建container对象，并给这个container创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md). 注意，这个container是一个**临时的container(ephemeral containers)，即docker会通过这个container对象去操作读写层中的各项目录，进行目录挂载，link等操作，最后将这个临时的container commit为image，并remove**。具体可参考[docker file best practice](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#create-ephemeral-containers)
+上述代码在执行完基本的config后，创建container对象，并给这个container创建**读写层**，关于读写层、Layer等docker image存储笔记，[参考](docker-image-store.md). 注意，这个container是一个**临时的container(ephemeral containers)，即docker会通过这个container对象去操作读写层中的各项目录，进行目录挂载，link等操作，最后将这个临时的container commit为image layer，并remove，然后继续执行下一条命令，循环往复**。具体可参考[docker file best practice](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#create-ephemeral-containers)
 
 进入`CreateLayer`:
 ```go
@@ -965,6 +974,232 @@ func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
 	return b.commitContainer(dispatchState, id, runConfigWithCommentCmd)
 }
 ```
-这个commitContainer将调用Backend接口的`CommitBuildStep(backend.CommitConfig) (image.ID, error)`.
+这个commitContainer将调用Backend接口的`CommitBuildStep(backend.CommitConfig) (image.ID, error)`.此处的实现为imageService：
+```go
+// CommitBuildStep is used by the builder to create an image for each step in
+// the build.
+//
+// This method is different from CreateImageFromContainer:
+//   * it doesn't attempt to validate container state
+//   * it doesn't send a commit action to metrics
+//   * it doesn't log a container commit event
+//
+// This is a temporary shim. Should be removed when builder stops using commit.
+func (i *ImageService) CommitBuildStep(c backend.CommitConfig) (image.ID, error) {
+	container := i.containers.Get(c.ContainerID)
+	...
+	c.ContainerMountLabel = container.MountLabel
+	c.ContainerOS = container.OS
+	c.ParentImageID = string(container.ImageID)
+	return i.CommitImage(c)
+}
+```
+如函数上的注释所述，CommitBuildStep是用于为image build过程的每一步生成一个image，即image layer。继续看`CommitImage`函数：
+```go
+// CommitImage creates a new image from a commit config
+func (i *ImageService) CommitImage(c backend.CommitConfig) (image.ID, error) {
+	//获取os对应的layer store对象
+	layerStore, ok := i.layerStores[c.ContainerOS]
+	...
+	//首先根据临时的container id以及mount label获取读写层
+	rwTar, err := exportContainerRw(layerStore, c.ContainerID, c.ContainerMountLabel)
+	...
+	var parent *image.Image
+	//parent image
+	if c.ParentImageID == "" {
+		//如果这个镜像没有parent image,则使用rootfs
+		parent = new(image.Image)
+		parent.RootFS = image.NewRootFS()
+	} else {
+		parent, err = i.imageStore.Get(image.ID(c.ParentImageID))
+		...
+	}
+	//create layer
+	l, err := layerStore.Register(rwTar, parent.RootFS.ChainID())
+	...
+	defer layer.ReleaseAndLog(layerStore, l)
+	//构造child config，即当前layer的config
+	cc := image.ChildConfig{
+		ContainerID:     c.ContainerID,
+		Author:          c.Author,
+		Comment:         c.Comment,
+		ContainerConfig: c.ContainerConfig,
+		Config:          c.Config,
+		DiffID:          l.DiffID(),
+	}
+	config, err := json.Marshal(image.NewChildImage(parent, cc, c.ContainerOS))
+	...
+	//create image
+	id, err := i.imageStore.Create(config)
+	...
+	if c.ParentImageID != "" {
+		if err := i.imageStore.SetParent(id, image.ID(c.ParentImageID)); err != nil {
+			return "", err
+		}
+	}
+	return id, nil
+}
+```
+上述代码主要有3步构成：
+1. 获取读写层
+2. 创建layer
+3. 创建image
+
+首先是读写层的获取：
+```go
+func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.ReadCloser, err error) {
+	//根据container layer的id获取读写层 
+	rwlayer, err := layerStore.GetRWLayer(id)
+	...
+	// TODO: this mount call is not necessary as we assume that TarStream() should
+	// mount the layer if needed. But the Diff() function for windows requests that
+	// the layer should be mounted when calling it. So we reserve this mount call
+	// until windows driver can implement Diff() interface correctly.
+	// 这个Mount接口最终委托给graphdriver，由.../daemon/graphdriver/driver.go的ProtoDriver接口的Get方法完成
+	// 对于不同的驱动，需要实现这个接口，在overlay2中的实现由函数
+	// 		func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr error) 
+	// 完成，位于.../daemon/graphdriver/overlay2/overlay.go。
+	// 其内部实现即读取主机/overlay2目录下在该container layer id下的各个目录，然后使用系统调用mount
+	_, err = rwlayer.Mount(mountLabel)
+	
+	...
+	//返回一个tar包
+	archive, err := rwlayer.TarStream()
+	...
+	return ioutils.NewReadCloserWrapper(archive, func() error {
+			archive.Close()
+			err = rwlayer.Unmount()
+			layerStore.ReleaseRWLayer(rwlayer)
+			return err
+		}),
+		nil
+}
+```
+接下来是调用layerStore的Register去注册这个layer，这一步主要是去在image和layer目录下创建目录和文件：
+```go
+func (ls *layerStore) registerWithDescriptor(ts io.Reader, parent ChainID, descriptor distribution.Descriptor) (Layer, error) {
+	...
+	//获取父镜像层
+	if string(parent) != "" {
+		p = ls.get(parent)
+		...
+		//父image的cache id，即layerdb中的cacheID,指向了overlay2中的一个layer目录
+		pid = p.cacheID
+		// Release parent chain if error
+		...
+	}
+
+	// 创建一个新的readonly layer
+	layer := &roLayer{
+		parent:         p,
+		cacheID:        stringid.GenerateRandomID(),
+		referenceCount: 1,
+		layerStore:     ls,
+		references:     map[Layer]struct{}{},
+		descriptor:     descriptor,
+	}
+	//根据父镜像层和cacheID创建Layer,
+	//这里同样需要驱动（overlay2）根据实现ProtoDriver接口
+	//在overlay2的实现中，这个create主要根据cacheID,创建../overlay2/{cacheID}目录，并link
+	if err = ls.driver.Create(layer.cacheID, pid, nil); err != nil {
+		return nil, err
+	}
+	//通过创建一个tmp文件去开启一个事务
+	tx, err := ls.store.StartTransaction()
+	//接下来将计算..iamge/layerdb目录下需要的信息
+	//包括计算layer的大小、diff_id、tar-split.json.gz等
+	...
+	if err = ls.applyTar(tx, ts, pid, layer); err != nil {
+		return nil, err
+	}
+	//layer的chainID
+	if layer.parent == nil {
+		layer.chainID = ChainID(layer.diffID)
+	} else {
+		layer.chainID = createChainIDFromParent(layer.parent.chainID, layer.diffID)
+	}
+	if err = storeLayer(tx, layer); err != nil {
+		return nil, err
+	}
+	...
+	if existingLayer := ls.getWithoutLock(layer.chainID); existingLayer != nil {
+		// Set error for cleanup, but do not return the error
+		err = errors.New("layer already exists")
+		return existingLayer.getReference(), nil
+	}
+	if err = tx.Commit(layer.chainID); err != nil {
+		return nil, err
+	}
+	ls.layerMap[layer.chainID] = layer
+	return layer.getReference(), nil
+}
+```
+最后一步，创建image，无非就是在image的iamgedb目录下生成需要的信息。在`CommitBuildStep`中，执行完`CommitImage`的前两步(上文两步)，将首先生成一个`ChildConfig`对象用于保存本层的config：
+```go
+cc := image.ChildConfig{
+		ContainerID:     c.ContainerID,
+		Author:          c.Author,
+		Comment:         c.Comment,
+		ContainerConfig: c.ContainerConfig,
+		Config:          c.Config,
+		DiffID:          l.DiffID(),
+	}
+	config, err := json.Marshal(image.NewChildImage(parent, cc, c.ContainerOS))
+```
+然后执行image的`Create`:
+```go
+//config文件即childImage的config，也就是在docker的imagedb目录中保存的以iamgeID为文件名的文件内容
+func (is *store) Create(config []byte) (ID, error) {
+	var img Image
+	err := json.Unmarshal(config, &img)
+	...
+	// Must reject any config that references diffIDs from the history
+	// which aren't among the rootfs layers.
+	rootFSLayers := make(map[layer.DiffID]struct{})
+	for _, diffID := range img.RootFS.DiffIDs {
+		rootFSLayers[diffID] = struct{}{}
+	}
+
+	layerCounter := 0
+	for _, h := range img.History {
+		if !h.EmptyLayer {
+			layerCounter++
+		}
+	}
+	if layerCounter > len(img.RootFS.DiffIDs) {
+		return "", errors.New("too many non-empty layers in History section")
+	}
+	//将config文件写入../imagedb目录的content/sha256/{imageID}中
+	dgst, err := is.fs.Set(config)
+	...
+	imageID := IDFromDigest(dgst)
+	...
+	if _, exists := is.images[imageID]; exists {
+		return imageID, nil
+	}
+	layerID := img.RootFS.ChainID()
+	var l layer.Layer
+	if layerID != "" {
+		if !system.IsOSSupported(img.OperatingSystem()) {
+			return "", system.ErrNotSupportedOperatingSystem
+		}
+		l, err = is.lss[img.OperatingSystem()].Get(layerID)
+		...
+	}
+	imageMeta := &imageMeta{
+		layer:    l,
+		children: make(map[ID]struct{}),
+	}
+	is.images[imageID] = imageMeta
+	if err := is.digestSet.Add(imageID.Digest()); err != nil {
+		delete(is.images, imageID)
+		return "", err
+	}
+	return imageID, nil
+}
+```
+至此，对于整体的一个commitLayer过程完结。docker在build过程中，将根据docker file中的命令以及对各个命令的prase过程不停地执行prase->run cmd->mount->create rw layer->commit layer。直到最后一条命令执行完成，整个image构建完成。
+
+
 
 

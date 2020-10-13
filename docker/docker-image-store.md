@@ -112,7 +112,7 @@ Filesystem)，较为常见的有UnionFS、aufs 、OverlayFS 等
 
 ### repositories.json
 
-repositories.json文件中存储了本地的所有镜像，里面主要涉及了image的name/tag以及image的sha256值。
+repositories.json文件中存储了本地的所有镜像，里面主要涉及了image的name/tag以及image的sha256值，即**imageID**。
 
 以pull的镜像**alpine:latest**为例，其内容如下：
 
@@ -134,7 +134,7 @@ imagedb目录中存放了**镜像基本配置信息和layer层次关系**。在i
 
 - **metadata**目录保存每个镜像的parent镜像ID，目录中是一个在build过程中产生的镜像的父子关系链。
 
-- **content**目录下存储了镜像的JSON格式描述信息和配置信息，**配置信息用于在运行容器过程中使用**，文件名以image的sha256形式保存。以**alpine:latest**为例，通过repositories.json可以看到其sha256值为`3f53bb00af943dfdf8...`，因此在content下，可以看到以该sha256命名的文件，文件内容为：
+- **content**目录下存储了镜像的JSON格式描述信息和配置信息，**配置信息用于在运行容器过程中使用**，文件名以image的sha256形式保存。以**alpine:latest**为例，通过repositories.json可以看到其imageID值为`3f53bb00af943dfdf8...`，因此在content下，可以看到以该ID命名的文件，文件内容为：
 ```json
 {
     "architecture": "amd64",
@@ -225,9 +225,9 @@ build构建镜像时，可以看见是不断地生成新的container，然后提
 
 - **history**：构建该镜像的所有历史命令
 
-- **rootfs**：该镜像包含的layer层的diff id，这里的值主要用于描述layer，但注意：
+- **rootfs**：该镜像包含的layer层的**diff_id**，这里的值主要用于描述layer，但注意：
 
-1. 此处的diff_id**不一定等于**layer下的对应id，layer下存放的是chainID
+1. 此处的diff_id**不一定等于**layer下的对应id，layer下存放的是**chainID**
 
 2. diff_id的个数**不一定等于**在Dockerfile中Run的命令数
 
@@ -252,7 +252,7 @@ layerdb/
 
 - **mounts**: 当由镜像生成容器时，该目录下会生成容器的可读可写两个layer，可读即为由镜像生成，而可写就是未来对容器的修改的存放位置，由于alpine没有run，即生成容器，所以下方没有文件。
 
-- **sha256**: 主要存储的就是layer，注意这里存储的sha256值是**layer的chainId**，而非在imagedb里的json描述的diff_id，diff_id用来描述单个变化，而chainId用来便于一些列的变化，diff id和chain id之间的计算公式为，其中A表示单层layer，A|B表示在A之上添加了layerB，A是B的父layer，同理于A|B|C：
+- **sha256**: 主要存储的就是layer，注意这里存储的sha256值是**layer的chainID**，而非在imagedb里的json描述的diff_id，**diff_id用来描述单个变化，而chainID用来便于一些列的变化**，diff id和chain ID之间的计算公式为，其中A表示单层layer，A|B表示在A之上添加了layerB，A是B的父layer，同理于A|B|C：
 
 ```
 ChainID(A) = DiffID(A)
@@ -280,18 +280,18 @@ sha256:7bff100f35cb359a368537bb07829b055fe8e0b1cb01085a3a628ae9c187c7b8
 
 3. `tar-split.json.gz`表示layer层数据tar压缩包的split文件，该文件生成需要依赖tar-split，通过这个文件可以还原layer的tar包
 
-4. `cache_id`内容为一个uuid，指向Layer本地的真正存储位置。而这个真正的存储位置便是**/var/lib/docker/overlay2**目录:
+4. `cache_id`内容为一个uuid，**指向Layer本地的真正存储位置**。而这个真正的存储位置便是**/var/lib/docker/overlay2**目录:
 
 ```
 [root@docker-learn layerdb]# cat sha256/7bff100f35cb359a368537bb07829b055fe8e0b1cb01085a3a628ae9c187c7b8/cache-id 
 281c53a74496be2bfcf921ceee5ec2d95139c43fec165ab667a77899b3691d56
 ```
 
-5. `parent`文件存储了当前Layer层的父层chain_id，因为当前alpine镜像只有一层，所以此时的parent下没有值。
+5. `parent`文件存储了当前Layer层的父层chainID，因为当前alpine镜像只有一层，所以此时的parent下没有值。
 
 ### distribution
 
-distribution目录主要用于和docker registry操作，包含了Layer的diff_id和image的digest(不是image的sha256)之间的对应关系。**注意，这个digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有digest。 push 完成后，registry生成digest给server，server将layer id和digest建立对应关系**，push后的digest在stdout打印：
+distribution目录主要用于和docker registry操作，包含了Layer的diff_id（**就是在每个imageID文件中描述的diff_id中的id**）和image的digest(不是imageID)之间的对应关系。**注意，这个digest是由镜像仓库生成或维护，本地构建的镜像在没有push到仓库之前，没有digest。 push 完成后，registry生成digest给server，server将layer的diff_ID和digest建立对应关系**，push后的digest在stdout打印：
 ```
 The push refers to repository [docker.io/backbp/test-image]
 a6c8828ba4b5: Pushed 

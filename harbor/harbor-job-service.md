@@ -317,7 +317,7 @@ func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) 
 		// 根据redis配置得到redigo的pool对象
 		redisPool := bs.getRedisPool(cfg.PoolConfig.RedisPoolCfg)
 
-		// redis的数据迁移，如果有必要的话
+		// redis的数据迁移，(此处还没太明白)
 		rdbMigrator := migration.New(redisPool, namespace)
 		rdbMigrator.Register(migration.PolicyMigratorFactory)
 		if err := rdbMigrator.Migrate(); err != nil {
@@ -432,7 +432,7 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 	if eID, yes := isPeriodicJobExecution(j); yes {
 		jID = eID
 	}
-	//根据jobId track的主要作用是调用redis的“HGETALL”取出job的信息并存入basicTracker.jobStats
+	//根据jobId得到一个tracker接口的实例，tracker的主要作用是进行整个job的生命周期管理，根据job的执行情况变更其状态。
 	if tracker, err = rj.ctl.Track(jID); err != nil {
 		//失败控制，避免无线循环
 		now := time.Now().Unix()
@@ -441,18 +441,89 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 		}
 		return
 	}
+```
+其中的Tracker接口定义如下，可以看到其作为是管理整个job的生命周期：
+```go
+type Tracker interface {
+	// Save the job stats which tracked by this tracker to the backend
+	//
+	// Return:
+	//   none nil error returned if any issues happened
+	Save() error
 
+	// Load the job stats which tracked by this tracker with the backend data
+	//
+	// Return:
+	//   none nil error returned if any issues happened
+	Load() error
+
+	// Get the job stats which tracked by this tracker
+	//
+	// Returns:
+	//  *models.Info : job stats data
+	Job() *Stats
+
+	// Update the properties of the job stats
+	//
+	// fieldAndValues ...interface{} : One or more properties being updated
+	//
+	// Returns:
+	//  error if update failed
+	Update(fieldAndValues ...interface{}) error
+
+	// NumericID returns the numeric ID of periodic job.
+	// Please pay attention, this only for periodic job.
+	NumericID() (int64, error)
+
+	// Mark the periodic job execution to done by update the score
+	// of the relation between its periodic policy and execution to -1.
+	PeriodicExecutionDone() error
+
+	// Check in message
+	CheckIn(message string) error
+
+	// Update status with retry enabled
+	UpdateStatusWithRetry(targetStatus Status) error
+
+	// The current status of job
+	Status() (Status, error)
+
+	// Expire the job stats data
+	Expire() error
+
+	// Switch status to running
+	Run() error
+
+	// Switch status to stopped
+	Stop() error
+
+	// Switch the status to error
+	Fail() error
+
+	// Switch the status to success
+	Succeed() error
+
+	// Reset the status to `pending`
+	Reset() error
+}
+```
+继续回到`func (rj *RedisJob) Run(j *work.Job) (err error)`:
+```go
+func (rj *RedisJob) Run(j *work.Job) (err error)
+	...
 	//返回redis中的job状态，并switch-case
 	jStatus := job.Status(tracker.Job().Info.Status)
 	switch jStatus {
+	//pending, scheduled的继续走代码
 	case job.PendingStatus, job.ScheduledStatus:
 		break
+	//stop状态置标记位
 	case job.StoppedStatus:
 		//stop
 		markStopped = bp(true)
 		return nil
 	case job.ErrorStatus:
-		//没有达到次数，则调用tracker.reSet()
+		//将job状态重新置为pending
 		...
 		break
 	default:
@@ -461,12 +532,14 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 	//定义defer 从redis中重新获取job状态，stop or success处理
 	defer func() {
 		if err != nil {
+			//job状态置为error
 			if er := tracker.Fail(); er != nil {
 				...
 			}
 			return
 		}
 		if latest, er := tracker.Status(); er == nil {
+			//job如果是stop，置标记位
 			if latest == job.StoppedStatus {
 				// Logged
 				logger.Infof("Job %s:%s is stopped", tracker.Job().Info.JobName, tracker.Job().Info.JobID)
@@ -476,8 +549,8 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 			}
 		}
 
-		// Mark job status to success.
-		if er := tracker.Succeed(); er != nil {
+		// 如果以上情况都正常，job标记为成功，将job在redis中置过期，并发送callBackHook相关信息。
+		if er := tracker.Succeed(); er != nil 
 			logger.Errorf("Mark job status to success error: %s", er)
 		}
 	}()
@@ -497,6 +570,7 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 	if rj.context.JobContext == nil {
 		rj.context.JobContext = impl.NewDefaultContext(rj.context.SystemContext)
 	}
+	//将tracker封装成一个可执行上下文，该上下文除了包含tracker，还包括了需要使用的configManager,sysContext
 	if execContext, err = rj.context.JobContext.Build(tracker); err != nil {
 		return
 	}
@@ -513,15 +587,15 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 
 	// Wrap job
 	runningJob = Wrap(rj.job)
-	// 通过CAS 讲job的状态置为running
+	// 通过CAS 将job的状态置为running
 	if err = tracker.Run(); err != nil {
 		return
 	}
-	// 调用run
+	// 执行具体的run操作，根据runningJob的类型，执行对应Job的Run方法，这些Job类型包括了scan,gc,replication,scheduler等。
 	err = runningJob.Run(execContext, j.Args)
-	// Handle retry
+	// 根据job类型，判断这个job是否需要retry，如果不需要，设置足够大的一个失败次数(10000000000)
 	rj.retry(runningJob, j)
-	// Handle periodic job execution
+	// 根据job的参数判断是否为周期性job，如果是，重新将其加入队列
 	if _, yes := isPeriodicJobExecution(j); yes {
 		if er := tracker.PeriodicExecutionDone(); er != nil {
 			// Just log it
@@ -532,6 +606,29 @@ func (rj *RedisJob) Run(j *work.Job) (err error) {
 	return
 }
 ```
+上述代码需要注意的是**几个defer函数的定义，这些defer函数用于处理job失败的情况，其执行顺序为声明顺序的倒序**。整个job消费的处理流程可以描述为：
+
+1. 根据jobID从redis中取出job，并封装为一个tracker对象，用于job的全生命周期管理
+
+2. 解析job状态：
+
+2.1 如果是pending（待处理），scheduled（周期性），则break后执行后续代码；
+
+2.2 如果是stop状态，将stop标记(markStop)置true并return；
+
+2.3 如果是error状态，将调用tracker.Reset，将job状态重置为pending，等待下一次操作
+
+3. 执行job的run过程：
+
+3.1 调用tracker.Run()操作，将job的状态变更为running；
+
+3.2 根据job的类型，执行对应的Run(execContext, j.Args)方法，这个Run方法具体完成了job描述的业务逻辑
+
+4. 进入defer环节，首先是一个关闭log和执行recover的defer
+
+5.  进入处理job状态的defer：如果在上述job处理的过程中，发生err，则将job状态置为error并return，进入下一个defer;如果job的状态变为stop，则将stop标记改为true并return,进入下一个refer；上述情况都未发生，说明job执行成功，将状态改为success，设置过期
+
+6. 进入下一个defer，如果job状态既不是stop，也没有err 说明job执行成功，打印日志并返回。
 
 可以看到，对于每一个job的handler，其实现为从redis中获取job的状态信息，并根据不同状态更新handler的执行(包括是否retry/返回/执行running)。而具体的执行位于代码`err = runningJob.Run(execContext, j.Args)`,可以看到针对不同的job类型，提供了不同的实现，包括了GC/Replication/Schedule/web hook等job，以web hook为例：
 
@@ -557,61 +654,103 @@ func (wj *WebhookJob) execute(ctx job.Context, params map[string]interface{}) er
 
 可以看到web hook类型的job的回调逻辑，其中`payload/address`即为在[notification](harbor-registry-notification.md) 中的`func (h *HTTPHandler) process(event *model.HookEvent)`封装信息。
 
-最后，返回函数`func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error)`。在完成job的handler后，剩下的工作主要是两部分，一是`agent.Serve()`,二是创建并拉起`apiServer服务`，即前文`router.go`中描述的api
+另一方面，**每一次job状态的转义，都伴随着一次callBack的调用**，比如对于Success和Error：
+```go
+//失败
+func (bt *basicTracker) Fail() error {
+	err := bt.UpdateStatusWithRetry(ErrorStatus)
+	if !errs.IsStatusMismatchError(err) {
+		bt.refresh(ErrorStatus)
+		//回调点
+		if er := bt.fireHookEvent(ErrorStatus); err == nil && er != nil {
+			return er
+		}
+	}
 
-```go
-func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error){
-		...
-		//一个永真的同步循环从redis中Load job
-		if err = lcmCtl.Serve(); err != nil {
-			...
-		}
-		...
-		hookAgent.Attach(lcmCtl)
-		//
-		if err = hookAgent.Serve(); err != nil {
-			...
-		}
-	} ...
-	
-	//job service rest api init
-	ctl := core.NewController(backendWorker, manager)
-	apiServer := bs.createAPIServer(ctx, cfg, ctl)
-	...
-	//exit handler
-	...
-	return
+	return err
 }
-```
-其中的`agent.Serve()`用来处理在`hookCallback`填入`event channel`的event。那么这个callback在何处被调用？回到上文对于tracker逻辑的分析，执行`if er := tracker.Succeed()`后，当进行一个CAS调用出现status err后，将调用callback:
-```go
+//成功
 func (bt *basicTracker) Succeed() error {
 	err := bt.UpdateStatusWithRetry(SuccessStatus)
 	if !errs.IsStatusMismatchError(err) {
-		...
+		bt.refresh(SuccessStatus)
+		// Expire the stat data of the successful job
+		if er := bt.expire(statDataExpireTimeForSuccess); er != nil {
+			...
+		}
+		//回调点
 		if er := bt.fireHookEvent(SuccessStatus); err == nil && er != nil {
 			...
 		}
 	}
 	return err
 }
+```
 
-// FireHookEvent fires the hook event
-func (bt *basicTracker) fireHookEvent(status Status, checkIn ...string) error {
+这个callBack函数的定义位于最初的`func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc)`中，其功能就是接收event后，封装为evt对象，调用hookAgent的Trigger，将evt入队：
+```go
+func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error) {
 	...
-	change := &StatusChange{
-		JobID:    bt.jobID,
-		Status:   status.String(),
-		Metadata: bt.jobStats.Info,
-	}
-	...
-	//调用callback
-	if bt.callback != nil {
-		return bt.callback(bt.jobStats.Info.WebHookURL, change)
-	}
-	return nil
+	if cfg.PoolConfig.Backend == config.JobServicePoolBackendRedis {
+		...
+		hookCallback := func(URL string, change *job.StatusChange) error {
+			msg := fmt.Sprintf("status change: job=%s, status=%s", change.JobID, change.Status)
+			if !utils.IsEmptyStr(change.CheckIn) {
+				msg = fmt.Sprintf("%s, check_in=%s", msg, change.CheckIn)
+			}
+
+			evt := &hook.Event{
+				URL:       URL,
+				Timestamp: time.Now().Unix(),
+				Data:      change,
+				Message:   msg,
+			}
+
+			return hookAgent.Trigger(evt)
+		}
+
+		...
 }
 ```
 
-## 总结
+最后，返回函数`func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error)`。在完成job的handler后，剩下的工作主要是两部分，一是`hookAgent.Serve()`，这个agent的主要功能是回调job的webhook，将执行成功的job信息发送回原地址;二是创建并拉起`apiServer服务`，即前文`router.go`中描述的api。
+
+```go
+func (bs *Bootstrap) LoadAndRun(ctx context.Context, cancel context.CancelFunc) (err error){
+		// 启动redis和注册的worker handler...
+		backendWorker, err = bs.loadAndRunRedisWorkerPool(
+			rootContext,
+			namespace,
+			workerNum,
+			redisPool,
+			lcmCtl,
+		)
+		...
+		// Run daemon process of life cycle controller
+		// Ignore returned error
+		if err = lcmCtl.Serve(); err != nil {
+			return errors.Errorf("start life cycle controller error: %s", err)
+		}
+		// Start agent
+		// Non blocking call
+		hookAgent.Attach(lcmCtl)
+		if err = hookAgent.Serve(); err != nil {
+			return errors.Errorf("start hook agent error: %s", err)
+		}
+	} 
+	...
+
+	// Initialize controller
+	ctl := core.NewController(backendWorker, manager)
+	// Start the API server
+	apiServer := bs.createAPIServer(ctx, cfg, ctl)
+	...
+	if er := apiServer.Start(); er != nil {
+		...
+	} 
+	...
+}
+```
+
+因为`hookAgent.Serve()`用来处理各种event，而这个event是在上文分析的各个job状态变动时，调用callback生成并放入channel，Serve()的作用就是取出这些event，根据其URL等描述，发送http请求。
 

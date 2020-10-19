@@ -2,6 +2,8 @@
 
 [webhook](https://www.jianshu.com/p/4cae7512c247) 可理解为一种事件驱动型的回调函数，当监听的事件发生数据变化时，向注册的回调地址发送变化信息。
 
+以下代码基于harbor-1.9.x
+
 ## docker registry notification
 
 docker通过webhook，向registry中加入了[notification](https://docs.docker.com/registry/notifications/) 机制实现image的管理。这个机制就是当有image pull/push事件发生时，将这些事件序列化后发送至配置的地址。

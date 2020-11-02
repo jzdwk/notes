@@ -16,18 +16,19 @@ return {
         fields = {
           -- 定义 plugin的可配置项
 		  {
-            header_name = {
+            header_key = {
               type = "string",
               required = true,
             },
           },
           {
-            header_key = {
+            header_value = {
               type = "string",
               required = true,
             },
           },
         },
       },
-  },
+    },
+  }
 }

@@ -37,3 +37,114 @@ complete-plugin #插件文件
 ## phrase to impl
 
 ## install
+
+当代码编辑完成后，将插件安装在kong上，官方推荐使用[luarocks](https://luarocks.org) 工具.
+
+1. 首先，在插件的本地目录编辑一个`rockspec`文件，文件内容的模板为，[参考](https://github.com/Kong/kong-plugin/blob/master/kong-plugin-myplugin-0.1.0-1.rockspec)：
+```
+package = "kong-plugin-myplugin"  -- TODO: rename, must match the info in the filename of this rockspec!
+                                  -- as a convention; stick to the prefix: `kong-plugin-`
+version = "0.1.0-1"               -- TODO: renumber, must match the info in the filename of this rockspec!
+-- The version '0.1.0' is the source code version, the trailing '1' is the version of this rockspec.
+-- whenever the source version changes, the rockspec should be reset to 1. The rockspec version is only
+-- updated (incremented) when this file changes, but the source remains the same.
+
+-- TODO: This is the name to set in the Kong configuration `plugins` setting.
+-- Here we extract it from the package name.
+local pluginName = package:match("^kong%-plugin%-(.+)$")  -- "myplugin"
+
+supported_platforms = {"linux", "macosx"}
+source = {
+  url = "http://github.com/Kong/kong-plugin.git",
+  tag = "0.1.0"
+}
+
+description = {
+  summary = "Kong is a scalable and customizable API Management Layer built on top of Nginx.",
+  homepage = "http://getkong.org",
+  license = "Apache 2.0"
+}
+
+dependencies = {
+}
+
+build = {
+  type = "builtin",
+  modules = {
+    -- TODO: add any additional files that the plugin consists of
+    ["kong.plugins."..pluginName..".handler"] = "kong/plugins/"..pluginName.."/handler.lua",
+    ["kong.plugins."..pluginName..".schema"] = "kong/plugins/"..pluginName.."/schema.lua",
+  }
+}
+```
+以`request-trans`插件为例子，其spec如下：
+```
+package = "kong-plugin-argonath-request-transformer"
+version = "0.1.0-1"
+
+source = {
+  url = "git://github.com/tyler-cloud-elements/kong-plugin-request-transformer",
+  tag = "v0.1.0"
+}
+
+supported_platforms = {"linux", "macosx"}
+description = {
+  summary = "Cloud Elements Argonath Request Transformer Plugin",
+}
+
+dependencies = {
+   "lua >= 5.1"
+}
+
+build = {
+  type = "builtin",
+  modules = {
+    ["kong.plugins.argonath-request-transformer.migrations.cassandra"] = "kong/plugins/argonath-request-transformer/migrations/cassandra.lua",
+    ["kong.plugins.argonath-request-transformer.migrations.postgres"] = "kong/plugins/argonath-request-transformer/migrations/postgres.lua",
+    ["kong.plugins.argonath-request-transformer.migrations.common"] = "kong/plugins/argonath-request-transformer/migrations/common.lua",
+    ["kong.plugins.argonath-request-transformer.handler"] = "kong/plugins/argonath-request-transformer/handler.lua",
+    ["kong.plugins.argonath-request-transformer.access"] = "kong/plugins/argonath-request-transformer/access.lua",
+    ["kong.plugins.argonath-request-transformer.schema"] = "kong/plugins/argonath-request-transformer/schema.lua",
+  }
+}
+```
+
+2. 在插件的本地目录中，创建按spec描述的目录结构，并将代码放入：
+```shell
+|my-plugin
+├── kong  #主要为此目录
+│   └── plugins
+│       └── my-plugin
+│           ├── handler.lua
+│           └── schema.lua
+├── kong-plugin-my-plugin-0.0.1-1.rockspec
+```
+
+3. 执行`luarocks make`
+
+4. 以上为本地plugin源码安装，也可以将其打包为：
+```shell
+# pack the installed rock
+$ luarocks pack <plugin-name> <version>
+# 比如
+luarocks pack kong-plugin-my-plugin 0.0.1-1
+# 此时将生成 类似kong-plugin-my-plugin-0.0.1-1.all.rock
+# 执行
+luarocks install kong-plugin-my-plugin-0.0.1-1.all.rock
+```
+
+5. 进入kong的配置文件目录，默认位于`/etc/kong/xxx.conf`,修改conf文件的plugins项：
+```
+# bundled表是安装kong默认的插件
+
+plugins = bundled,<plugin-name>
+
+```
+6. 重启/reload kong
+```
+# reload
+kong prepare
+kong reload -c xxx.conf
+# restart
+kong restart -c xxx.conf
+```

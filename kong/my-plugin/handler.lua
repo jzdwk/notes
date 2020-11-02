@@ -108,6 +108,7 @@ function doAuthN(headers,config)
 		end
 	end
 	return false
+end
 
 
 return MyPluginHandler

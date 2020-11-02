@@ -99,7 +99,7 @@ end
 -- 定义主要的处理逻辑，入参：
 -- headers： http 请求头
 -- config: 插件的config配置
-function doAuthN(headers,config)
+local function doAuthN(headers,config)
 	for k, v in pairs(headers) do
 		kong.log.debug("[header]: " .. k .. "[header_value]: "..v)
 		-- 遍历header table， 如果存在配置的header头以及对应的key，则返回

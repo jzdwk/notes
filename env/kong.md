@@ -44,3 +44,5 @@ kong start -c  /etc/kong/my.kong.conf --vv
 ```
 
 参考：https://docs.konghq.com/install/ubuntu/
+
+# kong 插件安装

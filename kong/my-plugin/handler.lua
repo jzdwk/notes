@@ -62,7 +62,10 @@ function MyPluginHandler:access(config)
   -- 通过官方的plugin development kit, 获取请求头，参考链接 https://docs.konghq.com/2.2.x/plugin-development/
   local headers = kong.request.get_headers(),
   -- 调用核心的处理逻辑
-  doAuthN(headers, config)
+  rst = doAuthN(headers, config)
+  if not rst then
+	return kong.response.error(401,"no defined header in request")
+  end
   kong.log.debug("[my-plugin] spend time : " .. os.clock() - start_time .. ".")
 end
 
@@ -96,7 +99,7 @@ end
 -- 定义主要的处理逻辑，入参：
 -- headers： http 请求头
 -- config: 插件的config配置
-function doAuthN(headers,config){
+function doAuthN(headers,config)
 	for k, v in pairs(headers) do
 		kong.log.debug("[header]: " .. k .. "[header_value]: "..v)
 		-- 遍历header table， 如果存在配置的header头以及对应的key，则返回
@@ -105,7 +108,7 @@ function doAuthN(headers,config){
 		end
 	end
 	return false
-}
+
 
 return MyPluginHandler
 

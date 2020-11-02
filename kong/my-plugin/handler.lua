@@ -62,7 +62,7 @@ function MyPluginHandler:access(config)
   -- 通过官方的plugin development kit, 获取请求头，参考链接 https://docs.konghq.com/2.2.x/plugin-development/
   local headers = kong.request.get_headers(),
   -- 调用核心的处理逻辑
-  rst = doAuthN(headers, config)
+  local rst = doAuthN(headers, config)
   if not rst then
 	return kong.response.error(401,"no defined header in request")
   end

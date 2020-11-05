@@ -270,7 +270,94 @@ return CustomHandler
 
 至此，针对目标1的简单的plugin已经实现完毕。当定义的plugin需要和kong的db等或扩展admin api(比如提供 /kong:8001/my-plugin api)，则需要定义额外
 
-## phrase to impl
+## migration
+
+当开发的插件需要用到kong的db去存储数据，则需要扩展kong的db层，增加额外的表，即migration需要做的工作。首先：
+
+1. 在插件所在目录下，创建子目录以及init文件`migrations/init.lua`，这个lua文件用于描述migrations需要的lua脚本文件（即dB中的表定义等内容）,如果migration进行了升级，则需要在此后追加修改脚本，而不是覆盖原有脚本：
+```lua
+-- `migrations/init.lua`
+return {
+  -- 最初版lua脚本
+  "000_base_my_plugin",
+  -- 从100版本升级到了110,文件格式推荐为：序号_旧版本_to_新版本
+  "001_100_to_110",
+}
+```
+
+2. 继续在`migrations`目录下，创建db描述脚本，比如`000_base_my_plugin`，其模板格式如下:
+```lua
+-- `<plugin_name>/migrations/000_base_my_plugin.lua`
+return {
+  postgresql = {
+    up = [[
+      CREATE TABLE IF NOT EXISTS "my_plugin_table" (
+        "id"           UUID                         PRIMARY KEY,
+        "created_at"   TIMESTAMP WITHOUT TIME ZONE,
+        "col1"         TEXT
+      );
+    
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "my_plugin_table_col1"
+                                ON "my_plugin_table" ("col1");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+    ]],
+  },
+
+  cassandra = {
+    up = [[
+      CREATE TABLE IF NOT EXISTS my_plugin_table (
+        id          uuid PRIMARY KEY,
+        created_at  timestamp,
+        col1        text
+      );
+      
+      CREATE INDEX IF NOT EXISTS ON my_plugin_table (col1);
+    ]],
+  }
+}
+
+-- `<plugin_name>/migrations/001_100_to_110.lua`
+return {
+  postgresql = {
+    up = [[
+      DO $$
+      BEGIN
+        ALTER TABLE IF EXISTS ONLY "my_plugin_table" ADD "cache_key" TEXT UNIQUE;
+      EXCEPTION WHEN DUPLICATE_COLUMN THEN
+        -- Do nothing, accept existing state
+      END;
+    $$;
+    ]],
+    teardown = function(connector, helpers)
+      assert(connector:connect_migrations())
+      assert(connector:query([[
+        DO $$
+        BEGIN
+          ALTER TABLE IF EXISTS ONLY "my_plugin_table" DROP "col1";
+        EXCEPTION WHEN UNDEFINED_COLUMN THEN
+          -- Do nothing, accept existing state
+        END$$;
+      ]])
+    end,
+  },
+
+  cassandra = {
+    up = [[
+      ALTER TABLE my_plugin_table ADD cache_key text;
+      CREATE INDEX IF NOT EXISTS ON my_plugin_table (cache_key);
+    ]],
+    teardown = function(connector, helpers)
+      assert(connector:connect_migrations())
+      assert(connector:query("ALTER TABLE my_plugin_table DROP col1"))
+    end,
+  }
+}
+
+```
 
 ## install
 

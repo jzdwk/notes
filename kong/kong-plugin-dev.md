@@ -31,7 +31,7 @@ complete-plugin #插件文件
 
 开发个插件my-plugin，应用在service或者route上，要求请求的header上必须携带一个`k,v`对，这个`k,v`对为在config中配置的给定值
 
-## schema
+### schema
 `schema.lua`文件的作用为定义plugin的数据配置结构，从而使其可以在admin api中被创建，比如：
 ```shell
 # name和config.foo都是在schema中定义的
@@ -124,7 +124,7 @@ return {
 }
 ```
 
-## handler
+### handler
 
 `handler.lua`的作用为**实现用户自定义的插件逻辑**，该文件是实现plugin的核心文件。实现plugin的方式为，重写kong定义的在处理http请求的8个接口，这些接口位于[openResty lua-nginx-module](https://github.com/openresty/lua-nginx-module) 的不同阶段，在**HTTP/s 上编写的插件**接口包括了：
 
@@ -270,7 +270,13 @@ return CustomHandler
 
 至此，针对目标1的简单的plugin已经实现完毕。当定义的plugin需要和kong的db等或扩展admin api(比如提供 /kong:8001/my-plugin api)，则需要定义额外
 
-## migration
+## 目标2
+
+在目标1中，完成了简单的根据plugin的config，从request（route/service）中过滤请求，执行handler的逻辑。假设现在需要kong去持久化一些数据，并将这些数据绑定在某个kong的资源对象上，当request到达时，需要对请求中携带的信息以及持久化的数据，使用lua脚本编写的逻辑进行验证（比如鉴权）。则需要kong的db/migration/dao参与。
+
+- **目标2**：继续扩展插件my-plugin，应用在service或者route上，要求请求的header上必须携带一个`k,v`对，这个`k,v`对为在config中配置的给定值，此为请求的过滤条件。当达到条件后，再根据这个k,v对，去判断该k,v对是否已经绑定在了所请求的route对象上，如果绑定，则通过，否则失败。
+
+### migration
 
 当开发的插件需要用到kong的db去存储数据，则需要扩展kong的db层，增加额外的表，即migration需要做的工作。首先：
 
@@ -285,11 +291,13 @@ return {
 }
 ```
 
-2. 继续在`migrations`目录下，创建db描述脚本，比如`000_base_my_plugin`，其模板格式如下:
+2. 继续在`migrations`目录下，创建db描述脚本，比如`000_base_my_plugin`，它的主要作用就是描述扩展的plugin的db表。具体的migration脚本的模板格式如下:
 ```lua
 -- `<plugin_name>/migrations/000_base_my_plugin.lua`
 return {
+  -- db为postges的配置
   postgresql = {
+    -- up项表示，当kong执行db初始化时执行的语句
     up = [[
       CREATE TABLE IF NOT EXISTS "my_plugin_table" (
         "id"           UUID                         PRIMARY KEY,
@@ -306,8 +314,9 @@ return {
       END$$;
     ]],
   },
-
+  --db为cassandra的配置
   cassandra = {
+    -- 同理于上面up项所述
     up = [[
       CREATE TABLE IF NOT EXISTS my_plugin_table (
         id          uuid PRIMARY KEY,
@@ -319,7 +328,9 @@ return {
     ]],
   }
 }
-
+```
+同样的，在执行版本升级时，migration脚本模板如下：
+```lua
 -- `<plugin_name>/migrations/001_100_to_110.lua`
 return {
   postgresql = {
@@ -332,9 +343,11 @@ return {
       END;
     $$;
     ]],
+	-- teardown项用于描述 当kong执行完成db初始化后，执行的语句，和up搭配使用
     teardown = function(connector, helpers)
       assert(connector:connect_migrations())
       assert(connector:query([[
+	    -- 具体的SQL语句
         DO $$
         BEGIN
           ALTER TABLE IF EXISTS ONLY "my_plugin_table" DROP "col1";
@@ -350,13 +363,13 @@ return {
       ALTER TABLE my_plugin_table ADD cache_key text;
       CREATE INDEX IF NOT EXISTS ON my_plugin_table (cache_key);
     ]],
+	-- 同上 teardown描述
     teardown = function(connector, helpers)
       assert(connector:connect_migrations())
       assert(connector:query("ALTER TABLE my_plugin_table DROP col1"))
     end,
   }
 }
-
 ```
 
 ## install

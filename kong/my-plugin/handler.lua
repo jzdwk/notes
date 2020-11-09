@@ -105,7 +105,7 @@ function do_auth_n(headers,config)
     kong.log.debug("[header]: " .. k .. "[header_value]: "..v)
     -- 遍历header table， 如果存在配置的header头以及对应的key，则返回
     if k == config.header_key and v == config.header_value then
-        return true
+      return true
     end
   end
   return false

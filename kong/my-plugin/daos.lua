@@ -39,7 +39,7 @@ return {
           auto      = false,
         },
       },
-	  {
+      {
         -- header_value
         header_value = {
           type      = "string",

@@ -12,4 +12,7 @@ return {
 		PRIMARY KEY ("id"));
     ]],
   },
+  
+  cassandra = {
+  }
 }

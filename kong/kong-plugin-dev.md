@@ -456,7 +456,7 @@ build = {
 ├── kong-plugin-my-plugin-0.0.1-1.rockspec
 ```
 
-3. 执行`luarocks make`
+3. 执行`luarocks make`,此步执行完后，会在目录`/usr/local/lib/luarocks/rocks-5.1`中，添加名为`kong-plugin-my-plugin`的目录。
 
 4. 以上为本地plugin源码安装，也可以将其打包为：
 ```shell
@@ -468,6 +468,7 @@ luarocks pack kong-plugin-my-plugin 0.0.1-1
 # 执行
 luarocks install kong-plugin-my-plugin-0.0.1-1.all.rock
 ```
+执行后，同样会在`/usr/local/lib/luarocks/rocks-5.1`中，添加名为`kong-plugin-my-plugin`的目录。
 
 5. 进入kong的配置文件目录，默认位于`/etc/kong/xxx.conf`,修改conf文件的plugins项：
 ```
@@ -484,3 +485,13 @@ kong reload -c xxx.conf
 # restart
 kong restart -c xxx.conf
 ```
+
+## uninstall
+
+卸载插件需要3步：
+
+1. 清理已经在kong上应用的插件，即访问`{admin}/plugins`的DELETE方法，删除之
+
+2. 清理kong.conf中的plugins项，将添加的自定义插件删除，然后reload/restart之
+
+3. 使用`luarocks remove <kong-plugin-plugin-name>`，删除在目录`/usr/local/lib/luarocks/rocks-5.1`中添加的自定义插件目录。

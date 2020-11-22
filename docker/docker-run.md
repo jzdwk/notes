@@ -89,4 +89,49 @@ func createContainer(ctx context.Context, dockerCli command.Cli, containerConfig
 	return &response, err
 }
 ```
-在client端大致的过程就是先pull
+在client端大致的过程就是先pull镜像，然后调用ContainerCreate创建容器。这个创建的过程即向daemon发送http请求：
+```go
+func (cli *Client) ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, containerName string) (container.ContainerCreateCreatedBody, error) {
+	var response container.ContainerCreateCreatedBody
+	//version check
+	...
+	//http query	
+	query := url.Values{}
+	if containerName != "" {
+		query.Set("name", containerName)
+	}
+	//http body
+	body := configWrapper{
+		Config:           config,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkingConfig,
+	}
+	//do post
+	serverResp, err := cli.post(ctx, "/containers/create", query, body, nil)
+	defer ensureReaderClosed(serverResp)
+	...
+	err = json.NewDecoder(serverResp.body).Decode(&response)
+	return response, err
+}
+```
+daemon端的处理随后分析。ContainerCreate的返回中包含了Container的ID，因此，对于下一过程ContainerStart，其主要是向Daemon发送：
+```go
+func (cli *Client) ContainerStart(ctx context.Context, containerID string, options types.ContainerStartOptions) error {
+	query := url.Values{}
+	if len(options.CheckpointID) != 0 {
+		query.Set("checkpoint", options.CheckpointID)
+	}
+	if len(options.CheckpointDir) != 0 {
+		query.Set("checkpoint-dir", options.CheckpointDir)
+	}
+	resp, err := cli.post(ctx, "/containers/"+containerID+"/start", query, nil, nil)
+	ensureReaderClosed(resp)
+	return err
+}
+```
+
+## daemon
+
+### create
+
+### start

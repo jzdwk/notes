@@ -13,14 +13,7 @@ return {
     ]], 
   },
   cassandra = {
-    up = [[
-    CREATE TABLE IF NOT EXISTS my_plugin_headers(
-    id          uuid PRIMARY KEY,
-    created_at  timestamp,
-    route_id         uuid,
-    header_key       text,
-    header_value     text    
-    );
-    ]],
   }
 }
+
+

@@ -285,21 +285,7 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	if opts.params.Config.Image != "" {
 		img, err = daemon.imageService.GetImage(opts.params.Config.Image)
 		...
-		if img.OS != "" {
-			os = img.OS
-		} else {
-			// default to the host OS except on Windows with LCOW
-			if runtime.GOOS == "windows" && system.LCOWSupported() {
-				os = "linux"
-			}
-		}
-		imgID = img.ID()
-		...
-	} else {
-		if runtime.GOOS == "windows" {
-			os = "linux" // 'scratch' case.
-		}
-	}
+	} ...
 	
 	// On WCOW, if are not being invoked by the builder to create this container (where
 	// ignoreImagesArgEscaped will be true) - if the image already has its arguments escaped,
@@ -308,14 +294,15 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	if os == "windows" && !opts.ignoreImagesArgsEscaped && img != nil && img.RunConfig().ArgsEscaped {
 		opts.params.Config.ArgsEscaped = true
 	}
-	//ima中定义了默认的config配置，位于../docker/image/overlay2/imagedb/content/sha256/{iamgeID}中的config段落。将用户的自定义配置和默认配置合并
+	//img中定义了默认的config配置，位于../docker/image/overlay2/imagedb/content/sha256/{iamgeID}中的config段落。将用户的自定义配置和默认配置合并
 	if err := daemon.mergeAndVerifyConfig(opts.params.Config, img); err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
-    //同上，合并hostconfig
+    //同上，合并hostconfig的logconfig
 	if err := daemon.mergeAndVerifyLogConfig(&opts.params.HostConfig.LogConfig); err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
+	//创建container
 	if container, err = daemon.newContainer(opts.params.Name, os, opts.params.Config, opts.params.HostConfig, imgID, opts.managed); err != nil {
 		return nil, err
 	}

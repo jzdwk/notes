@@ -99,6 +99,22 @@ func (cli *Client) ContainerCreate(ctx context.Context, config *container.Config
 	if containerName != "" {
 		query.Set("name", containerName)
 	}
+	//http body
+	body := configWrapper{
+		Config:           config,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkingConfig,
+	}
+	//do post
+	serverResp, err := cli.post(ctx, "/containers/create", query, body, nil)
+	defer ensureReaderClosed(serverResp)
+	...
+	err = json.NewDecoder(serverResp.body).Decode(&response)
+	return response, err
+}
+```
+daemon端的处理随后分析。ContainerCreate的返回中包含了Container的ID，因此，对于下一过程ContainerStart，其主要是向Daemon发送：
+```go
 	
 	body := configWrapper{
 		Config:           config,  //image config
@@ -143,6 +159,10 @@ func (cli *Client) ContainerStart(ctx context.Context, containerID string, optio
 ```
 
 ## daemon
+
+### create
+
+### start
 
 daemon端的两个主要工作就是`createContainer`以及`ContainerStart`。和container相关的api操作定义如下,位于`/moby/api/server/router/container/container.go`：
 ```go
@@ -302,48 +322,67 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	if err := daemon.mergeAndVerifyLogConfig(&opts.params.HostConfig.LogConfig); err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
-	//创建container
+
+	//newContainer只是进行了参数的封装，返回一个container对象
 	if container, err = daemon.newContainer(opts.params.Name, os, opts.params.Config, opts.params.HostConfig, imgID, opts.managed); err != nil {
 		return nil, err
 	}
-	defer func() {
-		if retErr != nil {
-			if err := daemon.cleanupContainer(container, true, true); err != nil {
-				logrus.Errorf("failed to cleanup container on create error: %v", err)
+```
+进入`newContainer`函数可以看到，其首先是创建一个container对象，
+```go
+func (daemon *Daemon) newContainer(name string, operatingSystem string, config *containertypes.Config, hostConfig *containertypes.HostConfig, imgID image.ID, managed bool) (*container.Container, error) {
+	var (
+		id             string
+		err            error
+		noExplicitName = name == ""
+	)
+	id, name, err = daemon.generateIDAndName(name)
+	...
+
+	if hostConfig.NetworkMode.IsHost() {
+		if config.Hostname == "" {
+			config.Hostname, err = os.Hostname()
+			if err != nil {
+				return nil, errdefs.System(err)
 			}
 		}
-	}()
+	} else {
+		daemon.generateHostname(id, config)
+	}
+	entrypoint, args := daemon.getEntrypointAndArgs(config.Entrypoint, config.Cmd)
 
+	base := daemon.newBaseContainer(id)
+	//注意，容器内使用的UTC时间
+	base.Created = time.Now().UTC()
+	base.Managed = managed
+	base.Path = entrypoint
+	base.Args = args //FIXME: de-duplicate from config
+	base.Config = config
+	base.HostConfig = &containertypes.HostConfig{}
+	base.ImageID = imgID
+	base.NetworkSettings = &network.Settings{IsAnonymousEndpoint: noExplicitName}
+	base.Name = name
+	base.Driver = daemon.imageService.GraphDriverForOS(operatingSystem)
+	base.OS = operatingSystem
+	return base, err
+}
+```
+继续回到`create`函数：
+```
+	...
 	if err := daemon.setSecurityOptions(container, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
 
 	container.HostConfig.StorageOpt = opts.params.HostConfig.StorageOpt
 
-	// Fixes: https://github.com/moby/moby/issues/34074 and
-	// https://github.com/docker/for-win/issues/999.
-	// Merge the daemon's storage options if they aren't already present. We only
-	// do this on Windows as there's no effective sandbox size limit other than
-	// physical on Linux.
-	if runtime.GOOS == "windows" {
-		if container.HostConfig.StorageOpt == nil {
-			container.HostConfig.StorageOpt = make(map[string]string)
-		}
-		for _, v := range daemon.configStore.GraphOptions {
-			opt := strings.SplitN(v, "=", 2)
-			if _, ok := container.HostConfig.StorageOpt[opt[0]]; !ok {
-				container.HostConfig.StorageOpt[opt[0]] = opt[1]
-			}
-		}
-	}
-
+	//windows fix
+	...
+	//这一步才是最关键的，创建一个读写层
 	// Set RWLayer for container after mount labels have been set
 	rwLayer, err := daemon.imageService.CreateLayer(container, setupInitLayer(daemon.idMapping))
-	if err != nil {
-		return nil, errdefs.System(err)
-	}
+	...
 	container.RWLayer = rwLayer
-
 	rootIDs := daemon.idMapping.RootPair()
 
 	if err := idtools.MkdirAndChown(container.Root, 0700, rootIDs); err != nil {
@@ -378,8 +417,3 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	return container, nil
 }
 ```
-
-
-
-
-

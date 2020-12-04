@@ -182,9 +182,45 @@ Hierarchy是由cgroup组成的**树形结构**。一方面，树形结构的Hier
 
 举个例子，比如定义了一个`Hierarchy_1`，并将某memory约束`mem_subSystem`绑定此`Hierarchy_1`，则此`Hierarchy_1`的根节点`r_cgroup`将遵循这个`mem_subSystem`描述的mem约束，比如`2G`。接下来，这个根节点`r_cgroup`下的所有子节点将遵循这一约束，并可配置每个节点对memory使用的占比，比如`chd_cgroup`配置了20%,即该`chd_group`下的进程最多使用`2000mb*20%=400mb`memory.
 
+Linux默认在启动时，已经为每一个**subSystem**创建了对应的默认的**hierarchy**，mount路径位于`sys/fs/cgroup/xxx`,xxx包括了memory/cpu等,当然，这个目录也是**root cgroup**，毕竟hierarchy是抽象的概念，具体还是由各个cgroup去描述。
+```shell
+[root@iZ2zebl327dijrrsaeq81zZ ~]# mount -l
+...
+cgroup on /sys/fs/cgroup/perf_event type cgroup (rw,nosuid,nodev,noexec,relatime,perf_event)
+cgroup on /sys/fs/cgroup/devices type cgroup (rw,nosuid,nodev,noexec,relatime,devices)
+cgroup on /sys/fs/cgroup/blkio type cgroup (rw,nosuid,nodev,noexec,relatime,blkio)
+cgroup on /sys/fs/cgroup/hugetlb type cgroup (rw,nosuid,nodev,noexec,relatime,hugetlb)
+cgroup on /sys/fs/cgroup/pids type cgroup (rw,nosuid,nodev,noexec,relatime,pids)
+cgroup on /sys/fs/cgroup/rdma type cgroup (rw,nosuid,nodev,noexec,relatime,rdma)
+cgroup on /sys/fs/cgroup/cpu,cpuacct type cgroup (rw,nosuid,nodev,noexec,relatime,cpu,cpuacct)
+cgroup on /sys/fs/cgroup/net_cls,net_prio type cgroup (rw,nosuid,nodev,noexec,relatime,net_cls,net_prio)
+cgroup on /sys/fs/cgroup/freezer type cgroup (rw,nosuid,nodev,noexec,relatime,freezer)
+cgroup on /sys/fs/cgroup/cpuset type cgroup (rw,nosuid,nodev,noexec,relatime,cpuset)
+cgroup on /sys/fs/cgroup/memory type cgroup (rw,nosuid,nodev,noexec,relatime,memory)
+...
+```
+因此在容器实现资源限额时，将在默认的**hierarchy**创建子cgroup,并写入限额配置，比如docker的实现见下面小节**docker&cgroup**。
+
+### cgroup & task
+
+概念上，一个进程可以作为多个cgroup的成员，但是这些cgroup必须在不同的hierarchy中（原因在于如果位于同一hierarchy的不同cgroup，该hierarchy绑定了memory subSystem，则无法约束这个进程的memory了）。一个进程fork出子进程时，子进程是和父进程在同一个cgroup中，也可以根据需要移动到其他cgroup。
+
+具体的cgroup和进程的关系通过cgroup下的**tasks**描述，所以在默认的`sys/fs/cgroup/xxx`下（即root cgroup），tasks文件描述了系统中所有进程的信息：
+```shell
+[root@iZ2zebl327dijrrsaeq81zZ cpu]# cat tasks 
+1
+2
+3
+4
+...
+3325
+3327
+```
+而在进行容器限额时，思路就是创建一个**子cgroup**，将容器进程id写入子cgroup的tasks，并在子cgroup上描述具体限额配置。比如docker的实现见下面小节**docker&cgroup**。
+
 ### docker & cgroup
 
-使用docker run一个容器后，docker会为每个容器在系统的**hierarchy**中创建cgroup:
+使用docker run一个容器后，docker会为每个容器在系统的**hierarchy**中创建子的cgroup:
 ```shell
 
 # docker ps
@@ -213,9 +249,12 @@ cgroup.procs           memory.kmem.slabinfo                memory.limit_in_bytes
 memory.failcnt         memory.kmem.tcp.failcnt             memory.max_usage_in_bytes        memory.stat
 memory.force_empty     memory.kmem.tcp.limit_in_bytes      memory.move_charge_at_immigrate  memory.swappiness
 memory.kmem.failcnt    memory.kmem.tcp.max_usage_in_bytes  memory.numa_stat                 memory.usage_in_bytes
-
 ```
-
+其中的文件`memory.limit_in_bytes`等就是用来描述这个cgroup的限额。另一方面，通过查看这个cgroup的tasks文件，可看到这个限额将作用于哪个容器进程，比如下面例子的1898：
+```shell
+[root@iZ2zebl327dijrrsaeq81zZ 281b2a76e696cde0d5009ce94d1221d7c103ab491e05dc47123e8be564bb82f]# cat tasks 
+1898
+```
 ## Union File System
 
 可以移步[docker-image-store.md](../docker-image-store.md)
@@ -251,9 +290,72 @@ Linux 下的`/proc`文件系统由内核提供，它其实不是一个真正的�
 
 ### Veth
 
+net namespace隔离了网络栈，容器网络的隔离使用了net namespace。但容器间需要通信，同时容器也需要和宿主通信。因此提供了**Veth设备**。 **两个命名空间之间的通信，需要使用一个Veth设备对**
+
+示例：
+```shell
+[/]$ #创建两个网络Namespace
+[/]$ sudo ip netns add nsl
+[/]$ sudo ip netns add ns2
+[/]$ #创建一对Veth
+[/]$ sudo ip l nk add vethO type veth peer name vethl
+[/]$ #分别将两个Veth移到两个Namespace 中
+[/]$ sudo ip link set vethO netns nsl
+[/]$ sudo ip link set vethl netns ns2
+[/]$ #配置每个veth的网络地址，并启动设备
+[/]$ sudo ip netns exec nsl ifconfig vethO 172.18.0.2/24 up
+[/]$ sudo ip netns exec ns2 ifconfig vethl 172.18.0.3/24 up
+[/]$ #配置ns1的路由，default代表0.0.0.0/0，即所有流量经过veth0流出
+[/]$ sudo ip netns exec nsl route add default dev vethO
+[/]$ #同上
+[/]$ sudo ip netns exec ns2 route add default dev vethl
+[/]$ #通过veth一端出去的包，在另外一端(另一个ns中，ns2)能够直接接收到
+[/]$ sudo ip netns exec nsl ping -c 1 172.18.0.3
+```
 ### Bridge
 
-### route
+Bridge工作在**链路层**，是一种**虚拟网络设备**，所以具备虚拟网络设备的所有特性，比如可以配置 IP、MAC 等。除此之外，Bridge还是一个**交换机**，具有交换机所有的功能。因此，Bridge可以接入其他的网络设备，比如物理设备、虚拟设备、VLAN 设备等。Bridge通常充当主设备，其他设备为从设备，这样的效果就等同于物理交换机的端口连接了一根网线。
+
+而它把其他的从设备虚拟为一个port。当把一个网卡设备(或虚拟网卡)加入的网桥后，网卡将**共享网桥的ip，网卡的接受、发送数据包就交给网桥决策**。
+
+因此，Bridge可以作为容器/虚拟机通信的媒介，将不同net namespace上的Veth设备加入Bridge实现通信。
+
+示例：
+```shell
+[/]$ #创建Veth对，并将一端veth1移入namespace
+[/]$ sudo ip netns add ns1
+[/]$ sudo ip link add veth0 type veth peer name veth1
+[/]$ #将veth1移入ns1
+[/]$ sudo ip link set vethl netns nsl
+[/]$ #创建网桥br0
+[/]$ sudo brctl addbr br0
+[/]$ #挂载网络设备,其中将veth0挂载到网桥
+[/]$ sudo brctl addif br0 eth0
+[/]$ sudo brctl addif br0 veth0
+```
+
+### route table
+
+linux的路由表功能和路由器中的route table一致，定义路由表来决定在某个网络Namespace中包的流向，从而定义请求会到哪个网络设备上。
+
+```shell
+[/]$ #启动veth0和网桥br0
+[/]$ sudo ip link set veth0 up
+[/]$ sudo ip link set br0 up
+[/]$ 设置veth1在Net Namespace中的IP地址
+[/]$ sudo ip netns exec ns1 ifconfig veth1 172.18.0.2/24 up
+[/]$ #设置nsl的路由
+[/]$ #default代表0.0.0.0/0，即在Net Namespace中所有流量都经过vethl的网络设备流出
+[/]$ sudo ip netns exec nsl route add default dev vethl
+[/]$ #在宿主机上将172.18.0.0/24 的网段请求路由到br0的网桥
+[/]$ sudo route add -net 172.18.0.0/24 dev br0
+[/]$ #从ns1中访问宿主机的地址,假设为10.0.2.15
+[/]$ 此时的路径为:首先根据ns1的路由表配置，所有流量从veth1流出，流向对端设备veth0，而后者和eth0均挂载与网桥上，因此通信成功
+[/]$ sudo ip netns exec nsl ping -c 1 10.0.2.15
+[/]$ #从宿主机访问Namespace中的网络地址
+[/]$ #此时的路径为：根据宿主的route配置，172流量均流向网桥br0，因此br0接收流量，根据mac地址转发至veth0的对端veth1,
+[/]$ ping -c 1 172.18.0.2
+```
 
 ### iptables
 

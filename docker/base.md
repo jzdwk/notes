@@ -357,7 +357,108 @@ linux的路由表功能和路由器中的route table一致，定义路由表来�
 [/]$ ping -c 1 172.18.0.2
 ```
 
+
 ### iptables
+
+netfilter/iptables(iptables是Linux管理工具，位于/sbin/iptables。实现功能的是netfilter，它是Linux内核中实现包过滤的内部结构)是Linux平台下的包过滤防火墙，它通过配置**规则**，完成封包过滤、封包重定向和网络地址转换（NAT）等功能。实现上，通过**表和链**来完成具体功能。
+
+- **表（tables）**提供特定的功能，iptables内置了**4个表，即filter表、nat表、mangle表和raw表**，分别用于实现包过滤，网络地址转换、包重构(修改)和数据跟踪处理。具体的划分如下：
+
+1. filter表，**较为常用**，作用：过滤数据包  内核模块：iptables_filter.
+2. Nat表，**较为常用**，作用：用于网络地址转换（IP、端口） 内核模块：iptable_nat
+3. Mangle表，作用：修改数据包的服务类型、TTL、并且可以配置路由实现QOS  内核模块：iptable_mangle
+4. Raw表，作用：决定数据包是否被状态跟踪机制处理  内核模块：iptable_raw
+
+表的优先顺序为：**raw-->mangle-->nat-->filter**
+
+- **链（chains）**是数据包传播的路径，每一条链其实就是众多规则中的一个检查清单，每一条链中可以有一 条或数条规则。当一个数据包到达一个链时，iptables就会从链中第一条规则开始检查，看该数据包是否满足规则所定义的条件。如果满足，系统就会根据 该条规则所定义的方法处理该数据包；否则iptables将继续检查下一条规则，如果该数据包不符合链中任一条规则，iptables就会根据该链预先定义的默认策略来处理数据包。**链**的种类分为了：
+
+1. INPUT——进来的数据包应用此规则链中的策略
+2. OUTPUT——外出的数据包应用此规则链中的策略
+3. FORWARD——转发数据包时应用此规则链中的策略
+4. PREROUTING——对数据包作路由选择前应用此链中的规则，**所有的数据包进来的时侯都先由这个链处理**
+5. POSTROUTING——对数据包作路由选择后应用此链中的规则，**所有的数据包出来的时侯都先由这个链处理**
+
+- **链和表**的关系
+
+表描述了实现功能模块上的划分，链描述了对数据包的处理时机。
+
+这样设计的原因在于：**对于一个数据包的处理，有两个维度需要考虑，一个是如何处理，另一个是处理时机。如何处理的逻辑即为包过滤、重构等，处理时机则分为了路由前/后等。**因此，在对一个数据包的整体处理上，遵循**先表后链**的原则，因此会有。
+
+可见图[!tables&chains](../images/docker/base-table-chain.png)
+
+基本步骤如下： 
+
+1. 数据包到达网络接口，比如 eth0。 
+2. 进入 raw 表的 PREROUTING 链，这个链的作用是赶在连接跟踪之前处理数据包。 
+3. 如果进行了连接跟踪，在此处理。 
+4. 进入 mangle 表的 PREROUTING 链，在此可以修改数据包，比如 TOS 等。 
+5. 进入 nat 表的 PREROUTING 链，可以在此做DNAT，但不要做过滤。 
+6. 决定路由，看是交给本地主机还是转发给其它主机。 
+
+当数据包要转发给其它主机： 
+
+7. 进入 mangle 表的 FORWARD 链，这里也比较特殊，这是在第一次路由决定之后，在进行最后的路由决定之前，我们仍然可以对数据包进行某些修改。 
+8. 进入 filter 表的 FORWARD 链，在这里我们可以对所有转发的数据包进行过滤。需要注意的是：经过这里的数据包是转发的，方向是双向的。 
+9. 进入 mangle 表的 POSTROUTING 链，到这里已经做完了所有的路由决定，但数据包仍然在本地主机，我们还可以进行某些修改。 
+10. 进入 nat 表的 POSTROUTING 链，在这里一般都是用来做 SNAT ，不要在这里进行过滤。 
+11. 进入出去的网络接口。完毕。 
+
+当数据包发给本地主机的，那么它会依次穿过： 
+
+7. 进入 mangle 表的 INPUT 链，这里是在路由之后，交由本地主机之前，我们也可以进行一些相应的修改。 
+8. 进入 filter 表的 INPUT 链，在这里我们可以对流入的所有数据包进行过滤，无论它来自哪个网络接口。 
+9. 交给本地主机的应用程序进行处理。 
+10. 处理完毕后进行路由决定，看该往那里发出。 
+11. 进入 raw 表的 OUTPUT 链，这里是在连接跟踪处理本地的数据包之前。 
+12. 连接跟踪对本地的数据包进行处理。 
+13. 进入 mangle 表的 OUTPUT 链，在这里我们可以修改数据包，但不要做过滤。 
+14. 进入 nat 表的 OUTPUT 链，可以对防火墙自己发出的数据做 NAT 。 
+15. 进入 filter 表的 OUTPUT 链，可以对本地出去的数据包进行过滤。 
+16. 再次进行路由决定。 
+17. 进入 mangle 表的 POSTROUTING 链，同上一种情况的第9步。注意，这里不光对经过防火墙的数据包进行处理，还对防火墙自己产生的数据包进行处理。 
+18. 进入 nat 表的 POSTROUTING 链，同上一种情况的第10步。 
+19. 进入出去的网络接口。完毕
+
+- iptables的命令格式：
+```shell
+iptables [-t 表名] 命令选项 ［链名］ ［条件匹配］ ［-j 目标动作或跳转］
+```
+参考[!iptable](../image/docker/base-iptable.jpg)
+
+参考: 
+[1](https://blog.51cto.com/wushank/1171768)
+[2](https://www.jianshu.com/p/ee4ee15d3658)
+
+- 容器常用的规则：
+
+容器场景下，需要对进入容器的数据包的ip地址进行转换，数据流出时，包中的source address应该为宿主ip，流入时，包中的destination address应该为容器ip。因此，使用iptables增加规则
+
+1. MASQUERADE
+
+在理解这个规则之前，先梳理SNAT（Source Network Address Translation，源地址转换）,SNAT在数据包流出这台机器之前的最后一个链，也就是POSTROUTING链来，进行操作。比如：
+```shell
+# iptables -t nat -A POSTROUTING -s 192.168.0.0/24 -j SNAT --to-source 58.20.51.66
+```
+这个语句就是告诉系统把即将要流出本机的数据的source ip address修改成为58.20.51.66。这样，数据包在达到目的机器以后，目的机器会将包返回到58.20.51.66也就是本机。但是这有一个问题：**假如当前系统用的是ADSL/3G/4G动态拨号方式，那么每次拨号，出口IP都会改变，同样的，对于容器场景，每次容器启动，其ip为系统随机分配，因此SNAT就会有局限性**，因此，MASQUERADE即解决这个问题:
+```shell
+#  iptables -t nat -A POSTROUTING -s 192.168.0.0/24 -o eth0 -j MASQUERADE
+```
+MASQUERADE会**自动读取eth0现在的ip地址然后做SNAT出去**，这样就实现了很好的动态SNAT地址转换。
+
+2. DNAT（Destination Network Address Translation,目的地址转换)
+
+DNAT主要应用在**外部应用访问容器内应用时**，外部应用无法知道容器内应用的ip地址和ns(比如ns1上的172.18.0.2)，因此外部数据包到达后，需要根据某种策略，将访问某端口的请求的Destination Network Address转换为172.18.0.2，比如：
+```shell
+[/] $ #将到宿主机上80端口的请求转发到Namespace的IP 上
+[/] $ sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 80 -j DNAT --to-destination 172.18.0.2:80
+```
+
+参考：
+[1](https://www.jianshu.com/p/beeb6094bcc9)
+
+
+
 
 
 

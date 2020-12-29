@@ -7,8 +7,8 @@
 //docker run 后携带的命令主要分为了runOptinos和containerOptions
 func runRun(dockerCli command.Cli, flags *pflag.FlagSet, ropts *runOptions, copts *containerOptions) error {
 	//解析从终端输入的config options，这里面的config主要有
-	//config ：独立于宿主机的配置信息，其内容如果用户没有指定，将默认来自于../docker/image/overlay2/imagedb/content/sha256/{iamgeID}中的config段落。比如hostname，user;默认omitempty设置，如果为空置则忽略字段。
-    //hostConfig ： 与主机相关的配置，即容器与主键之间的端口映射、日志、volume等等
+	//config ：独立于宿主机的配置信息，其内容如果用户没有指定，将默认来自于/var/lib/docker/image/overlay2/imagedb/content/sha256{iamgeID}中的config段落。比如hostname，user;默认omitempty设置，如果为空置则忽略字段。
+    //hostConfig ： 与主机相关的配置，即容器与主机之间的端口映射、日志、volume等等
     //networkingConfig ：容器网络相关的配置。
 	containerConfig, err := parse(flags, copts, dockerCli.ServerInfo().OSType)
 	...
@@ -160,10 +160,6 @@ func (cli *Client) ContainerStart(ctx context.Context, containerID string, optio
 
 ## daemon
 
-### create
-
-### start
-
 daemon端的两个主要工作就是`createContainer`以及`ContainerStart`。和container相关的api操作定义如下,位于`/moby/api/server/router/container/container.go`：
 ```go
 // initRoutes initializes the routes in container router
@@ -210,6 +206,8 @@ func (r *containerRouter) initRoutes() {
 ```
 
 ### ContainerCreate
+
+ContainerCreate的过程从本质上来说，就是将下载的只读的image和一个创建的读写的container layer进行union mount，从而构造容器的工作空间。
 
 根据api定位执行函数`postContainersCreate`，该函数只是做了一些http参数的接收解析以及校验工作，之后调用了backend接口的:
 ```go
@@ -328,7 +326,103 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 		return nil, err
 	}
 ```
-进入`newContainer`函数可以看到，其首先是创建一个container对象，
+以busybox容器运行后的hostconfig为例，目录位于/var/lib/docker/containers/{containers_id}，其内容为：
+```json
+{
+  "Binds": [
+    "/root/mnt:/home/mnt"   //因为run时指定了一个挂载，故在此Binds项中
+  ],
+  "ContainerIDFile": "",
+  "LogConfig": {
+    "Type": "json-file",
+    "Config": {}
+  },
+  "NetworkMode": "default",
+  "PortBindings": {},
+  "RestartPolicy": {
+    "Name": "no",
+    "MaximumRetryCount": 0
+  },
+  "AutoRemove": false,
+  "VolumeDriver": "",
+  "VolumesFrom": null,
+  "CapAdd": null,
+  "CapDrop": null,
+  "Dns": [],
+  "DnsOptions": [],
+  "DnsSearch": [],
+  "ExtraHosts": null,
+  "GroupAdd": null,
+  "IpcMode": "shareable",
+  "Cgroup": "",
+  "Links": null,
+  "OomScoreAdj": 0,
+  "PidMode": "",
+  "Privileged": false,
+  "PublishAllPorts": false,
+  "ReadonlyRootfs": false,
+  "SecurityOpt": null,
+  "UTSMode": "",
+  "UsernsMode": "",
+  "ShmSize": 67108864,
+  "Runtime": "runc",
+  "ConsoleSize": [
+    0,
+    0
+  ],
+  "Isolation": "",
+  "CpuShares": 0,
+  "Memory": 0,
+  "NanoCpus": 0,
+  "CgroupParent": "",
+  "BlkioWeight": 0,
+  "BlkioWeightDevice": [],
+  "BlkioDeviceReadBps": null,
+  "BlkioDeviceWriteBps": null,
+  "BlkioDeviceReadIOps": null,
+  "BlkioDeviceWriteIOps": null,
+  "CpuPeriod": 0,
+  "CpuQuota": 0,
+  "CpuRealtimePeriod": 0,
+  "CpuRealtimeRuntime": 0,
+  "CpusetCpus": "",
+  "CpusetMems": "",
+  "Devices": [],
+  "DeviceCgroupRules": null,
+  "DiskQuota": 0,
+  "KernelMemory": 0,
+  "MemoryReservation": 0,
+  "MemorySwap": 0,
+  "MemorySwappiness": null,
+  "OomKillDisable": false,
+  "PidsLimit": 0,
+  "Ulimits": null,
+  "CpuCount": 0,
+  "CpuPercent": 0,
+  "IOMaximumIOps": 0,
+  "IOMaximumBandwidth": 0,
+  "MaskedPaths": [
+    "/proc/asound",
+    "/proc/acpi",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/sys/firmware"
+  ],
+  "ReadonlyPaths": [
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger"
+  ]
+}
+```
+继续进入`newContainer`函数可以看到，其首先是创建一个container对象，
 ```go
 func (daemon *Daemon) newContainer(name string, operatingSystem string, config *containertypes.Config, hostConfig *containertypes.HostConfig, imgID image.ID, managed bool) (*container.Container, error) {
 	var (
@@ -378,28 +472,126 @@ func (daemon *Daemon) newContainer(name string, operatingSystem string, config *
 
 	//windows fix
 	...
-	//这一步才是最关键的，创建一个读写层
+	//这一步比较关键，创建容器的读写层，实际的目录位于/var/lib/docker/overlay2/{MountID}-init
+	//创建的过程将调用具体的文件驱动，比如overlay2，读写层的父层即容器的image layer
+	//读写层的基本原理为在docker创建的对应的容器的工作目录下new一个读写目录，然后image layer的只读层做union mount
 	// Set RWLayer for container after mount labels have been set
 	rwLayer, err := daemon.imageService.CreateLayer(container, setupInitLayer(daemon.idMapping))
 	...
 	container.RWLayer = rwLayer
 	rootIDs := daemon.idMapping.RootPair()
-
+	//目录位于/var/lib/docker/containers/{container_id}
 	if err := idtools.MkdirAndChown(container.Root, 0700, rootIDs); err != nil {
 		return nil, err
 	}
+	//目录位于/var/lib/docker/containers/{container_id}/checkpoints
 	if err := idtools.MkdirAndChown(container.CheckpointDir(), 0700, rootIDs); err != nil {
 		return nil, err
 	}
-
+	//根据hostconfig的配置，将配置信息应用于容器
 	if err := daemon.setHostConfig(container, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
+```
+进入setHostConfig(container, opts.params.HostConfig),可以看到：
+```go
+func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *containertypes.HostConfig) error {
+	// Do not lock while creating volumes since this could be calling out to external plugins
+	// Don't want to block other actions, like `docker ps` because we're waiting on an external plugin
+	//注册挂载点，包括了
+	//1. 容器对象自身的挂载点
+	//2. –volumes-form声明的父容器的挂载
+	//3. --volume声明的挂载，来自hostconfig的Binds项
+	//3. --mount声明的挂载，具体见https://docs.docker.com/storage/bind-mounts/
+	//将最终的挂载点以[destination]point的map形式写入container
+	if err := daemon.registerMountPoints(container, hostConfig); err != nil {
+		return err
+	}
 
+	container.Lock()
+	defer container.Unlock()
+	//注册hostConfig中的Links，即--link选项，https://docs.docker.com/network/links/ 注，此项已不推荐使用
+	// Register any links from the host config before starting the container
+	if err := daemon.registerLinks(container, hostConfig); err != nil {
+		return err
+	}
+	//hostconfig网络模型设置
+	runconfig.SetDefaultNetModeIfBlank(hostConfig)
+	container.HostConfig = hostConfig
+	return container.CheckpointTo(daemon.containersReplica)
+}
+```
+回到`create`函数，上述注册完挂载点后，调用`createContainerOSSpecificSettings`进行容器读写层中具体目录的创建：
+```go
+	...
+	//
 	if err := daemon.createContainerOSSpecificSettings(container, opts.params.Config, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
+	...
+	//进入函数
+// createContainerOSSpecificSettings performs host-OS specific container create functionality
+func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
+	if err := daemon.Mount(container); err != nil {
+		return err
+	}
+	defer daemon.Unmount(container)
 
+	rootIDs := daemon.idMapping.RootPair()
+	//设置workDir，目录位于/var/lib/docker/overlay2/{mountID}/work 可通过docker inspect --format '{{.GraphDriver.Data}}' {containerID}查看
+	if err := container.SetupWorkingDirectory(rootIDs); err != nil {
+		return err
+	}
+
+	// Set the default masked and readonly paths with regard to the host config options if they are not set.
+	if hostConfig.MaskedPaths == nil && !hostConfig.Privileged {
+		hostConfig.MaskedPaths = oci.DefaultSpec().Linux.MaskedPaths // Set it to the default if nil
+		container.HostConfig.MaskedPaths = hostConfig.MaskedPaths
+	}
+	if hostConfig.ReadonlyPaths == nil && !hostConfig.Privileged {
+		hostConfig.ReadonlyPaths = oci.DefaultSpec().Linux.ReadonlyPaths // Set it to the default if nil
+		container.HostConfig.ReadonlyPaths = hostConfig.ReadonlyPaths
+	}
+	//挂载卷处理
+	for spec := range config.Volumes {
+		name := stringid.GenerateRandomID()
+		destination := filepath.Clean(spec)
+
+		// Skip volumes for which we already have something mounted on that
+		// destination because of a --volume-from.
+		if container.HasMountFor(destination) {
+			logrus.WithField("container", container.ID).WithField("destination", spec).Debug("mountpoint already exists, skipping anonymous volume")
+			// Not an error, this could easily have come from the image config.
+			continue
+		}
+		path, err := container.GetResourcePath(destination)
+		if err != nil {
+			return err
+		}
+
+		stat, err := os.Stat(path)
+		if err == nil && !stat.IsDir() {
+			return fmt.Errorf("cannot mount volume over existing file, file exists %s", path)
+		}
+
+		v, err := daemon.volumes.Create(context.TODO(), name, hostConfig.VolumeDriver, volumeopts.WithCreateReference(container.ID))
+		if err != nil {
+			return err
+		}
+
+		if err := label.Relabel(v.Mountpoint, container.MountLabel, true); err != nil {
+			return err
+		}
+
+		container.AddMountPointWithVolume(destination, &volumeWrapper{v: v, s: daemon.volumes}, true)
+	}
+	return daemon.populateVolumes(container)
+}
+```
+返回`create`, 进行容器网络设置：
+```go
+	...
+	//如果没有设置网络，将网络模式设置为 default
 	var endpointsConfigs map[string]*networktypes.EndpointSettings
 	if opts.params.NetworkingConfig != nil {
 		endpointsConfigs = opts.params.NetworkingConfig.EndpointsConfig
@@ -407,11 +599,13 @@ func (daemon *Daemon) newContainer(name string, operatingSystem string, config *
 	// Make sure NetworkMode has an acceptable value. We do this to ensure
 	// backwards API compatibility.
 	runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
-
+	//更新网络设置
 	daemon.updateContainerNetworkSettings(container, endpointsConfigs)
+	//在Daemon中注册新建的container对象，底层为一个map[string]*Container，key为容器id
 	if err := daemon.Register(container); err != nil {
 		return nil, err
 	}
+	//状态首先设置为stopped
 	stateCtr.set(container.ID, "stopped")
 	daemon.LogContainerEvent(container, "create")
 	return container, nil

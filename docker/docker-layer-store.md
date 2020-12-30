@@ -37,7 +37,7 @@ drwx------ 2 root root 4096 Jun 20 07:36 l
 
 docker image与docker layer的存储可参考图![image](../images/docker/docker-image-layer-store.png)
 
-另外，在`/l/..`中，保存了和layer(layer_id)一一对应的link，目的在于缩短参数，避免达到mount命令的参数大小限制，建立连接后的目录如下：
+另外，在`/l/..`中，保存了和layer(layer_id)一一对应的link，创建这个别名的目的在于缩短参数，避免达到mount命令的参数大小限制，建立连接后的目录如下：
 ```
 $ ls -l /var/lib/docker/overlay2/l
 
@@ -49,7 +49,7 @@ lrwxrwxrwx 1 root root 72 Jun 20 07:36 JEYMODZYFCZFYSDABYXD5MF6YO -> ../eca1e4e1
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 NFYKDW6APBCCUCTOUSYDH4DXAT -> ../223c2864175491657d238e2664251df13b63adb8d050924fd1bfcdb278b866f7/diff
 lrwxrwxrwx 1 root root 72 Jun 20 07:36 UL2MW33MSE3Q5VYIKBRN4ZAGQP -> ../e8876a226237217ec61c4baf238a32992291d059fdac95ed6303bdff3f59cff5/diff
 ```
-可以看到，/l目录下的每一个标识符都指向一个layer的**diff目录**，这个diff目录中就保存了该层的只读目录。对于最底层（根layer）`3a36935c9df`,其目录下内容为：
+可以看到，/l目录下的每一个标识符都指向一个layer的**diff目录，即/var/lib/docker/overlay2/{layerId}/diff**，这个diff目录中就保存了该层的只读目录。对于最底层（根layer）`3a36935c9df`,其目录下内容为：
 ```
 $ ls /var/lib/docker/overlay2/3a36935c9df35472229c57f4a27105a136f5e4dbef0f87905b2e506e494e348b/
 diff  link

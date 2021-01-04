@@ -439,7 +439,7 @@ func (daemon *Daemon) newContainer(name string, operatingSystem string, config *
 	return base, err
 }
 ```
-3. **在**`/var/lib/docker/{fsdriver}`**目录中，创建容器读写层rwLayer**：
+3. **在**`/var/lib/docker/{fsdriver}`**目录中，创建容器读写层rwLayer**，19.03版本为`/var/lib/docker/overlay2/`：
 ```go
 	...
 	//windows fix
@@ -601,7 +601,7 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 }
 ```
 
-5. **执行具体OS的容器创建工作，包括了执行实际的文件挂载
+5. **执行具体OS的容器创建工作，包括了执行实际的文件挂载**
 
 回到`create`函数，上述注册完挂载点后，调用`createContainerOSSpecificSettings`进行容器具体的创建工作，即对读写层的实际创建和mount，此部分的工作都在目录`/var/lib/docker/{fsdriver}`中完成,比如`/var/lib/docker/overlay2`：
 ```go
@@ -688,6 +688,12 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 	runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
 	//更新网络设置
 	daemon.updateContainerNetworkSettings(container, endpointsConfigs)
+	...
+}
+```
+7. **保存该container对象**
+```
+	...
 	//在Daemon中注册新建的container对象，底层为一个map[string]*Container，key为容器id
 	if err := daemon.Register(container); err != nil {
 		return nil, err
@@ -696,7 +702,7 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 	stateCtr.set(container.ID, "stopped")
 	daemon.LogContainerEvent(container, "create")
 	return container, nil
-}
+	...
 ```
 
 至此，container对象创建完毕，对象中维护了容器运行时的所有配置，包括了存储、网络和文件目录等，容器在运行时需要的物理文件目录也mount完毕。

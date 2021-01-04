@@ -286,11 +286,41 @@ Linux 下的`/proc`文件系统由内核提供，它其实不是一个真正的�
 
 ### detach
 
-## network
+## 网络管理
+
+### docker 网络类型
+
+- **host**
+
+使用host模式时，容器将不会获得一个独立的Network Namespace，而是**和宿主机共用一个Network Namespace**。因此，容器将不会虚拟出自己的网卡，配置自己的IP等，而是使用宿主机的IP和端口
+```shell
+$ ## 运行一个nginx
+$ docker run --name=nginx_host --net=host -p 80:80 -d nginx
+$ ## 提示端口映射将失效
+$ WARNING: Published ports are discarded when using host network mode
+$ ## 提示端口映射将失效
+```
+在容器中，执行ifconfig命令查看网络环境时，看到的都是宿主机上的信息。同样的，外界访问容器中的应用，则直接使用**{host-ip}:{port}**即可，不用任何NAT转换，就如直接跑在宿主机中一样。但容器文件系统、进程列表等还是和宿主机隔离的。
+
+- **container**
+
+host模式是和host共享一个Network Namespace, 而container模式指定新创建的容器和**已经存在的一个容器共享一个Network Namespace**。新创建的容器不会创建自己的网卡，配置自己的IP，而是和一个指定的容器共享IP、端口范围等。同样，两个容器除了网络方面，其他的如文件系统、进程列表等还是隔离的。两个容器的进程可以通过lo网卡设备通信。
+
+- **none**
+
+该模式将容器放置在它自己的网络栈中，但是并不进行任何配置。换句话说，该模式关闭了容器的网络功能，主要应用于**容器并不需要网络**的场景，比如磁盘读写任务。
+
+- **bridge**
+
+容器**使用独立network Namespace，并连接到docker0虚拟网卡（默认模式）**。通过docker0网桥以及Iptables nat表配置与宿主机通信。
+
+**bridge模式是Docker默认的网络设置**，此模式会为每一个容器分配Network Namespace、设置IP等，并将一个主机上的Docker容器连接到一个虚拟网桥上。
+
+
 
 ### Veth
 
-net namespace隔离了网络栈，容器网络的隔离使用了net namespace。但容器间需要通信，同时容器也需要和宿主通信。因此提供了**Veth设备**。 **两个命名空间之间的通信，需要使用一个Veth设备对**
+net namespace隔离了网络栈，容器网络的隔离使用了net namespace。但容器间需要通信，同时容器也需要和宿主通信。因此提供了**Veth设备**。 **两个命名空间之间的通信，需要使用一个Veth设备对**。Veth设备总是成对出现的，它们组成了一个数据的通道，数据从一个设备进入，就会从另一个设备出来。因此，veth设备常用来连接两个网络设备。
 
 示例：
 ```shell

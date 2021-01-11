@@ -601,7 +601,7 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 }
 ```
 
-5. **执行具体OS的容器创建工作，包括了执行实际的文件挂载**
+5. **执行具体OS的容器创建工作，包括了尝试执行实际的文件挂载**
 
 回到`create`函数，上述注册完挂载点后，调用`createContainerOSSpecificSettings`进行容器具体的创建工作，即对读写层的实际创建和mount，此部分的工作都在目录`/var/lib/docker/{fsdriver}`中完成,比如`/var/lib/docker/overlay2`：
 ```go
@@ -620,6 +620,7 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 	if err := daemon.Mount(container); err != nil {
 		return err
 	}
+	//注意挂载执行后再卸载掉，此处猜测是进行挂载尝试？
 	defer daemon.Unmount(container)
 
 	rootIDs := daemon.idMapping.RootPair()
@@ -709,4 +710,294 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 
 ### ContainerStart
 
-接下来将启动容器，入口函数位于
+接下来将启动容器，入口函数位于`api/server/router/container/container_routes.go`的方法`func (s *containerRouter) postContainersStart(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error`
+
+进行版本校验后，进入backend的ContainerStart方法，具体实现为:
+```go
+// ContainerStart starts a container.
+func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.HostConfig, checkpoint string, checkpointDir string) error {
+	...
+	//根据container名称，从daemon的缓存中读取container对象
+	container, err := daemon.GetContainer(name)
+	...
+	//状态检查
+	validateState := func() error {
+		container.Lock()
+		defer container.Unlock()
+
+		if container.Paused {
+			return errdefs.Conflict(errors.New("cannot start a paused container, try unpause instead"))
+		}
+
+		if container.Running {
+			return containerNotModifiedError{running: true}
+		}
+
+		if container.RemovalInProgress || container.Dead {
+			return errdefs.Conflict(errors.New("container is marked for removal and cannot be started"))
+		}
+		return nil
+	}
+	if err := validateState(); err != nil {
+		return err
+	}
+	
+	//处理container启动时，daemon缓存的hostConfig配置与api接口接收的配置不一致问题，1.12版本后已废弃
+	if runtime.GOOS != "windows" {
+		// This is kept for backward compatibility - hostconfig should be passed when
+		// creating a container, not during start.
+		//hostconfig为api接口接收的配置信息
+		if hostConfig != nil {
+			logrus.Warn("DEPRECATED: Setting host configuration options when the container starts is deprecated and has been removed in Docker 1.12")
+			//container容器缓存的配置信息
+			oldNetworkMode := container.HostConfig.NetworkMode
+			if err := daemon.setSecurityOptions(container, hostConfig); err != nil {
+				return errdefs.InvalidParameter(err)
+			}
+			if err := daemon.mergeAndVerifyLogConfig(&hostConfig.LogConfig); err != nil {
+				return errdefs.InvalidParameter(err)
+			}
+			if err := daemon.setHostConfig(container, hostConfig); err != nil {
+				return errdefs.InvalidParameter(err)
+			}
+			newNetworkMode := container.HostConfig.NetworkMode
+			if string(oldNetworkMode) != string(newNetworkMode) {
+				// if user has change the network mode on starting, clean up the
+				// old networks. It is a deprecated feature and has been removed in Docker 1.12
+				container.NetworkSettings.Networks = nil
+				if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+					return errdefs.System(err)
+				}
+			}
+			container.InitDNSHostConfig()
+		}
+	} else {
+		if hostConfig != nil {
+			return errdefs.InvalidParameter(errors.New("Supplying a hostconfig on start is not supported. It should be supplied on create"))
+		}
+	}
+	
+	// check if hostConfig is in line with the current system settings.
+	// It may happen cgroups are umounted or the like.
+	//检查container的各项配置，主要是语法检查
+	//包括了：
+	//  - config配置：    1. workdir路径是否为绝对路径 2.环境变量语法是否正确 3.healthCheck配置参数合法性
+	//  - hostConfig配置: 1. mount配置 2.extraHost配置 3.port映射 4.restartPolicy 5.capabilites配置
+	if _, err = daemon.verifyContainerSettings(container.OS, container.HostConfig, nil, false); err != nil {
+		return errdefs.InvalidParameter(err)
+	}
+	...
+	return daemon.containerStart(container, checkpoint, checkpointDir, true)
+}
+```
+上述代码完成了hostConfig和config的配置校验，继续进入`daemon.containerStart(container, checkpoint, checkpointDir, true)`:
+```go
+// containerStart prepares the container to run by setting up everything the
+// container needs, such as storage and networking, as well as links
+// between containers. The container is left waiting for a signal to
+// begin running.
+func (daemon *Daemon) containerStart(container *container.Container, checkpoint string, checkpointDir string, resetRestartManager bool) (err error) {
+	start := time.Now()
+	container.Lock()
+	defer container.Unlock()
+	...//状态检查
+	...//以下函数分为了几大步
+```
+1. **挂载congtainer中Mount字段描述的文件，同【创建容器】的步骤【6】**
+```go
+	//内部调用daemon.Mount(container)方法，同【创建容器】的步骤【6】，最终根据实际驱动mount config中配置
+	if err := daemon.conditionalMountOnStart(container); err != nil {
+		return err
+	}
+```
+
+2. **初始化容器网络**
+```go 
+	if err := daemon.initializeNetworking(container); err != nil {
+		return err
+	}	
+```	
+进入函数内部：
+```go
+//根据docker网络的类型container/bridge/host分别处理
+func (daemon *Daemon) initializeNetworking(container *container.Container) error {
+	var err error
+	//1. container类型：获取要连接的container,将后者中的hostname等配置赋值给要启动的container
+	if container.HostConfig.NetworkMode.IsContainer() {
+		// we need to get the hosts files from the container to join
+		nc, err := daemon.getNetworkedContainer(container.ID, container.HostConfig.NetworkMode.ConnectedContainer())
+		...
+		err = daemon.initializeNetworkingPaths(container, nc)
+		...
+		container.Config.Hostname = nc.Config.Hostname
+		container.Config.Domainname = nc.Config.Domainname
+		return nil
+	}
+	//2. host类型：将宿主的hostname赋值给container
+	if container.HostConfig.NetworkMode.IsHost() {
+		if container.Config.Hostname == "" {
+			container.Config.Hostname, err = os.Hostname()
+			...
+		}
+	}
+	//3. default(bridge)类型的处理
+	if err := daemon.allocateNetwork(container); err != nil {
+		return err
+	}
+	return container.BuildHostnameFile()
+}
+```
+对于docker默认的bridge类型，调用`daemon.allocateNetwork(container)`,继续进入函数：
+```go
+func (daemon *Daemon) allocateNetwork(container *container.Container) error {
+	start := time.Now()
+	controller := daemon.netController
+	...
+	// Cleanup any stale sandbox left over due to ungraceful daemon shutdown
+	if err := controller.SandboxDestroy(container.ID); err != nil {
+		logrus.Errorf("failed to cleanup up stale network sandbox for container %s", container.ID)
+	}
+	...
+	updateSettings := false
+	//如果没有配置network，将container中的属性至空，返回
+	if len(container.NetworkSettings.Networks) == 0 {
+		daemon.updateContainerNetworkSettings(container, nil)
+		updateSettings = true
+	}
+	// always connect default network first since only default
+	// network mode support link and we need do some setting
+	// on sandbox initialize for link, but the sandbox only be initialized
+	// on first network connecting.
+	defaultNetName := runconfig.DefaultDaemonNetworkMode().NetworkName()
+	//设置default network, bridge模式
+	if nConf, ok := container.NetworkSettings.Networks[defaultNetName]; ok {
+		//清除network相关的所有配置
+		cleanOperationalData(nConf)
+		//连接到指定网络，具体操作为创建/获取sandbox, 将config中的endPoint接入sandbox.
+		//endpoint对应于Veth设备，sandbox为Linux network namespace， 这里的network即为linux bridge
+		//详细参考 https://developer.51cto.com/art/202010/629789.htm
+		if err := daemon.connectToNetwork(container, defaultNetName, nConf.EndpointSettings, updateSettings); err != nil {
+			return err
+		}
+
+	}
+
+	// the intermediate map is necessary because "connectToNetwork" modifies "container.NetworkSettings.Networks"
+	networks := make(map[string]*network.EndpointSettings)
+	for n, epConf := range container.NetworkSettings.Networks {
+		if n == defaultNetName {
+			continue
+		}
+		networks[n] = epConf
+	}
+	//非默认network，遍历run时声明连接的网络
+	for netName, epConf := range networks {
+		//和default network处理相同
+		cleanOperationalData(epConf)
+		if err := daemon.connectToNetwork(container, netName, epConf.EndpointSettings, updateSettings); err != nil {
+			return err
+		}
+	}
+
+	// If the container is not to be connected to any network,
+	// create its network sandbox now if not present
+	//如果没有配置网络，即为none，且没有创建none的sandbox，创建之
+	if len(networks) == 0 {
+		if nil == daemon.getNetworkSandbox(container) {
+			options, err := daemon.buildSandboxOptions(container)
+			if err != nil {
+				return err
+			}
+			sb, err := daemon.netController.NewSandbox(container.ID, options...)
+			if err != nil {
+				return err
+			}
+			updateSandboxNetworkSettings(container, sb)
+			defer func() {
+				if err != nil {
+					sb.Delete()
+				}
+			}()
+		}
+
+	}
+	
+	if _, err := container.WriteHostConfig(); err != nil {
+		return err
+	}
+	networkActions.WithValues("allocate").UpdateSince(start)
+	return nil
+}
+```
+3. **创建oci标准的spec**
+```go
+	spec, err := daemon.createSpec(container)
+	...
+	if resetRestartManager {
+		container.ResetRestartManager(true)
+		container.HasBeenManuallyStopped = false
+	}
+
+	if err := daemon.saveApparmorConfig(container); err != nil {
+		return err
+	}
+
+	if checkpoint != "" {
+		checkpointDir, err = getCheckpointDir(checkpointDir, checkpoint, container.Name, container.ID, container.CheckpointDir(), false)
+		if err != nil {
+			return err
+		}
+	}
+
+	createOptions, err := daemon.getLibcontainerdCreateOptions(container)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.TODO()
+
+	err = daemon.containerd.Create(ctx, container.ID, spec, createOptions)
+	if err != nil {
+		if errdefs.IsConflict(err) {
+			logrus.WithError(err).WithField("container", container.ID).Error("Container not cleaned up from containerd from previous run")
+			// best effort to clean up old container object
+			daemon.containerd.DeleteTask(ctx, container.ID)
+			if err := daemon.containerd.Delete(ctx, container.ID); err != nil && !errdefs.IsNotFound(err) {
+				logrus.WithError(err).WithField("container", container.ID).Error("Error cleaning up stale containerd container object")
+			}
+			err = daemon.containerd.Create(ctx, container.ID, spec, createOptions)
+		}
+		if err != nil {
+			return translateContainerdStartErr(container.Path, container.SetExitCode, err)
+		}
+	}
+
+	// TODO(mlaventure): we need to specify checkpoint options here
+	pid, err := daemon.containerd.Start(context.Background(), container.ID, checkpointDir,
+		container.StreamConfig.Stdin() != nil || container.Config.Tty,
+		container.InitializeStdio)
+	if err != nil {
+		if err := daemon.containerd.Delete(context.Background(), container.ID); err != nil {
+			logrus.WithError(err).WithField("container", container.ID).
+				Error("failed to delete failed start container")
+		}
+		return translateContainerdStartErr(container.Path, container.SetExitCode, err)
+	}
+
+	container.SetRunning(pid, true)
+	container.HasBeenStartedBefore = true
+	daemon.setStateCounter(container)
+
+	daemon.initHealthMonitor(container)
+
+	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+		logrus.WithError(err).WithField("container", container.ID).
+			Errorf("failed to store container")
+	}
+
+	daemon.LogContainerEvent(container, "start")
+	containerActions.WithValues("start").UpdateSince(start)
+
+	return nil
+}
+```

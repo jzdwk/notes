@@ -930,47 +930,171 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 }
 ```
 3. **创建oci标准的spec**
+
 ```go
 	spec, err := daemon.createSpec(container)
 	...
+```
+其中，oci的spec位于[oci标准的runtime-spec定义](https://github.com/opencontainers/runtime-spec/blob/master/specs-go/config.go)
+```go
+// Spec is the base configuration for the container.
+type Spec struct {
+	// Version of the Open Container Initiative Runtime Specification with which the bundle complies.
+	Version string `json:"ociVersion"`
+	// Process configures the container process.
+	Process *Process `json:"process,omitempty"`
+	// Root configures the container's root filesystem.
+	Root *Root `json:"root,omitempty"`
+	// Hostname configures the container's hostname.
+	Hostname string `json:"hostname,omitempty"`
+	// Mounts configures additional mounts (on top of Root).
+	Mounts []Mount `json:"mounts,omitempty"`
+	// Hooks configures callbacks for container lifecycle events.
+	Hooks *Hooks `json:"hooks,omitempty" platform:"linux,solaris"`
+	// Annotations contains arbitrary metadata for the container.
+	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// Linux is platform-specific configuration for Linux based containers.
+	Linux *Linux `json:"linux,omitempty" platform:"linux"`
+	// Solaris is platform-specific configuration for Solaris based containers.
+	Solaris *Solaris `json:"solaris,omitempty" platform:"solaris"`
+	// Windows is platform-specific configuration for Windows based containers.
+	Windows *Windows `json:"windows,omitempty" platform:"windows"`
+	// VM specifies configuration for virtual-machine-based containers.
+	VM *VM `json:"vm,omitempty" platform:"vm"`
+}
+```
+进入`createSpec`函数内部：
+```go
+func (daemon *Daemon) createSpec(c *container.Container) (retSpec *specs.Spec, err error) {
+	var (
+		//opts为一个函数数组，这个函数用于将container的属性信息封装/转化为oci的规范spec
+		// SpecOpts sets spec specific information to a newly generated OCI spec
+		//type SpecOpts func(context.Context, Client, *containers.Container, *Spec) error
+		opts []coci.SpecOpts
+		//初始化oci规范的默认spec
+		s    = oci.DefaultSpec()
+	)
+	//定义不同种类的opt函数
+	opts = append(opts,
+		WithCommonOptions(daemon, c),
+		WithCgroups(daemon, c),
+		WithResources(c),
+		WithSysctls(c),
+		WithDevices(daemon, c),
+		WithUser(c),
+		WithRlimits(daemon, c),
+		WithNamespaces(daemon, c),
+		WithCapabilities(c),
+		WithSeccomp(daemon, c),
+		WithMounts(daemon, c),
+		WithLibnetwork(daemon, c),
+		WithApparmor(c),
+		WithSelinux(c),
+		WithOOMScore(&c.HostConfig.OomScoreAdj),
+	)
+	if c.NoNewPrivileges {
+		opts = append(opts, coci.WithNoNewPrivileges)
+	}
+	
+	// Set the masked and readonly paths with regard to the host config options if they are set.
+	if c.HostConfig.MaskedPaths != nil {
+		opts = append(opts, coci.WithMaskedPaths(c.HostConfig.MaskedPaths))
+	}
+	if c.HostConfig.ReadonlyPaths != nil {
+		opts = append(opts, coci.WithReadonlyPaths(c.HostConfig.ReadonlyPaths))
+	}
+	if daemon.configStore.Rootless {
+		opts = append(opts, WithRootless)
+	}
+	//执行各项opt函数，并返回spec
+	return &s, coci.ApplyOpts(context.Background(), nil, &containers.Container{
+		ID: c.ID,
+	}, &s, opts...)
+}
+```
+比如以第一个`opt`函数``为例:
+```go
+// WithCommonOptions sets common docker options
+func WithCommonOptions(daemon *Daemon, c *container.Container) coci.SpecOpts {
+	//返回一个基于基本的docker run设置的oci spec
+	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
+		...//检查BaseFS
+		//环境变量
+		linkedEnv, err := daemon.setupLinkedContainers(c)
+		...
+		s.Root = &specs.Root{
+			Path:     c.BaseFS.Path(),
+			Readonly: c.HostConfig.ReadonlyRootfs,
+		}
+		//work dir
+		if err := c.SetupWorkingDirectory(daemon.idMapping.RootPair()); err != nil {
+			return err
+		}
+		cwd := c.Config.WorkingDir
+		if len(cwd) == 0 {
+			cwd = "/"
+		}
+		//执行命令的args
+		s.Process.Args = append([]string{c.Path}, c.Args...)
+
+		// only add the custom init if it is specified and the container is running in its
+		// own private pid namespace.  It does not make sense to add if it is running in the
+		// host namespace or another container's pid namespace where we already have an init
+		if c.HostConfig.PidMode.IsPrivate() {
+			if (c.HostConfig.Init != nil && *c.HostConfig.Init) ||
+				(c.HostConfig.Init == nil && daemon.configStore.Init) {
+				s.Process.Args = append([]string{inContainerInitPath, "--", c.Path}, c.Args...)
+				path := daemon.configStore.InitPath
+				if path == "" {
+					path, err = exec.LookPath(daemonconfig.DefaultInitBinary)
+					if err != nil {
+						return err
+					}
+				}
+				s.Mounts = append(s.Mounts, specs.Mount{
+					Destination: inContainerInitPath,
+					Type:        "bind",
+					Source:      path,
+					Options:     []string{"bind", "ro"},
+				})
+			}
+		}
+		//将container里解析的配置进spec
+		s.Process.Cwd = cwd
+		s.Process.Env = c.CreateDaemonEnvironment(c.Config.Tty, linkedEnv)
+		s.Process.Terminal = c.Config.Tty
+		s.Hostname = c.Config.Hostname
+		setLinuxDomainname(c, s)
+		return nil
+	}
+}
+```
+4. **调用containerd，创建容器**
+```go
+	
 	if resetRestartManager {
 		container.ResetRestartManager(true)
 		container.HasBeenManuallyStopped = false
 	}
-
+	//AppArmor(Application Armor)设置 https://docs.docker.com/engine/security/apparmor/
 	if err := daemon.saveApparmorConfig(container); err != nil {
 		return err
 	}
-
+	//check point
 	if checkpoint != "" {
 		checkpointDir, err = getCheckpointDir(checkpointDir, checkpoint, container.Name, container.ID, container.CheckpointDir(), false)
-		if err != nil {
-			return err
-		}
 	}
 
 	createOptions, err := daemon.getLibcontainerdCreateOptions(container)
-	if err != nil {
-		return err
-	}
+	...
 
 	ctx := context.TODO()
-
+	//调用containerd
 	err = daemon.containerd.Create(ctx, container.ID, spec, createOptions)
-	if err != nil {
-		if errdefs.IsConflict(err) {
-			logrus.WithError(err).WithField("container", container.ID).Error("Container not cleaned up from containerd from previous run")
-			// best effort to clean up old container object
-			daemon.containerd.DeleteTask(ctx, container.ID)
-			if err := daemon.containerd.Delete(ctx, container.ID); err != nil && !errdefs.IsNotFound(err) {
-				logrus.WithError(err).WithField("container", container.ID).Error("Error cleaning up stale containerd container object")
-			}
-			err = daemon.containerd.Create(ctx, container.ID, spec, createOptions)
-		}
-		if err != nil {
-			return translateContainerdStartErr(container.Path, container.SetExitCode, err)
-		}
-	}
+	...
+```
+
 
 	// TODO(mlaventure): we need to specify checkpoint options here
 	pid, err := daemon.containerd.Start(context.Background(), container.ID, checkpointDir,

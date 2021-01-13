@@ -968,7 +968,7 @@ type Spec struct {
 ```go
 func (daemon *Daemon) createSpec(c *container.Container) (retSpec *specs.Spec, err error) {
 	var (
-		//opts为一个函数数组，这个函数用于将container的属性信息封装/转化为oci的规范spec
+		//opts为一个函数数组，这个函数用于将container、client、context的信息注入oci的规范spec
 		// SpecOpts sets spec specific information to a newly generated OCI spec
 		//type SpecOpts func(context.Context, Client, *containers.Container, *Spec) error
 		opts []coci.SpecOpts
@@ -1007,7 +1007,7 @@ func (daemon *Daemon) createSpec(c *container.Container) (retSpec *specs.Spec, e
 	if daemon.configStore.Rootless {
 		opts = append(opts, WithRootless)
 	}
-	//执行各项opt函数，并返回spec
+	//执行各项opt函数，将container、client、context的信息注入spec，并返回spec
 	return &s, coci.ApplyOpts(context.Background(), nil, &containers.Container{
 		ID: c.ID,
 	}, &s, opts...)
@@ -1070,14 +1070,13 @@ func WithCommonOptions(daemon *Daemon, c *container.Container) coci.SpecOpts {
 	}
 }
 ```
-4. **调用containerd，创建容器**
+4. **创建containerd定义的container容器**
 ```go
-	
 	if resetRestartManager {
 		container.ResetRestartManager(true)
 		container.HasBeenManuallyStopped = false
 	}
-	//AppArmor(Application Armor)设置 https://docs.docker.com/engine/security/apparmor/
+	//AppArmor(Application Armor)设置， 详细内容参考 https://docs.docker.com/engine/security/apparmor/
 	if err := daemon.saveApparmorConfig(container); err != nil {
 		return err
 	}
@@ -1085,43 +1084,73 @@ func WithCommonOptions(daemon *Daemon, c *container.Container) coci.SpecOpts {
 	if checkpoint != "" {
 		checkpointDir, err = getCheckpointDir(checkpointDir, checkpoint, container.Name, container.ID, container.CheckpointDir(), false)
 	}
-
+	//runC的配置
 	createOptions, err := daemon.getLibcontainerdCreateOptions(container)
 	...
-
-	ctx := context.TODO()
-	//调用containerd
+	//调用containerd的接口
 	err = daemon.containerd.Create(ctx, container.ID, spec, createOptions)
 	...
 ```
-
-
-	// TODO(mlaventure): we need to specify checkpoint options here
-	pid, err := daemon.containerd.Start(context.Background(), container.ID, checkpointDir,
-		container.StreamConfig.Stdin() != nil || container.Config.Tty,
-		container.InitializeStdio)
-	if err != nil {
-		if err := daemon.containerd.Delete(context.Background(), container.ID); err != nil {
-			logrus.WithError(err).WithField("container", container.ID).
-				Error("failed to delete failed start container")
-		}
-		return translateContainerdStartErr(container.Path, container.SetExitCode, err)
+进入`create函数`：
+```go
+func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, runtimeOptions interface{}, opts ...containerd.NewContainerOpts) error {
+	bdir := c.bundleDir(id)
+	//创建newOpts函数数组，函数NewContainerOpts的作用为：允许调用者在创建容器时设置额外的选项
+	newOpts := []containerd.NewContainerOpts{
+		//withSpec返回的NewContainerOpts函数内部逻辑为：循环调用SpecOpts的函数，因为参数中没有opts，因此其主要作用为将spec赋值给container的Spec字段,即c.Spec, err = typeurl.MarshalAny(s)
+		containerd.WithSpec(ociSpec),
+		//withRuntime返回的NewContainerOpts函数内部逻辑为：向container写入runtime信息
+		containerd.WithRuntime(runtimeName, runtimeOptions),
+		////withBundle返回的NewContainerOpts函数内部逻辑为：向container的label中写入containers bundle path信息，key为com.docker/engine.bundle.path
+		WithBundle(bdir, ociSpec),
 	}
+	opts = append(opts, newOpts...)
 
-	container.SetRunning(pid, true)
-	container.HasBeenStartedBefore = true
-	daemon.setStateCounter(container)
-
-	daemon.initHealthMonitor(container)
-
-	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
-		logrus.WithError(err).WithField("container", container.ID).
-			Errorf("failed to store container")
-	}
-
-	daemon.LogContainerEvent(container, "start")
-	containerActions.WithValues("start").UpdateSince(start)
-
+	_, err := c.client.NewContainer(ctx, id, opts...)
+	...
 	return nil
 }
 ```
+继续看`NewContainer`函数，此函数的作用为重新创建一个container对象，**注意，此处的container对象已经不是docker中定义的container了(github.com/docker/docker/container/container.go), 而是containerd包中定义的container对象（github.com/containerd/containerd/containers/containers.go）**， 并将之前的spec/runtime/bundle path赋值给此对象。
+```
+// NewContainer will create a new container in container with the provided id
+// the id must be unique within the namespace
+func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContainerOpts) (Container, error) {
+	//向ctx中设置lease 类似ttl
+	ctx, done, err := c.WithLease(ctx)
+	...
+	//封装一个containerd定义的container对象
+	container := containers.Container{
+		ID: id,
+		Runtime: containers.RuntimeInfo{
+			Name: c.runtime,
+		},
+	}
+	//执行NewContainerOpts数组，向container中赋值spec,runtime，bundle path
+	for _, o := range opts {
+		if err := o(ctx, c, &container); err != nil {
+			return nil, err
+		}
+	}
+	r, err := c.ContainerService().Create(ctx, container)
+	...
+	return containerFromRecord(c, r), nil
+}
+```
+至此，我们能够看到docker架构演进的痕迹，docker daemon首先根据run的内容创建一个container对象，并根据oci的spec约束，将container对象中的各个信息赋值给新创建的spec，然后再将这个spec赋值给containerd的container，调用containerd的接口。
+即`docker daemon->containerd->runtime`.
+
+5. **使用grpc调用containerd**
+
+docker daemon调用containerd使用了grpc，进入上一步的`c.ContainerService().Create(ctx, container)`:
+```go
+func (c *containersClient) Create(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*CreateContainerResponse, error) {
+	out := new(CreateContainerResponse)
+	err := c.cc.Invoke(ctx, "/containerd.services.containers.v1.Containers/Create", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+```
+

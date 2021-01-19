@@ -112,7 +112,7 @@ func (cli *Client) ImagePull(ctx context.Context, refStr string, options types.I
 
 ## docker daemon
 
-docker daemon的api相关代码位于docker-ce/engine/api/server/router/\*，并根据不同的模块分为了container，network，image等包。根据client端的pull请求，定位到以下path定义：
+docker daemon的api相关代码位于moby/api/server/router/\*，并根据不同的模块分为了container，network，image等包。根据client端的pull请求，定位到以下path定义：
 ```go
 func (r *imageRouter) initRoutes() {
 	r.routes = []router.Route{

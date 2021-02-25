@@ -456,7 +456,7 @@ build = {
 ├── kong-plugin-my-plugin-0.0.1-1.rockspec
 ```
 
-3. 执行`luarocks make`,此步执行完后，会在目录`/usr/local/lib/luarocks/rocks-5.1`中，添加名为`kong-plugin-my-plugin`的目录。
+3. 执行`luarocks make`,此步执行完后，会在目录`/usr/local/lib/luarocks/rocks-5.1`中，添加名为`kong-plugin-my-plugin`的目录，该目录描述了要执行的lua脚本，而脚本的真正位置位于`/usr/local/share/lua/5.1/kong/plugins`下。
 
 4. 以上为本地plugin源码安装，也可以将其打包为：
 ```shell

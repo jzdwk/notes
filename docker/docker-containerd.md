@@ -67,6 +67,8 @@ containerd的namespaces、client options可[移步](https://github.com/container
 
 ## grpc service define
 
+以下内容基于containerd [!v1.2](https://github.com/containerd/containerd/tree/release/1.2) 版本
+
 containerd的grpc服务定义位于`/containerd/api/services/containers/v1/containers.proto`，可以看到对容器crud的定义:
 ```
 service Containers {
@@ -181,25 +183,13 @@ disabled_plugins = ["cri"]
 			return err
 		}
 		
-		// Make sure top-level directories are created early.
-		// 根据config的root、state属性创建目录
-		// 默认的config.root，即config.toml中描述的root = "/var/lib/containerd"
-		// config.state = "/run/containerd"
-		if err := server.CreateTopLevelDirectories(config); err != nil {
-			return err
-		}
 		...
 		// cleanup temp mounts
 		...
 		// config中的grpc
-		if config.GRPC.Address == "" {
-			return errors.Wrap(errdefs.ErrInvalidArgument, "grpc address cannot be empty")
-		}
-		if config.TTRPC.Address == "" {
-			// If TTRPC was not explicitly configured, use defaults based on GRPC.
-			config.TTRPC.Address = fmt.Sprintf("%s.ttrpc", config.GRPC.Address)
-			config.TTRPC.UID = config.GRPC.UID
-			config.TTRPC.GID = config.GRPC.GID
+		address := config.GRPC.Address
+		if address == "" {
+			return errors.New("grpc address cannot be empty")
 		}
 		...
 ```
@@ -211,62 +201,119 @@ disabled_plugins = ["cri"]
 	}
 //进入New函数	
 func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
-	//config timeout设置，
+	//config的route/state属性检查
 	...
-	//加载plugins
+	//根据config描述，创建root/state目录
+	...
+	//加载plugins对象
 	plugins, err := LoadPlugins(ctx, config)
-	...
-	for id, p := range config.StreamProcessors {
-		diff.RegisterProcessor(diff.BinaryHandler(id, p.Returns, p.Accepts, p.Path, p.Args, p.Env))
+```
+这里重点关注`loadPlugins`函数，该函数
+1. 首先从config的root目录茜load插件，load的插件以及方式为[golang 插件](https://draveness.me/golang/docs/part4-advanced/ch08-metaprogramming/golang-plugin/)。
+2. 向返回的注册列表Registration中添加内置插件，包括了ContentPlugin、MetadataPlugin
+3. 返回的plugins为一个Registration对象的数组。数组中每个Registration对象定义了自己的plugin类型/Id/初始化方法InitFn/个性化配置config。
+```go
+func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Registration, error) {
+	// load all plugins into containerd
+	// 从../root/plugins目录下load插件
+	if err := plugin.Load(filepath.Join(config.Root, "plugins")); err != nil {
+		return nil, err
 	}
+	// load additional plugins that don't automatically register themselves
+	// 注册内置插件
+	plugin.Register(&plugin.Registration{
+		Type: plugin.ContentPlugin,
+		ID:   "content",
+		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+			ic.Meta.Exports["root"] = ic.Root
+			return local.NewStore(ic.Root)
+		},
+	})
+	plugin.Register(&plugin.Registration{
+		Type: plugin.MetadataPlugin,
+		ID:   "bolt",
+		Requires: []plugin.Type{
+			plugin.ContentPlugin,
+			plugin.SnapshotPlugin,
+		},
+		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+			...
+		},
+	})
+
+	clients := &proxyClients{}
+	for name, pp := range config.ProxyPlugins {
+		var (
+			t plugin.Type
+			f func(*grpc.ClientConn) interface{}
+
+			address = pp.Address
+		)
+
+		switch pp.Type {
+		case string(plugin.SnapshotPlugin), "snapshot":
+			t = plugin.SnapshotPlugin
+			ssname := name
+			f = func(conn *grpc.ClientConn) interface{} {
+				return ssproxy.NewSnapshotter(ssapi.NewSnapshotsClient(conn), ssname)
+			}
+
+		case string(plugin.ContentPlugin), "content":
+			t = plugin.ContentPlugin
+			f = func(conn *grpc.ClientConn) interface{} {
+				return csproxy.NewContentStore(csapi.NewContentClient(conn))
+			}
+		default:
+			log.G(ctx).WithField("type", pp.Type).Warn("unknown proxy plugin type")
+		}
+
+		plugin.Register(&plugin.Registration{
+			Type: t,
+			ID:   name,
+			InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+				ic.Meta.Exports["address"] = address
+				conn, err := clients.getClient(address)
+				if err != nil {
+					return nil, err
+				}
+				return f(conn), nil
+			},
+		})
+
+	}
+
+	// return the ordered graph for plugins
+	// 返回的插件列表中剔除了config.DisabledPlugins中的配置项
+	return plugin.Graph(config.DisabledPlugins), nil
+}
+```
+继续回到server的New：
+```go
+	...
 	//创建grpc服务
 	serverOpts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
 		grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
 	}
-	//设置max send/recv msg size
 	...
-	//
-	ttrpcServer, err := newTTRPCServer()
+	rpc := grpc.NewServer(serverOpts...)
 	...
-	tcpServerOpts := serverOpts
-	// tls 配置
-	if config.GRPC.TCPTLSCert != "" {
-		log.G(ctx).Info("setting up tls on tcp GRPC services...")
-		creds, err := credentials.NewServerTLSFromFile(config.GRPC.TCPTLSCert, config.GRPC.TCPTLSKey)
-		...
-		tcpServerOpts = append(tcpServerOpts, grpc.Creds(creds))
-	}
+	//声明service对象
 	var (
-		
-		grpcServer = grpc.NewServer(serverOpts...)
-		tcpServer  = grpc.NewServer(tcpServerOpts...)
-
-		grpcServices  []plugin.Service
-		tcpServices   []plugin.TCPService
-		ttrpcServices []plugin.TTRPCService
-		//封装Servier对象，包括了grpc服务、tcp服务
-		s = &Server{
-			grpcServer:  grpcServer,
-			tcpServer:   tcpServer,
-			ttrpcServer: ttrpcServer,
-			events:      exchange.NewExchange(),
-			config:      config,
+		services []plugin.Service
+		s        = &Server{
+			rpc:    rpc,
+			events: exchange.NewExchange(),
+			config: config,
 		}
+		//记录已加载的plugin的集合
 		initialized = plugin.NewPluginSet()
-		required    = make(map[string]struct{})
 	)
-	//plugins是否存在校验
-	for _, r := range config.RequiredPlugins {
-		required[r] = struct{}{}
-	}
+	//遍历刚才注册的所有plugins
 	for _, p := range plugins {
 		id := p.URI()
-		reqID := id
-		if config.GetVersion() == 1 {
-			reqID = p.ID
-		}
 		...
+		//初始化initContext，该对象作为plugin调用InitFn的入参
 		initContext := plugin.NewContext(
 			ctx,
 			p,
@@ -276,67 +323,44 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 		)
 		initContext.Events = s.events
 		initContext.Address = config.GRPC.Address
-		initContext.TTRPCAddress = config.TTRPC.Address
-
-		// load the plugin specific configuration if it is provided
+		//load the plugin specific configuration if it is provided
+		//load plugin的自定义config配置
 		if p.Config != nil {
-			pc, err := config.Decode(p)
-			if err != nil {
-				return nil, err
-			}
-			initContext.Config = pc
+			pluginConfig, err := config.Decode(p.ID, p.Config)
+			...
+			initContext.Config = pluginConfig
 		}
-		//初始化plugin
+		//调用Registration的InitFn方法。每个注册的plugin需要定义该接口
 		result := p.Init(initContext)
+		//加入全局的已初始化plugin集合
 		if err := initialized.Add(result); err != nil {
 			return nil, errors.Wrapf(err, "could not add plugin result to plugin set")
 		}
 		instance, err := result.Instance()
 		...
-		delete(required, reqID)
+		//如果这个plugin实现了Service接口，说明提供了grpc服务，加入服务集合services，并在之后注册服务
 		// check for grpc services that should be registered with the server
-		// 已Load并初始化后的plugin添加进service集合
-		if src, ok := instance.(plugin.Service); ok {
-			grpcServices = append(grpcServices, src)
-		}
-		if src, ok := instance.(plugin.TTRPCService); ok {
-			ttrpcServices = append(ttrpcServices, src)
-		}
-		if service, ok := instance.(plugin.TCPService); ok {
-			tcpServices = append(tcpServices, service)
+		if service, ok := instance.(plugin.Service); ok {
+			services = append(services, service)
 		}
 		s.plugins = append(s.plugins, result)
 	}
-	...
 	// register services after all plugins have been initialized
-	// 注册不同plugins
-	for _, service := range grpcServices {
-		if err := service.Register(grpcServer); err != nil {
-			return nil, err
-		}
-	}
-	for _, service := range ttrpcServices {
-		if err := service.RegisterTTRPC(ttrpcServer); err != nil {
-			return nil, err
-		}
-	}
-	for _, service := range tcpServices {
-		if err := service.RegisterTCP(tcpServer); err != nil {
+	// 逐个注册grpc服务
+	for _, service := range services {
+		if err := service.Register(rpc); err != nil {
 			return nil, err
 		}
 	}
 	return s, nil
-}	
+}
 				
 ```
+至此，server的创建工作完成，返回server对象并回到main.go的App()中:
 ```go
-		// Launch as a Windows Service if necessary
-		if err := launchService(server, done); err != nil {
-			logrus.Fatal(err)
-		}
-
+		...
 		serverC <- server
-
+		//debug地址配置，默认本地/run/containerd/debug.sock
 		if config.Debug.Address != "" {
 			var l net.Listener
 			if filepath.IsAbs(config.Debug.Address) {
@@ -350,6 +374,7 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 			}
 			serve(ctx, l, server.ServeDebug)
 		}
+		//监控监听
 		if config.Metrics.Address != "" {
 			l, err := net.Listen("tcp", config.Metrics.Address)
 			if err != nil {
@@ -357,40 +382,18 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 			}
 			serve(ctx, l, server.ServeMetrics)
 		}
-		// setup the ttrpc endpoint
-		tl, err := sys.GetLocalListener(config.TTRPC.Address, config.TTRPC.UID, config.TTRPC.GID)
-		if err != nil {
-			return errors.Wrapf(err, "failed to get listener for main ttrpc endpoint")
-		}
-		serve(ctx, tl, server.ServeTTRPC)
-
-		if config.GRPC.TCPAddress != "" {
-			l, err := net.Listen("tcp", config.GRPC.TCPAddress)
-			if err != nil {
-				return errors.Wrapf(err, "failed to get listener for TCP grpc endpoint")
-			}
-			serve(ctx, l, server.ServeTCP)
-		}
-		// setup the main grpc endpoint
-		l, err := sys.GetLocalListener(config.GRPC.Address, config.GRPC.UID, config.GRPC.GID)
-		if err != nil {
-			return errors.Wrapf(err, "failed to get listener for main endpoint")
-		}
+		//拉起服务，本地注册api
+		//创建unix的sock文件，位于/run/containerd/containerd.sock
+		l, err := sys.GetLocalListener(address, config.GRPC.UID, config.GRPC.GID)
+		...
+		//提供grpc服务的api
 		serve(ctx, l, server.ServeGRPC)
-
-		if err := notifyReady(ctx); err != nil {
-			log.G(ctx).WithError(err).Warn("notify ready failed")
-		}
-
-		log.G(ctx).Infof("containerd successfully booted in %fs", time.Since(start).Seconds())
 		<-done
 		return nil
 	}
 	return app
 }
 ```
-
-包含三个子命令，configCommand，publishCommand，ociHook
 
 ## container create
 

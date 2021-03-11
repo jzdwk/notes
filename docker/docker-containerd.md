@@ -210,8 +210,8 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 ```
 这里重点关注`loadPlugins`函数，该函数
 1. 首先从config的root目录茜load插件，load的插件以及方式为[golang 插件](https://draveness.me/golang/docs/part4-advanced/ch08-metaprogramming/golang-plugin/)。
-2. 向返回的注册列表Registration中添加内置插件，包括了ContentPlugin、MetadataPlugin
-3. 返回的plugins为一个Registration对象的数组。数组中每个Registration对象定义了自己的plugin类型/Id/初始化方法InitFn/个性化配置config。
+2. 定义插件的Registration,其中包括了plugin类型/Id/初始化方法InitFn/个性化配置config。并向/plugin/plugin.go的全局变量register中注册插件，包括了content/metadata plugin等。
+3. 返回Registration对象的数组，Registration对象数组用户后续的初始化工作。
 ```go
 func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Registration, error) {
 	// load all plugins into containerd
@@ -224,23 +224,29 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 	plugin.Register(&plugin.Registration{
 		Type: plugin.ContentPlugin,
 		ID:   "content",
+		//定义后续调用的init函数
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			ic.Meta.Exports["root"] = ic.Root
+			//在宿主机创建目录/var/lib/containerd/io.containerd.content.v1.content/ingest，其中io.containerd.content.v1.content为plugin type
 			return local.NewStore(ic.Root)
 		},
 	})
 	plugin.Register(&plugin.Registration{
 		Type: plugin.MetadataPlugin,
 		ID:   "bolt",
+		//依赖插件
 		Requires: []plugin.Type{
 			plugin.ContentPlugin,
 			plugin.SnapshotPlugin,
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+			//首先从initContext获取依赖插
+			//在目录/var/lib/containerd/io.containerd.metadata.v1.bolt创建meta.db文件
+			//返回一个数组存储对象
 			...
 		},
 	})
-
+	//使用grpc进行通信的plugin注册
 	clients := &proxyClients{}
 	for name, pp := range config.ProxyPlugins {
 		var (
@@ -249,7 +255,6 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 
 			address = pp.Address
 		)
-
 		switch pp.Type {
 		case string(plugin.SnapshotPlugin), "snapshot":
 			t = plugin.SnapshotPlugin
@@ -394,6 +399,9 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 	return app
 }
 ```
+以上是main函数的大致过程，其中比较重要的是plugin的处理。
+
+## plugin example
 
 ## container create
 
@@ -408,20 +416,22 @@ func (s *service) Create(ctx context.Context, req *api.CreateContainerRequest) (
 	//local为grpc服务的客户端，实现了ContainersClient接口
 	return s.local.Create(ctx, req)
 }
-//具体实现
+```
+具体实现如下，其调用过程为：
+```go
 func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ ...grpc.CallOption) (*api.CreateContainerResponse, error) {
 	var resp api.CreateContainerResponse
-
+	//定义核心的container处理逻辑，该逻辑作为函数变量最终被withStoreUpdate调用
 	if err := l.withStoreUpdate(ctx, func(ctx context.Context) error {
+		//接收请求，封装containerd自定义container对象
 		container := containerFromProto(&req.Container)
 		//创建
 		created, err := l.Store.Create(ctx, container)
 		if err != nil {
 			return err
 		}
-
+		//返回
 		resp.Container = containerToProto(&created)
-
 		return nil
 	}); err != nil {
 		return &resp, errdefs.ToGRPC(err)
@@ -439,5 +449,58 @@ func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ .
 	}
 
 	return &resp, nil
+}
+####################################################################################################
+//实际的执行时机，调用db的update，起事务执行
+func (l *local) withStoreUpdate(ctx context.Context, fn func(ctx context.Context, store containers.Store) error) error {
+	return l.db.Update(l.withStore(ctx, fn))
+}
+func (m *DB) Update(fn func(*bolt.Tx) error) error {
+	m.wlock.RLock()
+	defer m.wlock.RUnlock()
+	err := m.db.Update(fn)
+	if err == nil {
+		m.dirtyL.Lock()
+		dirty := m.dirtyCS || len(m.dirtySS) > 0
+		for _, fn := range m.mutationCallbacks {
+			fn(dirty)
+		}
+		m.dirtyL.Unlock()
+	}
+
+	return err
+}
+####################################################################################################
+//将事务封装进containerStore对象，并调用Create中定义的函数变量fn。同样的，这个调用过程也被定义为一个函数变量并返回
+func (l *local) withStore(ctx context.Context, fn func(ctx context.Context, store containers.Store) error) func(tx *bolt.Tx) error {
+	return func(tx *bolt.Tx) error { return fn(ctx, metadata.NewContainerStore(tx)) }
+}
+```
+上面的调用本质上是开启一个事务，将事务对象封装至containerStore对象，最后调用指定对象的创建方法。具体顺序为：
+```
+在最外层Create调用withStoreUpdate->调用Update开启事务->调用withStore封装containerStore->调最外层withStoreUpdate的第函数变量参数执行最终的create
+```
+进入`containerStore`的Create函数内部：
+```go
+func (s *containerStore) Create(ctx context.Context, container containers.Container) (containers.Container, error) {
+	namespace, err := namespaces.NamespaceRequired(ctx)
+	...
+	//check
+	if err := validateContainer(&container); err != nil {
+		return containers.Container{}, errors.Wrap(err, "create container failed validation")
+	}
+	//写db
+	bkt, err := createContainersBucket(s.tx, namespace)
+	if err != nil {
+		return containers.Container{}, err
+	}
+	cbkt, err := bkt.CreateBucket([]byte(container.ID))
+	...
+	container.CreatedAt = time.Now().UTC()
+	container.UpdatedAt = container.CreatedAt
+	if err := writeContainer(cbkt, &container); err != nil {
+		return containers.Container{}, errors.Wrapf(err, "failed to write container %q", container.ID)
+	}
+	return container, nil
 }
 ```

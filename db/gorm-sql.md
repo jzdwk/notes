@@ -162,7 +162,7 @@ type DB struct {
 	waitDuration int64 // Total time waited for new connections.
 	
 	//连接的基本信息
-	connector driver.Connector
+	connector driver.Connector	 // 数据库驱动接口
 	// numClosed is an atomic counter which represents a total number of
 	// closed connections. Stmt.openStmt checks it before cleaning closed
 	// connections in Stmt.css.
@@ -179,17 +179,17 @@ type DB struct {
 	// maybeOpenNewConnections sends on the chan (one send per needed connection)
 	// It is closed during db.Close(). The close tells the connectionOpener
 	// goroutine to exit.
-	openerCh          chan struct{}
+	openerCh          chan struct{}		// 通知需要创建新的连接
 	resetterCh        chan *driverConn
 	closed            bool
 	dep               map[finalCloser]depSet
 	lastPut           map[*driverConn]string // stacktrace of last conn's put; debug only
 	
-	//以下为连接池基本参数配置
+	//连接池基本参数配置
 	maxIdle           int                    // zero means defaultMaxIdleConns; negative means 0	
 	maxOpen           int                    // <= 0 means unlimited
 	maxLifetime       time.Duration          // maximum amount of time a connection may be reused
-	cleanerCh         chan struct{}
+	cleanerCh         chan struct{} 		// 用于通知清理过期的连接，maxlife时间改变或者连接被关闭时会通过该channel通知
 	waitCount         int64 // Total number of connections waited for.
 	maxIdleClosed     int64 // Total number of connections closed due to idle.
 	maxLifetimeClosed int64 // Total number of connections closed due to max free limit.
@@ -199,10 +199,19 @@ type DB struct {
 ```
 **需要注意的是，在OpenDB后，并没有真正的创建任何连接**，只是开启了两个协程，通过channel维护池中连接数量。**真正的创建连接操作在具体的query处**
 
-## 连接的创建
+## get connection
 
-以`	tx.callbacks.Query().Execute(tx)`代码为例，gorm的查询最终调用了`processor`中的fns。以Query的为例：
+以`	tx.callbacks.Query().Execute(tx)`代码为例，gorm的查询最终调用了`processor`中的fns，processor对象维护了CRUD场景中需要的各个执行函数，所以函数以有序数组的形式在初始化时被注册，具体内容和参考后文的**transaction与connection**。以Query的为例：
 ```go
+func (p *processor) Execute(db *DB) {
+	...
+	//执行业务链
+	for _, f := range p.fns {
+		f(db)
+	}
+	...
+}
+
 func Query(db *gorm.DB) {
 	if db.Error == nil {
 		//创建sql
@@ -429,4 +438,416 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 }
 ```
 
+## release connection
+
 ## transaction 与 connection
+
+### 注册函数链
+
+在分析transaction前，首先捋清gorm执行sql的大致流程，在上文的`Open`函数中，只说明了初始化一个db的抽象对象。但除此之外，**Open中也注册了执行sql时需要的各种业务函数，比如开启事务，执行查询，封装返回等，思路类似一个责任链**，继续看该函数:
+```go
+// Open initialize db session based on dialector
+func Open(dialector Dialector, opts ...Option) (db *DB, err error) {
+	config := &Config{}
+	...
+	//初始化CRUD场景中的各个processor对象，并返回封装的callbacks，内部结构为一个map[string,processor]，每个processor中只有db信息
+	db.callbacks = initializeCallbacks(db)
+	...
+	//初始化db
+	if config.Dialector != nil {
+		err = config.Dialector.Initialize(db)
+	}
+	...
+	return
+}
+//算上返回值处理，一共6个场景，6类处理函数
+func initializeCallbacks(db *DB) *callbacks {
+	return &callbacks{
+		processors: map[string]*processor{
+			"create": {db: db},
+			"query":  {db: db},
+			"update": {db: db},
+			"delete": {db: db},
+			"row":    {db: db},
+			"raw":    {db: db},
+		},
+	}
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
+	//注册真正需要执行的，在CRUD场景下的业务链
+	// register callbacks
+	callbacks.RegisterDefaultCallbacks(db, &callbacks.Config{
+		WithReturning: !dialector.WithoutReturning,
+	})
+	//省略，后续代码在上文已经分析
+	...
+	return
+}
+```
+继续看函数`func RegisterDefaultCallbacks(db *gorm.DB, config *Config)`，该函数即注册了具体的函数链:
+```go
+func RegisterDefaultCallbacks(db *gorm.DB, config *Config) {
+	//设置不跳过事务，在下列场景中的Match中被调用
+	enableTransaction := func(db *gorm.DB) bool {
+		return !db.SkipDefaultTransaction
+	}
+	//create场景，CallBack
+	createCallback := db.Callback().Create()
+	createCallback.Match(enableTransaction).Register("gorm:begin_transaction", BeginTransaction) //注册事务
+	createCallback.Register("gorm:before_create", BeforeCreate)
+	createCallback.Register("gorm:save_before_associations", SaveBeforeAssociations(true))
+	createCallback.Register("gorm:create", Create(config))
+	createCallback.Register("gorm:save_after_associations", SaveAfterAssociations(true))
+	createCallback.Register("gorm:after_create", AfterCreate)
+	createCallback.Match(enableTransaction).Register("gorm:commit_or_rollback_transaction", CommitOrRollbackTransaction)
+	//query场景
+	...
+	//delete场景
+	deleteCallback := db.Callback().Delete()
+	...
+	//update场景
+	...
+	//数据返回处理，row场景
+	db.Callback().Row().Register("gorm:row", RowQuery)
+	//raw场景
+	db.Callback().Raw().Register("gorm:raw", RawExec)
+}
+```
+以Create场景为例,其过程为：
+
+1. 获取create场景中具体的processor
+```go
+createCallback := db.Callback().Create()
+func (db *DB) Callback() *callbacks {
+	return db.callbacks
+}
+//processor的key为create
+func (cs *callbacks) Create() *processor {
+	return cs.processors["create"]
+}
+```
+2. 初始化一个callback对象，用于维护函数链
+```go
+createCallback.Match(enableTransaction).Register("gorm:begin_transaction", BeginTransaction)
+func (p *processor) Match(fc func(*DB) bool) *callback {
+	//match字段为true 反向引用processor
+	return &callback{match: fc, processor: p}
+}
+```
+3. 将BeginTransaction注册至具体的callback
+```go
+func (c *callback) Register(name string, fn func(*DB)) error {
+	c.name = name
+	c.handler = fn
+	c.processor.callbacks = append(c.processor.callbacks, c)
+	//执行complie的作用是将注册的函数进行排序，并放进processor的fns字段中，供执行类似Query时调用，具体可见上文的“connection获取”段落
+	return c.processor.compile()
+}
+```
+这里，将`db/callback/processor`等对象的依赖关系屡一下：
+```
+//DB 定义
+type DB struct {
+	*Config	//Config中维护了DB的大多数信息
+	Error        error
+	RowsAffected int64
+	Statement    *Statement
+	clone        int
+}
+// Config GORM config
+type Config struct {
+	...
+	// ConnPool db conn pool
+	ConnPool ConnPool
+	...
+	//callbacks
+	callbacks  *callbacks
+	
+}
+// callbacks字段
+// callbacks gorm callbacks manager
+type callbacks struct {
+	//mep[string,processor]形式的map，其中key即queryCallback := db.Callback().Query()中的create/query/delete等
+	processors map[string]*processor
+}
+//processor
+type processor struct {
+	db        *DB			//反向维护一个db信息
+	fns       []func(*DB)	//fns即具体Delete等函数执行时的函数链
+	callbacks []*callback	//注册的callback
+}
+//callback，在createCallback.Match(enableTransaction).Register("gorm:begin_transaction", BeginTransaction)的Register中被Match初始化，并被Register赋值具体的操作函数
+type callback struct {
+	name      string			//名称，gorm:begin_transaction
+	before    string		
+	after     string
+	remove    bool
+	replace   bool
+	match     func(*DB) bool	//enableTransaction函数
+	handler   func(*DB)			//具体的执行函数，BeginTransaction
+	processor *processor		//所属的processor，反向引用
+}
+```
+所以，**注册函数链的整体流程就是，首选根据业务场景，从callbacks的map[string,processor]中获取processor对象，然后向该对象的callbacks中添加具体的执行函数，并通过complie排序，赋值给fns，供后续实际业务函数有序调用**
+
+### transaction场景
+
+transaction与connection的关系分为以下两个场景：
+
+1. 没有显式的声明一个transaction，执行单一的sql，代码类似：
+```go
+func (m mepMeta) Create(value *mepmd.MepMeta) error {
+	return models.PostgresDB.Create(value).Error
+}
+```
+进入`Create`的内部实现：
+```go
+func (db *DB) Create(value interface{}) (tx *DB) {
+	...
+	tx = db.getInstance()
+	tx.Statement.Dest = value
+	//Create()首先从callbacks的mep[string,processor]中获取create的processor，然后执行Exectue
+	tx.callbacks.Create().Execute(tx)
+	return
+}
+func (p *processor) Execute(db *DB) {
+	//根据上一小节，这里会首先执行注册的BeginTransaction函数
+	...
+	for _, f := range p.fns {
+		f(db)
+	}
+}
+func BeginTransaction(db *gorm.DB) {
+	//SkipDefaultTransaction返回false
+	if !db.Config.SkipDefaultTransaction {
+		//调用db.Begin
+		if tx := db.Begin(); tx.Error == nil {
+			db.Statement.ConnPool = tx.Statement.ConnPool
+			db.InstanceSet("gorm:started_transaction", true)
+		} else if tx.Error == gorm.ErrInvalidTransaction {
+			tx.Error = nil
+		}
+	}
+}
+// Begin begins a transaction
+func (db *DB) Begin(opts ...*sql.TxOptions) *DB {
+	var (
+		创建一个tx对象
+		tx  = db.getInstance().Session(&Session{Context: db.Statement.Context})
+		...
+	)
+	...
+	//无声明的transaction走这个分支
+	if beginner, ok := tx.Statement.ConnPool.(TxBeginner); ok {
+		//开启事务，并赋值给ConnPool
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else if beginner, ok := tx.Statement.ConnPool.(ConnPoolBeginner); ok {
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else {
+		err = ErrInvalidTransaction
+	}
+	...
+	return tx
+}
+```
+
+
+2. 使用了transaction，多个sql在一个tx对象中执行，代码类似：
+```go
+	return models.PostgresDB.Transaction(func(tx *gorm.DB) error {
+		if err := dao.ServiceDao.Create(tx, &svcInfo); ...
+		if err := tx.CreateInBatches(&apis, len(apis)).Error; ...
+		if err := tx.CreateInBatches(&args, len(args)).Error; ...
+		...
+		return nil
+	})
+```
+此时的事务已在Transaction函数中被创建：
+```go
+func (db *DB) Transaction(fc func(tx *DB) error, opts ...*sql.TxOptions) (err error) {
+	panicked := true
+	//走else分支
+	if committer, ok := db.Statement.ConnPool.(TxCommitter); ok && committer != nil {
+		// nested transaction
+		if !db.DisableNestedTransaction {
+			err = db.SavePoint(fmt.Sprintf("sp%p", fc)).Error
+			defer func() {
+				// Make sure to rollback when panic, Block error or Commit error
+				if panicked || err != nil {
+					db.RollbackTo(fmt.Sprintf("sp%p", fc))
+				}
+			}()
+		}
+		if err == nil {
+			err = fc(db.Session(&Session{}))
+		}
+	} else {
+		//创建transaction
+		tx := db.Begin(opts...)
+		...
+		//执行业务函数fc,commit
+		...
+	}
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+func (db *DB) Begin(opts ...*sql.TxOptions) *DB {
+	var (
+		// clone statement
+		tx  = db.Session(&Session{Context: db.Statement.Context})
+		...
+	)
+	...
+	if beginner, ok := tx.Statement.ConnPool.(TxBeginner); ok {
+	//走此分支，创建一个trasaction对象
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else if beginner, ok := tx.Statement.ConnPool.(ConnPoolBeginner); ok {
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else {
+		err = ErrInvalidTransaction
+	}
+	if err != nil {
+		tx.AddError(err)
+	}
+	return tx
+}
+```
+相应的，当在事务中的函数执行具体操作，比如示例代码中的:
+```
+dao.ServiceDao.Create(tx, &svcInfo)`:
+func (s service) Create(tx *gorm.DB, svc *apigwmd.Service) error {
+	if tx == nil {
+		tx = models.PostgresDB
+	}
+	return s.RewriteDbError(tx.Create(svc).Error)
+
+}
+```
+此函数**会执行Create的函数链**
+```go
+func (p *processor) Execute(db *DB) {
+	//执行注册的第一个函数，BeginTransaction
+	...
+	for _, f := range p.fns {
+		f(db)
+	}
+}
+```
+由于此时已经存在创建好的Transaction,因此，在Begin的具体函数中，会走else分支：
+```go
+func BeginTransaction(db *gorm.DB) {
+	//SkipDefaultTransaction返回false
+	if !db.Config.SkipDefaultTransaction {
+		//执行Begin抛出error
+		if tx := db.Begin(); tx.Error == nil {
+			db.Statement.ConnPool = tx.Statement.ConnPool
+			db.InstanceSet("gorm:started_transaction", true)
+		} else if tx.Error == gorm.ErrInvalidTransaction {
+			//因为err为ErrInvalidTransaction，因此至空，这说明BeginTransaction将不再创建新的事务
+			tx.Error = nil
+		}
+	}
+}
+//
+// Begin begins a transaction
+func (db *DB) Begin(opts ...*sql.TxOptions) *DB {
+	...
+	if beginner, ok := tx.Statement.ConnPool.(TxBeginner); ok {
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else if beginner, ok := tx.Statement.ConnPool.(ConnPoolBeginner); ok {
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else {
+		//走此分支，抛出ErrInvalidTransaction
+		err = ErrInvalidTransaction
+	}
+
+	if err != nil {
+		tx.AddError(err)
+	}
+
+	return tx
+}
+```
+接下来将执行后续函数链。此为**业务函数Create的流程，后续业务函数同理，他们将共用同一个事务对象**：
+```go
+	//使用同一个对象
+	return models.PostgresDB.Transaction(func(tx *gorm.DB) error {
+		if err := dao.ServiceDao.Create(tx, &svcInfo); ...
+		if err := tx.CreateInBatches(&apis, len(apis)).Error; ...
+		if err := tx.CreateInBatches(&args, len(args)).Error; ...
+		...
+		return nil
+	})
+```
+
+### 与connection的关系
+
+上文为transaction在不同场景的使用，继续看函数链中的`BeginTrasaction`如何处理事务与连接的关系：
+```go
+func BeginTransaction(db *gorm.DB) {
+	if !db.Config.SkipDefaultTransaction {
+		if tx := db.Begin(); tx.Error == nil {
+			db.Statement.ConnPool = tx.Statement.ConnPool
+			db.InstanceSet("gorm:started_transaction", true)
+		} else if tx.Error == gorm.ErrInvalidTransaction {
+			tx.Error = nil
+		}
+	}
+}
+```
+进入创建事务的`Begin`：
+```go
+// Begin begins a transaction
+func (db *DB) Begin(opts ...*sql.TxOptions) *DB {
+	...
+	if beginner, ok := tx.Statement.ConnPool.(TxBeginner); ok {
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else if beginner, ok := tx.Statement.ConnPool.(ConnPoolBeginner); ok {
+		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
+	} else {
+		err = ErrInvalidTransaction
+	}
+	...
+	return tx
+}
+// BeginTx starts a transaction.
+//
+// The provided context is used until the transaction is committed or rolled back.
+// If the context is canceled, the sql package will roll back
+// the transaction. Tx.Commit will return an error if the context provided to
+// BeginTx is canceled.
+//
+// The provided TxOptions is optional and may be nil if defaults should be used.
+// If a non-default isolation level is used that the driver doesn't support,
+// an error will be returned.
+func (db *DB) BeginTx(ctx context.Context, opts *TxOptions) (*Tx, error) {
+	var tx *Tx
+	var err error
+	for i := 0; i < maxBadConnRetries; i++ {
+		tx, err = db.begin(ctx, opts, cachedOrNewConn)
+		if err != driver.ErrBadConn {
+			break
+		}
+	}
+	if err == driver.ErrBadConn {
+		return db.begin(ctx, opts, alwaysNewConn)
+	}
+	return tx, err
+}
+//执行db.begin，将调用conn函数，后者将返回一个可用连接
+func (db *DB) begin(ctx context.Context, opts *TxOptions, strategy connReuseStrategy) (tx *Tx, err error) {
+	dc, err := db.conn(ctx, strategy)
+	if err != nil {
+		return nil, err
+	}
+	//获取连接后，调用beginDC开启事务
+	return db.beginDC(ctx, dc, dc.releaseConn, opts)
+}
+```
+**至此，可以看到，创建一个transaction对象，将首先从连接池中获取一个连接，获取的具体策略在上文已经分析，获取连接后，在该连接上开启事务**
+
+## 参考
+
+[1](https://learnku.com/articles/41137)
+
+[2](https://blog.51cto.com/muhuizz/2577451)

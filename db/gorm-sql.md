@@ -438,8 +438,6 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 }
 ```
 
-## release connection
-
 ## transaction 与 connection
 
 ### 注册函数链
@@ -640,7 +638,7 @@ func (db *DB) Begin(opts ...*sql.TxOptions) *DB {
 	...
 	//无声明的transaction走这个分支
 	if beginner, ok := tx.Statement.ConnPool.(TxBeginner); ok {
-		//开启事务，并赋值给ConnPool
+		//开启事务，并赋值给ConnPool，之后的查询都使用该conn
 		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
 	} else if beginner, ok := tx.Statement.ConnPool.(ConnPoolBeginner); ok {
 		tx.Statement.ConnPool, err = beginner.BeginTx(tx.Statement.Context, opt)
@@ -845,6 +843,227 @@ func (db *DB) begin(ctx context.Context, opts *TxOptions, strategy connReuseStra
 }
 ```
 **至此，可以看到，创建一个transaction对象，将首先从连接池中获取一个连接，获取的具体策略在上文已经分析，获取连接后，在该连接上开启事务**
+
+## release connection
+
+根据上文中，gorm通过注册函数链执行sql，可推断连接的释放位于函数链的最后一个函数，以`create`场景为例：
+```go
+	createCallback := db.Callback().Create()
+	createCallback.Match(enableTransaction).Register("gorm:begin_transaction", BeginTransaction)
+	createCallback.Register("gorm:before_create", BeforeCreate)
+	createCallback.Register("gorm:save_before_associations", SaveBeforeAssociations)
+	createCallback.Register("gorm:create", Create(config))
+	createCallback.Register("gorm:save_after_associations", SaveAfterAssociations)
+	createCallback.Register("gorm:after_create", AfterCreate)
+	//连接释放的入口
+	createCallback.Match(enableTransaction).Register("gorm:commit_or_rollback_transaction", CommitOrRollbackTransaction)
+```
+进入`CommitOrRollbackTransaction`内部，并一直跟进`Commit函数`，可以看到最终的释放位于`tx.close`中的`tx.releaseConn(err)`：
+```go
+func (tx *Tx) Commit() error {
+	// Check context first to avoid transaction leak.
+	// If put it behind tx.done CompareAndSwap statement, we can't ensure
+	// the consistency between tx.done and the real COMMIT operation.
+	select {
+	default:
+	case <-tx.ctx.Done():
+		if atomic.LoadInt32(&tx.done) == 1 {
+			return ErrTxDone
+		}
+		return tx.ctx.Err()
+	}
+	if !atomic.CompareAndSwapInt32(&tx.done, 0, 1) {
+		return ErrTxDone
+	}
+	var err error
+	withLock(tx.dc, func() {
+		err = tx.txi.Commit()
+	})
+	if err != driver.ErrBadConn {
+		tx.closePrepared()
+	}
+	//
+	tx.close(err)
+	return err
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// close returns the connection to the pool and
+// must only be called by Tx.rollback or Tx.Commit.
+func (tx *Tx) close(err error) {
+	tx.cancel()
+
+	tx.closemu.Lock()
+	defer tx.closemu.Unlock()
+	//此函数为将连接放入pool中
+	tx.releaseConn(err)
+	tx.dc = nil
+	tx.txi = nil
+}
+```
+那么该函数在何处被注册？回到函数链的注册逻辑，进入`BeginTransaction`，并一直跟进至`begin`：
+```go
+func (db *DB) begin(ctx context.Context, opts *TxOptions, strategy connReuseStrategy) (tx *Tx, err error) {
+	dc, err := db.conn(ctx, strategy)
+	if err != nil {
+		return nil, err
+	}
+	//在此处，获取到transaction的同时，注册了一个dc.releaseConn函数
+	return db.beginDC(ctx, dc, dc.releaseConn, opts)
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// beginDC starts a transaction. The provided dc must be valid and ready to use.
+func (db *DB) beginDC(ctx context.Context, dc *driverConn, release func(error), opts *TxOptions) (tx *Tx, err error) {
+	var txi driver.Tx
+	withLock(dc, func() {
+		txi, err = ctxDriverBegin(ctx, opts, dc.ci)
+	})
+	if err != nil {
+		//如果开启事务失败，直接释放连接
+		release(err)
+		return nil, err
+	}
+
+	// Schedule the transaction to rollback when the context is cancelled.
+	// The cancel function in Tx will be called after done is set to true.
+	ctx, cancel := context.WithCancel(ctx)
+	tx = &Tx{
+		db:          db,
+		dc:          dc,
+		//填写release域
+		releaseConn: release,
+		txi:         txi,
+		cancel:      cancel,
+		ctx:         ctx,
+	}
+	go tx.awaitDone()
+	return tx, nil
+}
+```
+因此，这个`dc.releaseConn`即连接释放的具体实现：
+```go
+func (dc *driverConn) releaseConn(err error) {
+	dc.db.putConn(dc, err, true)
+}
+
+// putConn adds a connection to the db's free pool.
+// err is optionally the last error that occurred on this connection.
+func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
+	db.mu.Lock()
+	if !dc.inUse {
+		if debugGetPut {
+			fmt.Printf("putConn(%v) DUPLICATE was: %s\n\nPREVIOUS was: %s", dc, stack(), db.lastPut[dc])
+		}
+		panic("sql: connection returned that was never out")
+	}
+	if debugGetPut {
+		db.lastPut[dc] = stack()
+	}
+	dc.inUse = false
+	// 调用连接上注册的一些statement的关闭函数
+	for _, fn := range dc.onPut {
+		fn()
+	}
+	dc.onPut = nil
+	// 如果当前连接已经不可用，意味着可能会有新的连接请求，调用maybeOpenNewConnections进行检测
+	if err == driver.ErrBadConn {
+		// Don't reuse bad connections.
+		// Since the conn is considered bad and is being discarded, treat it
+		// as closed. Don't decrement the open count here, finalClose will
+		// take care of that.
+		db.maybeOpenNewConnections()
+		db.mu.Unlock()
+		dc.Close()
+		return
+	}
+	if putConnHook != nil {
+		putConnHook(db, dc)
+	}
+	if db.closed {
+		// Connections do not need to be reset if they will be closed.
+		// Prevents writing to resetterCh after the DB has closed.
+		resetSession = false
+	}
+	if resetSession {
+		if _, resetSession = dc.ci.(driver.SessionResetter); resetSession {
+			// Lock the driverConn here so it isn't released until
+			// the connection is reset.
+			// The lock must be taken before the connection is put into
+			// the pool to prevent it from being taken out before it is reset.
+			dc.Lock()
+		}
+	}
+	//执行具体的连接释放
+	added := db.putConnDBLocked(dc, nil)
+	db.mu.Unlock()
+	//添加失败则关闭连接
+	if !added {
+		if resetSession {
+			dc.Unlock()
+		}
+		dc.Close()
+		return
+	}
+	if !resetSession {
+		return
+	}
+	select {
+	default:
+		// If the resetterCh is blocking then mark the connection
+		// as bad and continue on.
+		dc.lastErr = driver.ErrBadConn
+		dc.Unlock()
+	case db.resetterCh <- dc:
+	}
+}
+```
+再进入具体的连接释放函数`db.putConnDBLocked(dc, nil)`：
+```go
+// Satisfy a connRequest or put the driverConn in the idle pool and return true
+// or return false.
+// putConnDBLocked will satisfy a connRequest if there is one, or it will
+// return the *driverConn to the freeConn list if err == nil and the idle
+// connection limit will not be exceeded.
+// If err != nil, the value of dc is ignored.
+// If err == nil, then dc must not equal nil.
+// If a connRequest was fulfilled or the *driverConn was placed in the
+// freeConn list, then true is returned, otherwise false is returned.
+func (db *DB) putConnDBLocked(dc *driverConn, err error) bool {
+	if db.closed {
+		return false
+	}
+	// 如果已经超过最大打开数量了，就不需要在回归pool了
+	if db.maxOpen > 0 && db.numOpen > db.maxOpen {
+		return false
+	}
+	 // 这边是重点了，基本来说就是从connRequest这个map里面随机抽一个在排队等着的请求。取出来后发给他。就不用归还池子了。
+	if c := len(db.connRequests); c > 0 {
+		var req chan connRequest
+		var reqKey uint64
+		for reqKey, req = range db.connRequests {
+			break
+		}
+		delete(db.connRequests, reqKey) // Remove from pending requests.
+		if err == nil {
+			dc.inUse = true
+		}
+		// 把连接给这个正在排队的连接
+		req <- connRequest{
+			conn: dc,
+			err:  err,
+		}
+		return true
+	} else if err == nil && !db.closed {
+		// 既然没人排队，就看看到了最大连接数目没有。没到就归还给freeConn。
+		if db.maxIdleConnsLocked() > len(db.freeConn) {
+			db.freeConn = append(db.freeConn, dc)
+			db.startCleanerLocked()
+			return true
+		}
+		db.maxIdleClosed++
+	}
+	return false
+}
+```
 
 ## 参考
 

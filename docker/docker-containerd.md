@@ -504,3 +504,126 @@ func (s *containerStore) Create(ctx context.Context, container containers.Contai
 	return container, nil
 }
 ```
+
+## go-events
+参考
+1. [go-events](https://www.debug8.com/golang/t_59481.html) 
+2. [go-events-git](https://github.com/docker/go-events)
+
+go-event是一个在Docker项目中使用到的一个事件分发组件，实现了常规的广播，队列等事件分发模型。
+
+### 核心接口
+
+1. **Event**
+```go
+type Event interface{}
+
+//定义一个event
+msg := msg{Id:"1",Name:"jiao",Sex:"Male"}
+```
+Event被描述为一个空接口，接受任意类型。在go-events表示一个可以被执行的事件。比如定义了一个名为msg的event。
+
+2. **Sink**
+```go
+type Sink interface {
+	//事件的执行策略
+    Write(event Event) error
+	//sink关闭策略
+    Close() error
+}
+
+//定义一个http的sink
+type httpSink struct {
+	url string
+	client http.Client
+}
+
+func NewHttpSink(url string)event.Sink{
+	return &httpSink{url:url,client:http.Client{}}
+}
+//write方法执行的是http请求的发送
+func (h *httpSink) Write(event event.Event) error {
+	p, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	body := bytes.NewReader(p)
+	resp, err := h.client.Post(h.url, "application/json", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return errors.New("unexpected status")
+	}
+
+	return nil
+}
+//close方法
+func (h *httpSink) Close()error{
+	return nil
+}
+```
+Sink用来执行事件（Event），只要对象实现了这两个方法，就可以被当作一个Sink。
+
+3. **retry**
+```go
+	//定义一个retry对象，用于对sink执行N次的尝试，每一次都调用了Sink的Write
+	retry := event.NewRetryingSink(sink,event.NewBreaker(5, time.Second))
+	if err := retry.Write(msg);err!=nil{
+		t.Error(err)
+	}
+
+// Write attempts to flush the events to the downstream sink until it succeeds
+// or the sink is closed.
+func (rs *RetryingSink) Write(event Event) error {
+	...
+retry:
+	select {
+	case <-rs.closed:
+		return ErrSinkClosed
+	default:
+	}
+
+	if backoff := rs.strategy.Proceed(event); backoff > 0 {
+		select {
+		case <-time.After(backoff):
+			// TODO(stevvooe): This branch holds up the next try. Before, we
+			// would simply break to the "retry" label and then possibly wait
+			// again. However, this requires all retry strategies to have a
+			// large probability of probing the sync for success, rather than
+			// just backing off and sending the request.
+		case <-rs.closed:
+			return ErrSinkClosed
+		}
+	}
+
+	if err := rs.sink.Write(event); err != nil {
+		if err == ErrSinkClosed {
+			// terminal!
+			return err
+		}
+
+		logger := logger.WithError(err) // shadow!!
+
+		if rs.strategy.Failure(event, err) {
+			logger.Errorf("retryingsink: dropped event")
+			return nil
+		}
+
+		logger.Errorf("retryingsink: error writing event, retrying")
+		goto retry
+	}
+
+	rs.strategy.Success(event)
+	return nil
+}
+```
+
+4. **queue**
+
+5. **boardcast**
+
+
+

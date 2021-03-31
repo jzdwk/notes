@@ -625,5 +625,124 @@ retry:
 
 5. **boardcast**
 
+```go
+	//queue
+	queue := event.NewQueue(retry)
+
+	var broadcast = event.NewBroadcaster() // make it available somewhere in your application.
+	broadcast.Add(queue) // add your queue!*/
+	broadcast.Write(msg)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Broadcaster sends events to multiple, reliable Sinks. The goal of this
+// component is to dispatch events to configured endpoints. Reliability can be
+// provided by wrapping incoming sinks.
+type Broadcaster struct {
+	sinks   []Sink
+	events  chan Event
+	adds    chan configureRequest
+	removes chan configureRequest
+
+	shutdown chan struct{}
+	closed   chan struct{}
+	once     sync.Once
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Add the sink to the broadcaster.
+//
+// The provided sink must be comparable with equality. Typically, this just
+// works with a regular pointer type.
+func (b *Broadcaster) Add(sink Sink) error {
+	return b.configure(b.adds, sink)
+}
+func (b *Broadcaster) configure(ch chan configureRequest, sink Sink) error {
+	response := make(chan error, 1)
+
+	for {
+		select {
+		case ch <- configureRequest{
+			sink:     sink,
+			response: response}:
+			ch = nil
+		case err := <-response:
+			return err
+		case <-b.closed:
+			return ErrSinkClosed
+		}
+	}
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Write accepts an event to be dispatched to all sinks. This method will never
+// fail and should never block (hopefully!). The caller cedes the memory to the
+// broadcaster and should not modify it after calling write.
+func (b *Broadcaster) Write(event Event) error {
+	select {
+	case b.events <- event:
+	case <-b.closed:
+		return ErrSinkClosed
+	}
+	return nil
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// run is the main broadcast loop, started when the broadcaster is created.
+// Under normal conditions, it waits for events on the event channel. After
+// Close is called, this goroutine will exit.
+func (b *Broadcaster) run() {
+	defer close(b.closed)
+	remove := func(target Sink) {
+		for i, sink := range b.sinks {
+			if sink == target {
+				b.sinks = append(b.sinks[:i], b.sinks[i+1:]...)
+				break
+			}
+		}
+	}
+
+	for {
+		select {
+		case event := <-b.events:
+			for _, sink := range b.sinks {
+				if err := sink.Write(event); err != nil {
+					if err == ErrSinkClosed {
+						// remove closed sinks
+						remove(sink)
+						continue
+					}
+					logrus.WithField("event", event).WithField("events.sink", sink).WithError(err).
+						Errorf("broadcaster: dropping event")
+				}
+			}
+		case request := <-b.adds:
+			// while we have to iterate for add/remove, common iteration for
+			// send is faster against slice.
+
+			var found bool
+			for _, sink := range b.sinks {
+				if request.sink == sink {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				b.sinks = append(b.sinks, request.sink)
+			}
+			// b.sinks[request.sink] = struct{}{}
+			request.response <- nil
+		case request := <-b.removes:
+			remove(request.sink)
+			request.response <- nil
+		case <-b.shutdown:
+			// close all the underlying sinks
+			for _, sink := range b.sinks {
+				if err := sink.Close(); err != nil && err != ErrSinkClosed {
+					logrus.WithField("events.sink", sink).WithError(err).
+						Errorf("broadcaster: closing sink failed")
+				}
+			}
+			return
+		}
+	}
+}	
+```
 
 

@@ -567,17 +567,33 @@ func (h *httpSink) Close()error{
 ```
 Sink用来执行事件（Event），只要对象实现了这两个方法，就可以被当作一个Sink。
 
-3. **retry**
+### retry & queue & boardcast
+
+1. **retry**
+retry顾名思义，即重试。其作用为在一定时间间隔(backoff)内，对sink执行N次(threshold)的尝试，直到成功为止。
 ```go
-	//定义一个retry对象，用于对sink执行N次的尝试，每一次都调用了Sink的Write
-	retry := event.NewRetryingSink(sink,event.NewBreaker(5, time.Second))
+//breaker定义
+type Breaker struct {
+	threshold int			//重试阈值
+	recent    int			//重试次数
+	last      time.Time		//上一次write时间
+	backoff   time.Duration // time after which we retry after failure.	时间间隔
+	mu        sync.Mutex	
+}
+	//定义一个retry对象，其中event.NewBreaker(5, time.Second)返回了一个breaker对象
+	//5表示重试的阈值，time.Second*5表示时间间隔5秒
+	//因此，该breaker表示在5秒内尝试调用sink的write方法5次，如果都失败，下一轮5秒再尝试	
+	retry := event.NewRetryingSink(sink,event.NewBreaker(5, time.Second*5))
 	if err := retry.Write(msg);err!=nil{
 		t.Error(err)
 	}
-
+```
+可以看下retry的内部实现：
+```
 // Write attempts to flush the events to the downstream sink until it succeeds
 // or the sink is closed.
 func (rs *RetryingSink) Write(event Event) error {
+//1. 判断retry是否关闭，关闭则退出
 	...
 retry:
 	select {
@@ -585,9 +601,13 @@ retry:
 		return ErrSinkClosed
 	default:
 	}
-
+	//2.proceed更新在时间段内的重试次数
+	//	如果重试次数小于阈值，则次数+1，backoff = 0
+	//	否则，说明在时间间隔内，已经尝试了N次，返回backoff = 上一次调write时间+时间间隔-当前时间
+	//	backoff即距离下一次启动retry的时间差
 	if backoff := rs.strategy.Proceed(event); backoff > 0 {
 		select {
+		//如果backoff大于0，说明离下一轮尝试还有backoff时间，因此after
 		case <-time.After(backoff):
 			// TODO(stevvooe): This branch holds up the next try. Before, we
 			// would simply break to the "retry" label and then possibly wait
@@ -598,96 +618,123 @@ retry:
 			return ErrSinkClosed
 		}
 	}
-
+	//3.执行sink的写
 	if err := rs.sink.Write(event); err != nil {
+		
 		if err == ErrSinkClosed {
 			// terminal!
 			return err
 		}
-
+		//写入失败，则记日志，更新write调用时间，尝试次数+1
 		logger := logger.WithError(err) // shadow!!
-
 		if rs.strategy.Failure(event, err) {
-			logger.Errorf("retryingsink: dropped event")
-			return nil
+			...
 		}
-
-		logger.Errorf("retryingsink: error writing event, retrying")
+		//返回步骤1
+		...
 		goto retry
 	}
-
+	//4.成功后，清空尝试次数，更新write调用时间，返回
 	rs.strategy.Success(event)
 	return nil
 }
 ```
 
-4. **queue**
-
-5. **boardcast**
-
+2. **queue**
+queue返回一个队列，入参的sink对象会依次指定放入queue中的event：
 ```go
-	//queue
-	queue := event.NewQueue(retry)
+type Queue struct {
+	dst    Sink			//sink执行
+	events *list.List	//event双向链表，FILO
+	cond   *sync.Cond	//条件锁，内部引用全局mutex lock
+	mu     sync.Mutex	//全局mutex lock
+	closed bool			
+}
 
-	var broadcast = event.NewBroadcaster() // make it available somewhere in your application.
-	broadcast.Add(queue) // add your queue!*/
-	broadcast.Write(msg)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//在New函数中，直接执行一个run()，维护queue状态
+// run is the main goroutine to flush events to the target sink.
+func (eq *Queue) run() {
+	for {
+		//获取第一个event
+		//如果链表为空，并且queue关闭，则boardcast条件锁，eq.cond.Broadcast()
+		//否则，条件锁等待，eq.cond.Wait()，等待新的event入队
+		event := eq.next()
+		..
+		//sink write event
+		if err := eq.dst.Write(event); err != nil {
+			// TODO(aaronl): Dropping events could be bad depending
+			// on the application. We should have a way of
+			// communicating this condition. However, logging
+			// at a log level above debug may not be appropriate.
+			// Eventually, go-events should not use logrus at all,
+			// and should bubble up conditions like this through
+			// error values.
+			logrus.WithFields(logrus.Fields{
+				"event": event,
+				"sink":  eq.dst,
+			}).WithError(err).Debug("eventqueue: dropped event")
+		}
+	}
+}
+
+// queue的Write操作即把event入链表
+// Write accepts the events into the queue, only failing if the queue has
+// been closed.
+func (eq *Queue) Write(event Event) error {
+	eq.mu.Lock()
+	defer eq.mu.Unlock()
+	
+	if eq.closed {
+		return ErrSinkClosed
+	}
+	//入链表尾
+	eq.events.PushBack(event)
+	//入队后，链表不为空，通知在等待的event执行write
+	eq.cond.Signal() // signal waiters
+
+	return nil
+}
+```
+
+3. **boardcast**
+广播消息，将接收到的event分发给所有注册的sink去执行。首先看boardcast定义以及New函数：
+```go
+//定义
 // Broadcaster sends events to multiple, reliable Sinks. The goal of this
 // component is to dispatch events to configured endpoints. Reliability can be
 // provided by wrapping incoming sinks.
 type Broadcaster struct {
-	sinks   []Sink
-	events  chan Event
-	adds    chan configureRequest
+	sinks   []Sink					//sink组，event将会给所有注册的sink去执行
+	events  chan Event				//event队列
+	adds    chan configureRequest	//同步channel，执行add和remove
 	removes chan configureRequest
 
-	shutdown chan struct{}
+	shutdown chan struct{}			
 	closed   chan struct{}
 	once     sync.Once
 }
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// Add the sink to the broadcaster.
-//
-// The provided sink must be comparable with equality. Typically, this just
-// works with a regular pointer type.
-func (b *Broadcaster) Add(sink Sink) error {
-	return b.configure(b.adds, sink)
-}
-func (b *Broadcaster) configure(ch chan configureRequest, sink Sink) error {
-	response := make(chan error, 1)
+//New函数中开启线程执行run
+func NewBroadcaster(sinks ...Sink) *Broadcaster {
+	b := Broadcaster{
+		sinks:    sinks,
+		events:   make(chan Event),
+		adds:     make(chan configureRequest),
+		removes:  make(chan configureRequest),
+		shutdown: make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
 
-	for {
-		select {
-		case ch <- configureRequest{
-			sink:     sink,
-			response: response}:
-			ch = nil
-		case err := <-response:
-			return err
-		case <-b.closed:
-			return ErrSinkClosed
-		}
-	}
+	// Start the broadcaster
+	go b.run()
+
+	return &b
 }
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// Write accepts an event to be dispatched to all sinks. This method will never
-// fail and should never block (hopefully!). The caller cedes the memory to the
-// broadcaster and should not modify it after calling write.
-func (b *Broadcaster) Write(event Event) error {
-	select {
-	case b.events <- event:
-	case <-b.closed:
-		return ErrSinkClosed
-	}
-	return nil
-}
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // run is the main broadcast loop, started when the broadcaster is created.
 // Under normal conditions, it waits for events on the event channel. After
 // Close is called, this goroutine will exit.
 func (b *Broadcaster) run() {
 	defer close(b.closed)
+	//封装remove，移除sink，注意，sink要实现comparable才能使用sink == target
 	remove := func(target Sink) {
 		for i, sink := range b.sinks {
 			if sink == target {
@@ -696,9 +743,10 @@ func (b *Broadcaster) run() {
 			}
 		}
 	}
-
+	
 	for {
 		select {
+		//有event到来，遍历sink消费
 		case event := <-b.events:
 			for _, sink := range b.sinks {
 				if err := sink.Write(event); err != nil {
@@ -711,10 +759,9 @@ func (b *Broadcaster) run() {
 						Errorf("broadcaster: dropping event")
 				}
 			}
+		//如果有新的sink加入
 		case request := <-b.adds:
-			// while we have to iterate for add/remove, common iteration for
-			// send is faster against slice.
-
+			//判断sink是否存在
 			var found bool
 			for _, sink := range b.sinks {
 				if request.sink == sink {
@@ -722,15 +769,17 @@ func (b *Broadcaster) run() {
 					break
 				}
 			}
-
+			//加入sink列表
 			if !found {
 				b.sinks = append(b.sinks, request.sink)
 			}
-			// b.sinks[request.sink] = struct{}{}
+			//回写request的resp channel
 			request.response <- nil
+		//与上一个case同理
 		case request := <-b.removes:
 			remove(request.sink)
 			request.response <- nil
+		//如果boardcast关闭，通知所有sink的close
 		case <-b.shutdown:
 			// close all the underlying sinks
 			for _, sink := range b.sinks {
@@ -742,7 +791,51 @@ func (b *Broadcaster) run() {
 			return
 		}
 	}
-}	
+}
 ```
+4个case支撑了整个boardcast的业务场景，继续看boardcast的add操作：
+```go
+// Add the sink to the broadcaster.
+// The provided sink must be comparable with equality. Typically, this just
+// works with a regular pointer type.
+// 增加执行sink
+func (b *Broadcaster) Add(sink Sink) error {
+	return b.configure(b.adds, sink)
+}
+func (b *Broadcaster) configure(ch chan configureRequest, sink Sink) error {
+	response := make(chan error, 1)
+	for {
+		//向configRequest channel中写入sink以及一个容量为1的resp chan
+		select {
+		case ch <- configureRequest{
+			sink:     sink,
+			response: response}:
+			ch = nil
+		//当run()中configureRequest被读取并添加sink后，向response写入，执行此case
+		case err := <-response:
+			return err
+		case <-b.closed:
+			return ErrSinkClosed
+		}
+	}
+}
+```
+再继续看write操作：
+```go
+// Write accepts an event to be dispatched to all sinks. This method will never
+// fail and should never block (hopefully!). The caller cedes the memory to the
+// broadcaster and should not modify it after calling write.
+func (b *Broadcaster) Write(event Event) error {
+	//向b.events channel写入event，剩下的在run()中进行
+	select {
+	case b.events <- event:
+	case <-b.closed:
+		return ErrSinkClosed
+	}
+	return nil
+}
+```
+
+## create event handle
 
 

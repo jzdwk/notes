@@ -221,6 +221,8 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 	}
 	// load additional plugins that don't automatically register themselves
 	// 注册内置插件
+	// 除了此处在main.go中执行的插件注册，在各个具体的业务包中也通过init()进行了插件注册
+	// 比如/containerd/services/containers/local.go中的init()注册了插件"containers-service"
 	plugin.Register(&plugin.Registration{
 		Type: plugin.ContentPlugin,
 		ID:   "content",
@@ -303,22 +305,23 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 	...
 	rpc := grpc.NewServer(serverOpts...)
 	...
-	//声明service对象
+	//声明containerd server对象
 	var (
 		services []plugin.Service
 		s        = &Server{
 			rpc:    rpc,
+			//事件处理
 			events: exchange.NewExchange(),
 			config: config,
 		}
-		//记录已加载的plugin的集合
+		//创建一个记录已加载的plugin的集合
 		initialized = plugin.NewPluginSet()
 	)
 	//遍历刚才注册的所有plugins
 	for _, p := range plugins {
 		id := p.URI()
 		...
-		//初始化initContext，该对象作为plugin调用InitFn的入参
+		//初始化initContext，initContext表示在plugin初始化过程中需要用到的context，该对象作为plugin调用InitFn的入参
 		initContext := plugin.NewContext(
 			ctx,
 			p,
@@ -326,6 +329,7 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 			config.Root,
 			config.State,
 		)
+		//每一个plugin共享同一个全局的事件处理s.events，具体events的最后后文介绍
 		initContext.Events = s.events
 		initContext.Address = config.GRPC.Address
 		//load the plugin specific configuration if it is provided
@@ -335,7 +339,7 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]*plugin.Regis
 			...
 			initContext.Config = pluginConfig
 		}
-		//调用Registration的InitFn方法。每个注册的plugin需要定义该接口
+		//调用Registration的InitFn方法。在之前的代码中，每个注册的plugin都定义了该接口
 		result := p.Init(initContext)
 		//加入全局的已初始化plugin集合
 		if err := initialized.Add(result); err != nil {
@@ -567,7 +571,7 @@ func (h *httpSink) Close()error{
 ```
 Sink用来执行事件（Event），只要对象实现了这两个方法，就可以被当作一个Sink。
 
-### retry & queue & boardcast
+### retry & queue & broadcast
 
 1. **retry**
 retry顾名思义，即重试。其作用为在一定时间间隔(backoff)内，对sink执行N次(threshold)的尝试，直到成功为止。
@@ -656,7 +660,7 @@ type Queue struct {
 func (eq *Queue) run() {
 	for {
 		//获取第一个event
-		//如果链表为空，并且queue关闭，则boardcast条件锁，eq.cond.Broadcast()
+		//如果链表为空，并且queue关闭，则broadcast条件锁，eq.cond.Broadcast()
 		//否则，条件锁等待，eq.cond.Wait()，等待新的event入队
 		event := eq.next()
 		..
@@ -696,8 +700,8 @@ func (eq *Queue) Write(event Event) error {
 }
 ```
 
-3. **boardcast**
-广播消息，将接收到的event分发给所有注册的sink去执行。首先看boardcast定义以及New函数：
+3. **broadcast**
+广播消息，将接收到的event分发给所有注册的sink去执行。首先看broadcast定义以及New函数：
 ```go
 //定义
 // Broadcaster sends events to multiple, reliable Sinks. The goal of this
@@ -779,7 +783,7 @@ func (b *Broadcaster) run() {
 		case request := <-b.removes:
 			remove(request.sink)
 			request.response <- nil
-		//如果boardcast关闭，通知所有sink的close
+		//如果broadcast关闭，通知所有sink的close
 		case <-b.shutdown:
 			// close all the underlying sinks
 			for _, sink := range b.sinks {
@@ -793,7 +797,7 @@ func (b *Broadcaster) run() {
 	}
 }
 ```
-4个case支撑了整个boardcast的业务场景，继续看boardcast的add操作：
+4个case支撑了整个broadcast的业务场景，继续看boardcast的add操作：
 ```go
 // Add the sink to the broadcaster.
 // The provided sink must be comparable with equality. Typically, this just
@@ -838,4 +842,219 @@ func (b *Broadcaster) Write(event Event) error {
 
 ## create event handle
 
+继续回到`service.go的Create`函数:
+```go
+func (s *service) Create(ctx context.Context, req *api.CreateContainerRequest) (*api.CreateContainerResponse, error) {
+	//local为grpc服务的客户端，实现了ContainersClient接口
+	return s.local.Create(ctx, req)
+}
 
+func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ ...grpc.CallOption) (*api.CreateContainerResponse, error) {
+	var resp api.CreateContainerResponse
+	//定义核心的container处理逻辑，该逻辑作为函数变量最终被withStoreUpdate调用
+	...
+	//发布
+	if err := l.publisher.Publish(ctx, "/containers/create", &eventstypes.ContainerCreate{
+		ID:    resp.Container.ID,
+		Image: resp.Container.Image,
+		Runtime: &eventstypes.ContainerCreate_Runtime{
+			Name:    resp.Container.Runtime.Name,
+			Options: resp.Container.Runtime.Options,
+		},
+	}); err != nil {
+		return &resp, err
+	}
+	return &resp, nil
+}
+```
+可以看到在执行了etcd的create container db操作后，调用service对象的publisher进行了一个发布调用，那么：
+1. 这个publisher是如何定义的？
+2. Publish操作到底做了什么？
+首先看local中publisher的定义:
+```go
+//local
+type local struct {
+	db        *metadata.DB
+	//events.Publisher接口
+	publisher events.Publisher
+}
+//Publish接口
+type Publisher interface {
+	//create场景中，topic即/containers/create，event为封装的containerId/imageId等信息
+	Publish(ctx context.Context, topic string, event Event) error
+}
+```
+这个接口在`/containerd/services/containers/local.go`的`init()`中被初始化，这个函数注册了**container-service插件**：
+```go
+func init() {
+	plugin.Register(&plugin.Registration{
+		Type: plugin.ServicePlugin,
+		ID:   services.ContainersService,
+		Requires: []plugin.Type{
+			plugin.MetadataPlugin,
+		},
+		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+			m, err := ic.Get(plugin.MetadataPlugin)
+			...
+			return &local{
+				db:        m.(*metadata.DB),
+				//publisher的值为ic.Events，即initContext的events字段
+				publisher: ic.Events,
+			}, nil
+		},
+	})
+}
+```
+可以看到具体对象来自initContext，回顾之前对main的分析。在main中，loadPlugin后，初始化了initContext，遍历每一个plugin，调用其initFunction：
+```go
+//创建server对象
+var s    = &Server{
+			rpc:    rpc,
+			events: exchange.NewExchange(),
+			config: config,
+		}
+...省略
+//load后逐一init
+for _, p := range plugins {
+		...
+		initContext := plugin.NewContext(
+			ctx,
+			p,
+			initialized,
+			config.Root,
+			config.State,
+		)
+		initContext.Events = s.events
+		initContext.Address = config.GRPC.Address
+		...
+		result := p.Init(initContext)
+		...
+	}
+...
+##############################################
+type Exchange struct {
+	//上一节中go-events的Broadcaster
+	broadcaster *goevents.Broadcaster
+}
+
+```
+最终可以看到`local.publisher`其实就是被Exchange封装了的boardcast。因此看Exchange的Publish函数：
+```go
+// Publish packages and sends an event. The caller will be considered the
+// initial publisher of the event. This means the timestamp will be calculated
+// at this point and this method may read from the calling context.
+func (e *Exchange) Publish(ctx context.Context, topic string, event events.Event) (err error) {
+	var (
+		namespace string
+		encoded   *types.Any
+		envelope  events.Envelope
+	)
+	//namespace
+	namespace, err = namespaces.NamespaceRequired(ctx)
+	...
+	//topic check
+	if err := validateTopic(topic); err != nil {
+		return errors.Wrapf(err, "envelope topic %q", topic)
+	}
+	//event编码
+	encoded, err = typeurl.MarshalAny(event)
+	...
+	envelope.Timestamp = time.Now().UTC()
+	envelope.Namespace = namespace
+	envelope.Topic = topic
+	envelope.Event = encoded
+	defer ...
+	//广播事件，根据上节，这个eventlope将会被e.broadcast中所有的sink执行
+	return e.broadcaster.Write(&envelope)
+}
+```
+那么，sink在何时被add进e.broadcast中的？
+```go
+// Subscribe to events on the exchange. Events are sent through the returned
+// channel ch. If an error is encountered, it will be sent on channel errs and
+// errs will be closed. To end the subscription, cancel the provided context.
+//
+// Zero or more filters may be provided as strings. Only events that match
+// *any* of the provided filters will be sent on the channel. The filters use
+// the standard containerd filters package syntax.
+func (e *Exchange) Subscribe(ctx context.Context, fs ...string) (ch <-chan *events.Envelope, errs <-chan error) {
+	var (
+		evch                  = make(chan *events.Envelope)
+		errq                  = make(chan error, 1)
+		//go-events的NewChannel返回一个封装的chanel，并实现了sink接口（write即写入channel），0即channel容量，
+		channel               = goevents.NewChannel(0)
+		//queue见上文
+		queue                 = goevents.NewQueue(channel)
+		dst     goevents.Sink = queue
+	)
+
+	closeAll := func() {
+		defer close(errq)
+		defer e.broadcaster.Remove(dst)
+		defer queue.Close()
+		defer channel.Close()
+	}
+	//evch即为返回的channel
+	ch = evch
+	errs = errq
+	//如果存在过滤，则只有满足条件的events可以入队
+	if len(fs) > 0 {
+		filter, err := filters.ParseAll(fs...)
+		if err != nil {
+			errq <- errors.Wrapf(err, "failed parsing subscription filters")
+			closeAll()
+			return
+		}
+
+		dst = goevents.NewFilter(queue, goevents.MatcherFunc(func(gev goevents.Event) bool {
+			return filter.Match(adapt(gev))
+		}))
+	}
+	//将sink加入broadcast
+	e.broadcaster.Add(dst)
+	//然后启动一个协程，去监听sink(channel)的write
+	//因为sink的具体实现为channel
+	go func() {
+		defer closeAll()
+
+		var err error
+	loop:
+		for {
+			select {
+			//如果封装的channel sink的write被调用，即向channel.C中写入
+			case ev := <-channel.C:
+				//读取event
+				env, ok := ev.(*events.Envelope)
+				if !ok {
+					// TODO(stevvooe): For the most part, we are well protected
+					// from this condition. Both Forward and Publish protect
+					// from this.
+					err = errors.Errorf("invalid envelope encountered %#v; please file a bug", ev)
+					break
+				}
+				//把事件写入返回的channel中
+				select {
+				case evch <- env:
+				case <-ctx.Done():
+					break loop
+				}
+			case <-ctx.Done():
+				break loop
+			}
+		}
+		//如果err不为空，把err写入err channel
+		if err == nil {
+			if cerr := ctx.Err(); cerr != context.Canceled {
+				err = cerr
+			}
+		}
+
+		errq <- err
+	}()
+
+	return
+}
+```
+事件订阅的总体逻辑就是，向broadcast中**添加**一个channel sink，如果参数中声明了过滤器，则封装channel sink，提供事件过滤功能。
+
+每当发生广播，根据broadcast的机制，将调用添加的sink的write接口，即channel sink向channel.C中写events。此时，订阅函数中的协程将可以实时读取写入的事件，并将事件写入返回的event channel中，供函数调用者读取。

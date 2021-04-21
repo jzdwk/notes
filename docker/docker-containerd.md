@@ -968,7 +968,7 @@ func (e *Exchange) Publish(ctx context.Context, topic string, event events.Event
 	return e.broadcaster.Write(&envelope)
 }
 ```
-那么，sink在何时被add进e.broadcast中的？
+那么，sink在何时被add进e.broadcast中的？首先可以先看下add到broadcast的函数，即`subscribe`：
 ```go
 // Subscribe to events on the exchange. Events are sent through the returned
 // channel ch. If an error is encountered, it will be sent on channel errs and
@@ -1057,4 +1057,9 @@ func (e *Exchange) Subscribe(ctx context.Context, fs ...string) (ch <-chan *even
 ```
 事件订阅的总体逻辑就是，向broadcast中**添加**一个channel sink，如果参数中声明了过滤器，则封装channel sink，提供事件过滤功能。
 
-每当发生广播，根据broadcast的机制，将调用添加的sink的write接口，即channel sink向channel.C中写events。此时，订阅函数中的协程将可以实时读取写入的事件，并将事件写入返回的event channel中，供函数调用者读取。
+每当发生广播，即调用了broadcast.Write()，根据broadcast的机制，将调用添加的sink的write接口，即channel sink向channel.C中写events。此时，订阅函数中的协程将可以实时读取写入的事件，并将事件写入返回的event channel中，供函数调用者读取。
+
+那么会有哪些client会调用subscribe去监听这个creata container事件？
+
+
+

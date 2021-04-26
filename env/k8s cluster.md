@@ -10,31 +10,35 @@
 
 ## 环境准备
 
-- 关闭防火墙
+1. 关闭防火墙
 
-```
-systemctl disable firewalld
-systemctl stop firewalld
+```bash
+	systemctl disable firewalld
+	systemctl stop firewalld
 ```
 
-- 关闭selinux
+2. 关闭selinux
  
-1. 临时禁用selinux:`setenforce 0`
+- 临时禁用selinux:`setenforce 0`
  
-2. 永久关闭 修改/etc/sysconfig/selinux文件设置:
+- 永久关闭 修改/etc/sysconfig/selinux文件设置:
 
-```
+```bash
     sed -i 's/SELINUX=permissive/SELINUX=disabled/' /etc/sysconfig/selinux
     sed -i "s/SELINUX=enforcing/SELINUX=disabled/g" /etc/selinux/config
 ```
 
-- 关闭swap
+3. 关闭swap
 
-1. `swapoff -a`
+- `swapoff -a`
 
-2.永久禁用，打开/etc/fstab注释掉swap那一行。`sed -i 's/.*swap.*/#&/' /etc/fstab`
-     
-- 修改 /etc/hosts  添加192.168.182.13X->master、node
+-  永久禁用 打开`/etc/fstab`注释掉swap那一行
+```bash
+	sed -i 's/.*swap.*/#&/' /etc/fstab
+```   
+关闭的原因为，k8s在调度pod时需要评估node的内存，swap增加了此项工作的复杂度。
+  
+4. 修改 `/etc/hosts`,向其中添加 192.168.182.13x的本地域名
 
 - 修改内核参数 
 ```
@@ -46,27 +50,30 @@ systemctl stop firewalld
 
 ## 软件安装
 
-- network config 
+1. network配置 
 
-1. 将ip配置为192.168.182.134
-    `cd /etc/sysconfig/network-scripts/`
-    `vi ifcfg-ens33`
-    配置方式请见 https://www.cnblogs.com/yanfly/p/10348103.html
-    配置后 `systemctl restart NetworkManager   systemctl restart network`
-- yum config
+- 将ip配置为192.168.182.134
+```bash    
+	cd /etc/sysconfig/network-scripts/ 
+    vi ifcfg-ens33 #视具体网卡名称而定
+```
+配置详情：
+```bash
+配置方式请见 https://www.cnblogs.com/yanfly/p/10348103.html
+```
+配置后 `systemctl restart NetworkManager   systemctl restart network`
 
-    配置阿里yum源，请查看指定OS的`帮助`：https://opsx.alibaba.com/mirror
+2. 配置yum源
+
+使用阿里yum源，请查看指定OS的`帮助`：https://opsx.alibaba.com/mirror
 	 
-- docker config
-  see #3 
+3. docker配置，[详见]()
   
-- 安装kube ctl
-
-  see https://www.kubernetes.org.cn/installkubectl
+4. 安装kubectl  [详见](https://www.kubernetes.org.cn/installkubectl)
   
-- 安装 kubeadm kubelet  see https://www.kubernetes.org.cn/4256.html
+5. 安装kubeadm kubelet [详见](https://www.kubernetes.org.cn/4256.html)
 
-1. 配置k8s的源`/etc/yum.repos.d/kubernetes.repo`
+6. 配置k8s的源`/etc/yum.repos.d/kubernetes.repo`
    ```
    [kubernetes]
     name=Kubernetes
@@ -89,15 +96,15 @@ systemctl stop firewalld
 
 ## 使用kubeadm 创建 master 
 
-- 选择安装过kubeadm的机器 执行`kubeadm init`
+1. 选择安装过kubeadm的机器 执行`kubeadm init`
 
 该命令首先会下载k8s的组件，如apiserver/etcd等等
 由于墙，访问不了国外repo，所以从阿里云下载镜像，首先，参考: https://segmentfault.com/a/1190000020738509?utm_source=tag-newest
 
 - 确认版本信息`kubeadm config images list`
-- 编写脚本，注意将脚本的版本内容替换为本机实际值：
 
-```
+- 编写脚本，注意将脚本的版本内容替换为本机实际值：
+```bash
   #!/bin/bash
   set -e
 
@@ -123,12 +130,9 @@ systemctl stop firewalld
     docker rmi $ALIYUN_URL/$imageName
   done
 ```
+运行`sh ./kubeadm.sh`后，执行kubeadm:
 
-- 运行`sh ./kubeadm.sh`
-
-- 执行kubeadm:
-
-```
+```bash
  sudo kubeadm init \
  --apiserver-advertise-address 192.168.182.134 \
  --kubernetes-version=v1.16.3 \
@@ -136,38 +140,36 @@ systemctl stop firewalld
 ```
 
 该命令需要注意： 
-1. pod-network-cidr指的是pod的网络域
-2. docker的驱动模式改为systemd，在/etc/docker下创建daemon.json并编辑`mkdir /etc/docker/daemon.json`,加入以下内容：
+- pod-network-cidr指的是pod的网络域
+- docker的驱动模式改为systemd，在/etc/docker下创建daemon.json并编辑`mkdir /etc/docker/daemon.json`,加入以下内容：
 ```
 {
 	"exec-opts":["native.cgroupdriver=systemd"]
 }
 ```
-3. cpu 2个以上 
-4. 内核环境配置，见`环境配置`
+- cpu 2个以上 
+- 内核环境配置，见`环境配置`
 
 - 当出现 kubeadm join XXXX 以及token 时，说明配置成功。
 
-1. 如果是要安装多个master节点，则初始化命令使用:
-```
-kubeadm init --apiserver-advertise-address 192.168.182.134 --control-plane-endpoint 
-     192.168.182.134 --kubernetes-version=v1.16.3 --pod-network-cidr=10.244.0.0/16 --upload-certs
-```
-2. 添加master节点使用命令:
+- 添加work节点使用命令:
 ```
 kubeadm join 192.168.182.134:6443 --token z34zii.ur84appk8h9r3yik --discovery-token-ca-cert-hash sha256:dae426820f2c6073763a3697abeb14d8418c9268288e37b8fc25674153702801 --control- 
      plane --certificate-key 1b9b0f1fdc0959a9decef7d812a2f606faf69ca44ca24d2e557b3ea81f415afe
 ```
-3. 将kube相关文件粘贴至home下
+- 将kube相关文件粘贴至home下
 ```mkdir -p $HOME/.kube;
    cp -i /etc/kubernetes/admin.conf $HOME/.kube/config;
    chown $(id -u):$(id -g) $HOME/.kube/config
 ```
-
 - 重复获取token的join命令为 `kubeadm token create --print-join-command`
 - 执行kubectl get pods等命令，如果提示命令拒绝，将配置文件添加至环境变量
+```bash   
    echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> ~/.bash_profile
+```
+   
 # 安装pod 网络（fanneld）
+
 - 获取fanneld的yaml文件 wget https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
 - 拉取镜像脚本,被墙，所以只能脚本
 ```
@@ -232,7 +234,7 @@ systemctl restart kubelet
 ## node加入
 
 执行命令:
-```
+```bash
 kubeadm join 192.168.182.134:6443 --token lixsl8.v1auqmf91ty0xl0k \
     --discovery-token-ca-cert-hash 
     sha256:c3f92a6ed9149ead327342f48a545e7e127a455d5b338129feac85893d918a55 \
@@ -242,15 +244,19 @@ kubeadm join 192.168.182.134:6443 --token lixsl8.v1auqmf91ty0xl0k \
 1. docker的驱动模式改为systemd,在/etc/docker下创建daemon.json并编辑：`mkdir /etc/docker/daemon.json`加入以下内容：
 ```{"exec-opts":["native.cgroupdriver=systemd"]}```
 
-2. 提示加入成功后，查看master的node状态 kubectl get nodes
+2. 提示加入成功后，查看master的node状态`kubectl get nodes`
 
 # 其他说明
 - master和work都可以使用kubeadm reset重置，work节点的退出同样使用该命令
+
 - work节点上/下线：
-1. work节点使用kubeadm reset 清空配置
+
+1. work节点使用kubeadm reset清空配置
 2. 在master节点使用 kubectl delete nodes <nodename>
-3. 重新上线 使用kubeadm join
+3. 重新上线 使用`kubeadm join`
+
 - master节点上下线
-1. kubectl 删除所有work node 
-2. master 使用kubeadm reset重置，注意此时并没有重置 ~/.kube/config的描述
-3. 重新上线，使用kubeadm init 后， 将worknode加入，需要重新启用flaneld，kubectl delete -f kube-fanneld.yml / kubectl create -f kube-finneld.yml 
+
+1. kubectl删除所有work node 
+2. master使用kubeadm reset重置，注意此时并没有重置 ~/.kube/config的描述
+3. 重新上线，使用`kubeadm init`后，将worknode加入，需要重新启用flaneld，kubectl delete -f kube-fanneld.yml / kubectl create -f kube-finneld.yml 

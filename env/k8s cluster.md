@@ -16,6 +16,9 @@
 	systemctl disable firewalld
 	systemctl stop firewalld
 ```
+原因为，master与node间有大量通信。
+更安全的做法是在防火墙上配置各个组件互通的端口号。
+这里选择关闭即省事。
 
 2. 关闭selinux
  
@@ -28,6 +31,8 @@
     sed -i "s/SELINUX=enforcing/SELINUX=disabled/g" /etc/selinux/config
 ```
 
+关闭的原因为，容器需要读取主机文件系统（比如容器网络的pod）。
+
 3. 关闭swap
 
 - `swapoff -a`
@@ -36,7 +41,7 @@
 ```bash
 	sed -i 's/.*swap.*/#&/' /etc/fstab
 ```   
-关闭的原因为，k8s在调度pod时需要评估node的内存，swap增加了此项工作的复杂度。
+关闭的原因为，k8s在调度pod时需要评估node的内存，swap增加了此项工作的复杂度，同时影响了性能。
   
 4. 修改 `/etc/hosts`,向其中添加 192.168.182.13x的本地域名
 
@@ -45,7 +50,7 @@
    /etc/sysctl.d/k8s.conf
    net.bridge.bridge-nf-call-ip6tables = 1
    net.bridge.bridge-nf-call-iptables = 1
-   生效 sysctl --system
+   sysctl --system
 ```
 
 ## 软件安装
@@ -57,11 +62,36 @@
 	cd /etc/sysconfig/network-scripts/ 
     vi ifcfg-ens33 #视具体网卡名称而定
 ```
-配置详情：
+比如配置详情：
 ```bash
-配置方式请见 https://www.cnblogs.com/yanfly/p/10348103.html
+[root@master network-scripts]# cat ifcfg-ens33 
+TYPE=Ethernet
+PROXY_METHOD=none
+BROWSER_ONLY=no
+BOOTPROTO=static
+DEFROUTE=yes
+IPV4_FAILURE_FATAL=no
+IPV6INIT=yes
+IPV6_AUTOCONF=yes
+IPV6_DEFROUTE=yes
+IPV6_FAILURE_FATAL=no
+IPV6_ADDR_GEN_MODE=stable-privacy
+NAME=ens33
+UUID=a1b4c1c1-a0b5-4d98-a5d1-aae03a0516a5
+DEVICE=ens33
+ONBOOT=yes
+IPADDR=192.168.182.134   #静态IP
+NETMASK=255.255.255.0	
+GATEWAY=192.168.182.2
+DNS1=192.168.182.2
+DEVICE=ens33
+NAME=ens33
 ```
-配置后 `systemctl restart NetworkManager   systemctl restart network`
+配置后
+```bash
+	systemctl restart NetworkManager
+	service network restart	
+```
 
 2. 配置yum源
 
@@ -74,16 +104,16 @@
 5. 安装kubeadm kubelet [详见](https://www.kubernetes.org.cn/4256.html)
 
 6. 配置k8s的源`/etc/yum.repos.d/kubernetes.repo`
-   ```
-   [kubernetes]
-    name=Kubernetes
-    baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64
-    enabled=1
-    gpgcheck=1
-    repo_gpgcheck=1
-    gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg 
-    https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
-	```
+```bash
+[root@master yum.repos.d]# cat kubernetes.repo 
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
+gpgcheck=1
+enabled=1
+repo_gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+```
 	
 2. 安装 kubelet kubeadm  
 ```
@@ -106,6 +136,7 @@
 - 编写脚本，注意将脚本的版本内容替换为本机实际值：
 ```bash
   #!/bin/bash
+  # 脚本的目的为从aliyun上pull镜像，tag为官方镜像
   set -e
 
   KUBE_VERSION=v1.16.0
@@ -168,11 +199,16 @@ kubeadm join 192.168.182.134:6443 --token z34zii.ur84appk8h9r3yik --discovery-to
    echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> ~/.bash_profile
 ```
    
-# 安装pod 网络（fanneld）
+# 安装pod 网络
 
-- 获取fanneld的yaml文件 wget https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
-- 拉取镜像脚本,被墙，所以只能脚本
+## fanneld
+
+- 获取fanneld的yaml文件 
+```bash
+wget https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
 ```
+- 拉取镜像脚本,被墙，所以只能脚本
+```bash
 #!/bin/bash
 set -e
 FLANNEL_VERSION=v0.11.0
@@ -218,6 +254,15 @@ EOF
 删除`--network-plugin=cni`
 systemctl restart kubelet
 ```
+## weave（推荐）
+
+- 获取yaml文件
+```bash
+kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version|base64|tr -d `\n`)" 
+```
+- 注意
+
+因codedns组件会被调度到node上，所以确保node上存在`k8s.gcr.io/coredns:{version}`
 
 # Work CentOS 7
 
@@ -232,14 +277,18 @@ systemctl restart kubelet
 涉及selinux/内核等，与master相同
 
 ## node加入
-
-执行命令:
+在master执行命令：
+```bash
+kubeadm token create --print-join-command
+```
+将结果赋值，给node节点执行，比如:
 ```bash
 kubeadm join 192.168.182.134:6443 --token lixsl8.v1auqmf91ty0xl0k \
     --discovery-token-ca-cert-hash 
     sha256:c3f92a6ed9149ead327342f48a545e7e127a455d5b338129feac85893d918a55 \
    --ignore-preflight-errors=all
 ```
+
    
 1. docker的驱动模式改为systemd,在/etc/docker下创建daemon.json并编辑：`mkdir /etc/docker/daemon.json`加入以下内容：
 ```{"exec-opts":["native.cgroupdriver=systemd"]}```

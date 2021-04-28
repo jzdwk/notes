@@ -1061,5 +1061,5 @@ func (e *Exchange) Subscribe(ctx context.Context, fs ...string) (ch <-chan *even
 
 那么会有哪些client会调用subscribe去监听这个creata container事件？
 
-
+**此处无进展了，死活找不到哪个插件订阅的该事件，先看cri吧**
 

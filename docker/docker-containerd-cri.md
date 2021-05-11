@@ -204,6 +204,7 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 		return nil, errors.Wrap(err, "initialize platform")
 	}
 	// prepare streaming server
+	//定义http服务的路由，在run中被拉起
 	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort, config.StreamIdleTimeout)
 	...
 	c.eventMonitor = newEventMonitor(c)
@@ -250,6 +251,7 @@ func (c *criService) Run() error {
 		cniNetConfMonitorErrCh <- c.cniNetConfMonitor.syncLoop()
 	}()
     //5. 拉起http服务
+	//路由 ：GET/POST "/exec/{token}", "/attach/{token}", "/portforward/{token}"
 	// Start streaming server.
 	logrus.Info("Start streaming server")
 	streamServerErrCh := make(chan error)
@@ -310,3 +312,37 @@ func (c *criService) Run() error {
 	return nil
 }
 ```
+以上为`initCRIService`的实现，其调用时机为**containerd load plugin**后，具体可参考[containerd笔记](docker-containerd.md)
+
+由于`criService`实现了grpc接口：
+```go
+// grpcServices are all the grpc services provided by cri containerd.
+type grpcServices interface {
+	runtime.RuntimeServiceServer  //runtime的grpc接口定义
+	runtime.ImageServiceServer    //image的grpc接口定义
+}
+//CRIService接口
+type CRIService interface {
+	Run() error
+	// io.Closer is used by containerd to gracefully stop cri service.
+	io.Closer
+	plugin.Service
+	grpcServices //继承grpc接口
+}
+//criService的grpc实现
+func (c *criService) Register(s *grpc.Server) error {
+	return c.register(s)
+}
+//分别注册image和runtime服务
+func (c *criService) register(s *grpc.Server) error {
+	instrumented := newInstrumentedService(c)
+	runtime.RegisterRuntimeServiceServer(s, instrumented)
+	runtime.RegisterImageServiceServer(s, instrumented)
+	return nil
+}
+```
+因此，在containerd拉起服务时，（参考：[containerd笔记](docker-containerd.md)），便会注册服务。
+
+## run sandbox
+## create pod container
+## start pod container

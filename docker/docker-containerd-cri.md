@@ -80,22 +80,89 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 		StateDir:           ic.State,
 	}
 	...
-	//
+	//获取serviceOpts数组，数组中的每一个serviceOpt元素是一个函数变量，用于给service设置依赖的插件项
 	servicesOpts, err := getServicesOpts(ic)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get services")
+```
+这里进入`getServicesOpts(ic)`的实现:
+```go
+// getServicesOpts get service options from plugin context.
+func getServicesOpts(ic *plugin.InitContext) ([]containerd.ServicesOpt, error) {
+	//从ic的plugins的map中获取值map[pluginID]plugins
+	//getByType是从一个2层map中，根据plugin.ServicePlugin取一个map
+	//2层map定义为：byTypeAndID = make(map[Type]map[string]*Plugin)
+	//即[typeOrId,[pluginId,plugin]]
+	plugins, err := ic.GetByType(plugin.ServicePlugin)
+	...
+	//opts数组，第一个元素为“向service的eventService中写入ic.Events”函数变量
+	opts := []containerd.ServicesOpt{
+		containerd.WithEventService(ic.Events),
 	}
+	//定义cri依赖的插件
+	//具体操作为定义一个map，key为插件id，比如ContentService，value为serviceOpt函数。
+	//可以看到依赖的有ContentService/ImagesService/ContainersService等等
+	for s, fn := range map[string]func(interface{}) containerd.ServicesOpt{
+		services.ContentService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithContentStore(s.(content.Store))
+		},
+		services.ImagesService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithImageService(s.(images.ImagesClient))
+		},
+		services.SnapshotsService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithSnapshotters(s.(map[string]snapshots.Snapshotter))
+		},
+		services.ContainersService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithContainerService(s.(containers.ContainersClient))
+		},
+		services.TasksService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithTaskService(s.(tasks.TasksClient))
+		},
+		services.DiffService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithDiffService(s.(diff.DiffClient))
+		},
+		services.NamespacesService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithNamespaceService(s.(namespaces.NamespacesClient))
+		},
+		services.LeasesService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithLeasesService(s.(leases.Manager))
+		},
+		services.IntrospectionService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithIntrospectionService(s.(introspectionapi.IntrospectionClient))
+		},
+	} {
+		//如果在map[pluginId]plugin中存在
+		p := plugins[s]
+		...
+		i, err := p.Instance()
+		...
+		//fn即func WithXXX(xxx interface{}) ServicesOpt
+		opts = append(opts, fn(i))
+	}
+	return opts, nil
+}
 
-	log.G(ctx).Info("Connect containerd service")
+//以contentService为例
+//WithContentStore sets the content store.
+func WithContentStore(contentStore content.Store) ServicesOpt {
+	//返回的servicesOpt为，向s.contentStore项中设置插件服务contentStore
+	return func(s *services) {
+		s.contentStore = contentStore
+	}
+}
+```
+继续回到外层`initCRIService`，接下来将创建服务对象并启动:
+```go
+	...
+	//New函数传入了3个ClientOpt
 	client, err := containerd.New(
 		"",
+		//设置client的ns
 		containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
+		//设置client的platform
 		containerd.WithDefaultPlatform(criplatforms.Default()),
+		//设置client需要用到的插件服务依赖
 		containerd.WithServices(servicesOpts...),
 	)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create containerd client")
-	}
+	...
 	//创建一个cri service
 	//由于cri service实现了CRIService接口，CRIService由继承了plugin.Service
 	//所以cri service会被注册为grpc服务
@@ -111,4 +178,135 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	return s, nil
 }
 
+// NewCRIService returns a new instance of CRIService
+func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIService, error) {
+	var err error
+	labels := label.NewStore()
+	c := &criService{
+		config:             config,
+		client:             client,
+		os:                 osinterface.RealOS{},
+		sandboxStore:       sandboxstore.NewStore(labels),
+		containerStore:     containerstore.NewStore(labels),
+		imageStore:         imagestore.NewStore(client),
+		snapshotStore:      snapshotstore.NewStore(),
+		sandboxNameIndex:   registrar.NewRegistrar(),
+		containerNameIndex: registrar.NewRegistrar(),
+		initialized:        atomic.NewBool(false),
+	}
+
+	if client.SnapshotService(c.config.ContainerdConfig.Snapshotter) == nil {
+		return nil, errors.Errorf("failed to find snapshotter %q", c.config.ContainerdConfig.Snapshotter)
+	}
+	c.imageFSPath = imageFSPath(config.ContainerdRootDir, config.ContainerdConfig.Snapshotter)
+	...
+	if err := c.initPlatform(); err != nil {
+		return nil, errors.Wrap(err, "initialize platform")
+	}
+	// prepare streaming server
+	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort, config.StreamIdleTimeout)
+	...
+	c.eventMonitor = newEventMonitor(c)
+	c.cniNetConfMonitor, err = newCNINetConfSyncer(c.config.NetworkPluginConfDir, c.netPlugin, c.cniLoadOptions())
+	...
+	// Preload base OCI specs
+	c.baseOCISpecs, err = loadBaseOCISpecs(&config)
+	...
+	return c, nil
+}
+```
+最后，看下`Run()`函数：
+```go
+// Run starts the CRI service.
+func (c *criService) Run() error {
+	logrus.Info("Start subscribing containerd event")
+	//1. 向事件监听器注册
+	//过滤事件主题 topic=="/tasks/oom" && topic~="/images/"
+	c.eventMonitor.subscribe(c.client)
+	//恢复已拉起的sandbox
+	logrus.Infof("Start recovering state")
+	if err := c.recover(ctrdutil.NamespacedContext()); err != nil {
+		return errors.Wrap(err, "failed to recover state")
+	}
+	//2. 拉起到达事件的处理
+	// Start event handler.
+	logrus.Info("Start event monitor")
+	eventMonitorErrCh := c.eventMonitor.start()
+	//3. snapshot同步服务
+	// Start snapshot stats syncer, it doesn't need to be stopped.
+	logrus.Info("Start snapshots syncer")
+	snapshotsSyncer := newSnapshotsSyncer(
+		c.snapshotStore,
+		c.client.SnapshotService(c.config.ContainerdConfig.Snapshotter),
+		time.Duration(c.config.StatsCollectPeriod)*time.Second,
+	)
+	snapshotsSyncer.start()
+    //4. CNI网络配置同步
+	// Start CNI network conf syncer
+	logrus.Info("Start cni network conf syncer")
+	cniNetConfMonitorErrCh := make(chan error, 1)
+	go func() {
+		defer close(cniNetConfMonitorErrCh)
+		cniNetConfMonitorErrCh <- c.cniNetConfMonitor.syncLoop()
+	}()
+    //5. 拉起http服务
+	// Start streaming server.
+	logrus.Info("Start streaming server")
+	streamServerErrCh := make(chan error)
+	go func() {
+		defer close(streamServerErrCh)
+		if err := c.streamServer.Start(true); err != nil && err != http.ErrServerClosed {
+			logrus.WithError(err).Error("Failed to start streaming server")
+			streamServerErrCh <- err
+		}
+	}()
+
+	// Set the server as initialized. GRPC services could start serving traffic.
+	c.initialized.Set()
+
+	var eventMonitorErr, streamServerErr, cniNetConfMonitorErr error
+	// Stop the whole CRI service if any of the critical service exits.
+	select {
+	case eventMonitorErr = <-eventMonitorErrCh:
+	case streamServerErr = <-streamServerErrCh:
+	case cniNetConfMonitorErr = <-cniNetConfMonitorErrCh:
+	}
+	if err := c.Close(); err != nil {
+		return errors.Wrap(err, "failed to stop cri service")
+	}
+	// If the error is set above, err from channel must be nil here, because
+	// the channel is supposed to be closed. Or else, we wait and set it.
+	if err := <-eventMonitorErrCh; err != nil {
+		eventMonitorErr = err
+	}
+	logrus.Info("Event monitor stopped")
+	// There is a race condition with http.Server.Serve.
+	// When `Close` is called at the same time with `Serve`, `Close`
+	// may finish first, and `Serve` may still block.
+	// See https://github.com/golang/go/issues/20239.
+	// Here we set a 2 second timeout for the stream server wait,
+	// if it timeout, an error log is generated.
+	// TODO(random-liu): Get rid of this after https://github.com/golang/go/issues/20239
+	// is fixed.
+	const streamServerStopTimeout = 2 * time.Second
+	select {
+	case err := <-streamServerErrCh:
+		if err != nil {
+			streamServerErr = err
+		}
+		logrus.Info("Stream server stopped")
+	case <-time.After(streamServerStopTimeout):
+		logrus.Errorf("Stream server is not stopped in %q", streamServerStopTimeout)
+	}
+	if eventMonitorErr != nil {
+		return errors.Wrap(eventMonitorErr, "event monitor error")
+	}
+	if streamServerErr != nil {
+		return errors.Wrap(streamServerErr, "stream server error")
+	}
+	if cniNetConfMonitorErr != nil {
+		return errors.Wrap(cniNetConfMonitorErr, "cni network conf monitor error")
+	}
+	return nil
+}
 ```

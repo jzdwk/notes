@@ -473,9 +473,26 @@ type ImageServiceServer interface {
 
 ## 创建PodSandbox
 
+创建接口由cri的**grpc服务**完后，根据上文，containerd的cri插件被加载后，创建的`criService`对象实现了grpc服务的RunPodSanbox接口。
+
+cri containerd 插件的主要处理逻辑如下：
+1. 创建sandbox对象：创建的是元数据对象，仅是一条记录而已，不会创建任何资源。元数据对象是用来将一些资源关联在一起的。
+
+2. 确保镜像存在：确保pause容器镜像存在，不在则拉取镜像。
+
+3. 获取oci runtime：根据containerd的配置文件中关于runtime的配置，来决定容器使用哪个runtime启动
+
+4. 创建并配置网络命名空间：创建Pod的网络命名空间，调用CNI插件设置Pod网络。
+
+5. 创建容器对象：创建的是元数据对象，仅是一条记录而已。不会创建任何资源。元数据对象是用来将一些资源关联在一起的。
+
+6. 创建任务： 这里会向containerd中的task service发送创建任务请求，task service中会启动containerd-shim（v2）进程调用runc来创建容器。这一步的执行效果就是pause容器被创建出来
+
+7. 启动任务：这里会向containerd中的task service发送启动任务请求，task service中会将启动任务请求转发给containerd-shim（v2）进程，containerd-shim（v2）进程又会调用runc来讲上面创建的容器启动起来。这一步的执行最终效果就是pause容器被运行起来。
+
 创建PodSandbox的入口为`RuntimeServiceServer`定义的`RunPodSandbox(context.Context, *RunPodSandboxRequest) (*RunPodSandboxResponse, error)`。
 
-根据上文，containerd的cri插件被加载后，创建的`criService`对象实现了该接口：
+以下是`criService`对接口的具体实现：
 ```go
 // RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
 // the sandbox is in ready state.
@@ -552,7 +569,9 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		// In this case however caching the IP will add a subtle performance enhancement by avoiding
 		// calls to network namespace of the pod to query the IP of the veth interface on every
 		// SandboxStatus request.
-		// 这里会调用CNI插件（例如：/opt/cni/bin/bridge)来给Pod沙盒的网络命名空间配置网络
+		// 这里会调用criService对象的netPlugin去给pod的netns配置网络
+		// netPlugin为CNI接口，具体实现为libcni
+		// 配置网络的具体实现即根据libcni中的配置，读取指定路径的cni插件并执行调用
 		if err := c.setupPodNetwork(ctx, &sandbox); err != nil {
 			return nil, errors.Wrapf(err, "failed to setup network for sandbox %q", id)
 		}
@@ -629,7 +648,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// Create sandbox task in containerd.
 	taskOpts := c.taskOpts(ociRuntime.Type)
 	// We don't need stdio for sandbox container.
-	// 创建任务，向containerd发送CreateTaskRequest来创建任务
+	// 创建任务，向containerd发送CreateTaskRequest来创建任务，即创建容器
 	task, err := container.NewTask(ctx, containerdio.NullIO, taskOpts...)
 	...if err, send delete task request
 
@@ -683,7 +702,397 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 ## 创建PodContainer
 
+上一节中，执行`task, err := container.NewTask(ctx, containerdio.NullIO, taskOpts...)`即向containerd发送了CreateTaskRequest来创建容器，具体实现如下：
+```go
+func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...NewTaskOpts) (_ Task, err error) {
+	...
+	// 创建request
+	request := &tasks.CreateTaskRequest{
+		ContainerID: c.id,
+		Terminal:    cfg.Terminal,
+		Stdin:       cfg.Stdin,
+		Stdout:      cfg.Stdout,
+		Stderr:      cfg.Stderr,
+	}
+	// 调用container store，根据id获取container
+	r, err := c.get(ctx)
+	...
+	// 获取容器的挂载点信息，填充到request中
+	if r.SnapshotKey != "" {
+		...
+		// get the rootfs from the snapshotter and add it to the request
+		s, err := c.client.getSnapshotter(ctx, r.Snapshotter)
+		...
+		mounts, err := s.Mounts(ctx, r.SnapshotKey)
+		...
+		spec, err := c.Spec(ctx)
+		...
+		for _, m := range mounts {
+			if spec.Linux != nil && spec.Linux.MountLabel != "" {
+				context := label.FormatMountLabel("", spec.Linux.MountLabel)
+				if context != "" {
+					m.Options = append(m.Options, context)
+				}
+			}
+			request.Rootfs = append(request.Rootfs, &types.Mount{
+				Type:    m.Type,
+				Source:  m.Source,
+				Options: m.Options,
+			})
+		}
+	}
+	info := TaskInfo{
+		runtime: r.Runtime.Name,
+	}
+	...
+	//因为info中的各项都没有被实际赋值，所以略去
+	...
+	t := &task{
+		client: c.client,
+		io:     i,
+		id:     c.id,
+		c:      c,
+	}
+	...
+	//调用task service，其值在创建criService时由cri的ServicesOpts设置
+	response, err := c.client.TaskService().Create(ctx, request)
+	...
+	t.pid = response.Pid
+	return t, nil
+}
+```
+
+此处调用了`taskService`，**Task Service**也是containerd中的一个插件，并提供了**grpc服务**，主要用于同**容器运行时runtime交互**，taskService的接口定义位于`/containerd/api/services/apis/v1/tasks.proto`。其初始化位于，以下是定义：
+```go
+func init() {
+	plugin.Register(&plugin.Registration{
+		Type:     plugin.ServicePlugin, //属于service类plugin
+		ID:       services.TasksService,
+		Requires: tasksServiceRequires,
+		InitFn:   initFunc,
+	})
+
+	timeout.Set(stateTimeout, 2*time.Second)
+}
+
+func initFunc(ic *plugin.InitContext) (interface{}, error) {
+	runtimes, err := loadV1Runtimes(ic)
+	...
+	v2r, err := ic.Get(plugin.RuntimePluginV2)
+	...
+	m, err := ic.Get(plugin.MetadataPlugin)
+	...
+	monitor, err := ic.Get(plugin.TaskMonitorPlugin)
+	....
+	//由/containerd/services/tasks/local.go实现
+	db := m.(*metadata.DB)
+	l := &local{
+		runtimes:   runtimes,
+		containers: metadata.NewContainerStore(db),
+		store:      db.ContentStore(),
+		publisher:  ic.Events,
+		monitor:    monitor.(runtime.TaskMonitor),
+		v2Runtime:  v2r.(*v2.TaskManager),
+	}
+	for _, r := range runtimes {
+		tasks, err := r.Tasks(ic.Context, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range tasks {
+			l.monitor.Monitor(t)
+		}
+	}
+	v2Tasks, err := l.v2Runtime.Tasks(ic.Context, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range v2Tasks {
+		l.monitor.Monitor(t)
+	}
+	return l, nil
+}
+```
+
+在task service收到CreateTaskRequest请求后，主要干了两件事：
+
+1. 启动container shim进程。task service中会执行命令containerd-shim-runc-v2 -namespace k8s.io -id ${id} -bundle ${bundle} -address ${address} start来启动一个containerd shim (v2）进程，shim进程也是以服务化的方式，给containerd调用的。
+
+2. 将CreateTaskRequest请求转给shim进程处理。shim内部的处理这里不再展开，最终shim进程会调用 runc --root ${root} --bundle ${bundle} --log ${log} --pid-file ${pidfile} create ，来创建一个runc 容器
+
+首先看具体实现，`local`实现了grpc的`Create`接口：
+```go
+func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.CallOption) (*api.CreateTaskResponse, error) {
+	container, err := l.getContainer(ctx, r.ContainerID)
+	...
+	checkpointPath, err := getRestorePath(container.Runtime.Name, r.Options)
+	...
+	// jump get checkpointPath from checkpoint image
+	if checkpointPath == "" && r.Checkpoint != nil {
+		checkpointPath, err = ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "ctrd-checkpoint")
+		...
+		if r.Checkpoint.MediaType != images.MediaTypeContainerd1Checkpoint {
+			return nil, fmt.Errorf("unsupported checkpoint type %q", r.Checkpoint.MediaType)
+		}
+		reader, err := l.store.ReaderAt(ctx, ocispec.Descriptor{
+			MediaType:   r.Checkpoint.MediaType,
+			Digest:      r.Checkpoint.Digest,
+			Size:        r.Checkpoint.Size_,
+			Annotations: r.Checkpoint.Annotations,
+		})
+		...
+		_, err = archive.Apply(ctx, checkpointPath, content.NewReader(reader))
+		reader.Close()
+		...
+	}
+	//封装运行时在创建容器时所需的数据
+	opts := runtime.CreateOpts{
+		Spec: container.Spec,
+		IO: runtime.IO{
+			Stdin:    r.Stdin,
+			Stdout:   r.Stdout,
+			Stderr:   r.Stderr,
+			Terminal: r.Terminal,
+		},
+		Checkpoint:     checkpointPath,
+		Runtime:        container.Runtime.Name,
+		RuntimeOptions: container.Runtime.Options,
+		TaskOptions:    r.Options,
+	}
+	for _, m := range r.Rootfs {
+		opts.Rootfs = append(opts.Rootfs, mount.Mount{
+			Type:    m.Type,
+			Source:  m.Source,
+			Options: m.Options,
+		})
+	}
+	....
+	//获取运行时，如果没有设置，默认使用/containerd/runtime/v2/manager.go的TaskManager
+	rtime, err := l.getRuntime(container.Runtime.Name)
+	...
+	_, err = rtime.Get(ctx, r.ContainerID)
+	...
+	//调用TaskManager的Create
+	c, err := rtime.Create(ctx, r.ContainerID, opts)
+	...
+	if err := l.monitor.Monitor(c); err != nil {
+		return nil, errors.Wrap(err, "monitor task")
+	}
+	return &api.CreateTaskResponse{
+		ContainerID: r.ContainerID,
+		Pid:         c.PID(),
+	}, nil
+}
+```
+task servie的create相当于对请求做了一次2次封装，并根据加载的runtime，调用实际的runtime进行create；
+```go
+// Create a new task
+func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.CreateOpts) (_ runtime.Task, err error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	...
+	bundle, err := NewBundle(ctx, m.root, m.state, id, opts.Spec.Value)
+	//...if err. , delete
+	topts := opts.TaskOptions
+	if topts == nil {
+		topts = opts.RuntimeOptions
+	}
+	//启动containerd-shim进程
+	//由于使用的是container-shim-runc-v2，所以这里会调用container-shim-runc-v2命令启动shim
+	//containerd shim v2是containerd shim的v2版本。
+	//【shim进程】是用来在【containerd和runc启动的容器之间】做【铺垫的】，其主要作用是：
+	//1. 调用runc命令创建、启动、停止、删除容器等
+	//2. 作为容器的父进程，当容器中的第一个实例进程被杀死后，负责给其子进程收尸，避免出现僵尸进程
+	//3. 监控容器中运行的进程状态，当容器执行完成后，通过exit fifo文件来返回容器进程结束状态
+	b := shimBinary(ctx, bundle, opts.Runtime, m.containerdAddress, m.containerdTTRPCAddress, m.events, m.tasks)
+	shim, err := b.Start(ctx, topts, func() {
+		log.G(ctx).WithField("id", id).Info("shim disconnected")
+
+		cleanupAfterDeadShim(context.Background(), id, ns, m.tasks, m.events, b)
+		// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
+		// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
+		// disconnect and there is no chance to remove this dead task from runtime task lists.
+		// Thus it's better to delete it here.
+		m.tasks.Delete(ctx, id)
+	})
+	...
+	//shim进程起来之后，执行Create
+	//首先封装task.CreateTaskRequest，再调用task service的Create接口
+	//此请求会发送给shim去处理。shim调用runc create来创建一个runc容器
+	t, err := shim.Create(ctx, opts)
+	m.tasks.Add(ctx, t)
+	return t, nil
+}
+```
+在`shim`进程启动后，调用`t, err := shim.Create(ctx, opts)`去请求task service的Create接口，看下内部逻辑:
+```
+func (s *shim) Create(ctx context.Context, opts runtime.CreateOpts) (runtime.Task, error) {
+	topts := opts.TaskOptions
+	if topts == nil {
+		topts = opts.RuntimeOptions
+	}
+	//请求封装
+	request := &task.CreateTaskRequest{
+		ID:         s.ID(),
+		Bundle:     s.bundle.Path,
+		Stdin:      opts.IO.Stdin,
+		Stdout:     opts.IO.Stdout,
+		Stderr:     opts.IO.Stderr,
+		Terminal:   opts.IO.Terminal,
+		Checkpoint: opts.Checkpoint,
+		Options:    topts,
+	}
+	for _, m := range opts.Rootfs {
+		request.Rootfs = append(request.Rootfs, &types.Mount{
+			Type:    m.Type,
+			Source:  m.Source,
+			Options: m.Options,
+		})
+	}
+	//调用shim.task的Create
+	response, err := s.task.Create(ctx, request)
+	..
+	s.taskPid = int(response.Pid)
+	return s, nil
+}
+```
+那么这个`shim.task`来自哪里呢？回到上一节的`func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.CreateOpts)`函数，看到`shim.task`的赋值：
+```go
+	shim, err := b.Start(ctx, topts, func() {
+		log.G(ctx).WithField("id", id).Info("shim disconnected")
+
+		cleanupAfterDeadShim(context.Background(), id, ns, m.tasks, m.events, b)
+		// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
+		// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
+		// disconnect and there is no chance to remove this dead task from runtime task lists.
+		// Thus it's better to delete it here.
+		m.tasks.Delete(ctx, id)
+	})
+//进入b.Start
+func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ *shim, err error) {
+	...省略
+	//返回一个ttrpc Client
+	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onCloseWithShimLog))
+	return &shim{
+		bundle:  b.bundle,
+		client:  client, //
+		task:    task.NewTaskClient(client), //内部对client进行了封装，task.Create将最终调用task.client.Call
+		events:  b.events,
+		rtTasks: b.rtTasks,
+	}, nil
+}
+
+```
+继续看`taskClient`的`Call`：
+```go
+func (c *Client) Call(ctx context.Context, service, method string, req, resp interface{}) error {
+	payload, err := c.codec.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	var (
+		creq = &Request{
+			Service: service,
+			Method:  method,
+			Payload: payload,
+		}
+
+		cresp = &Response{}
+	)
+
+	if metadata, ok := GetMetadata(ctx); ok {
+		metadata.setRequest(creq)
+	}
+
+	if dl, ok := ctx.Deadline(); ok {
+		creq.TimeoutNano = dl.Sub(time.Now()).Nanoseconds()
+	}
+
+	info := &UnaryClientInfo{
+		FullMethod: fullPath(service, method),
+	}
+	if err := c.interceptor(ctx, creq, cresp, info, c.dispatch); err != nil {
+		return err
+	}
+
+	if err := c.codec.Unmarshal(cresp.Payload, resp); err != nil {
+		return err
+	}
+
+	if cresp.Status != nil && cresp.Status.Code != int32(codes.OK) {
+		return status.ErrorProto(cresp.Status)
+	}
+	return nil
+}
+```
 ## 启动PodContainer
+
+再次回到`criService`的`RunPodSandbox`函数，在创建PodSandbox中已经说明，拉起container的的过程分为2步：创建和启动。
+
+上一节中执行了container的创建，此节将执行启动过程。
+
+`criService`的代码如下
+```go
+// RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
+// the sandbox is in ready state.
+func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
+	...省略
+	//创建，上一节内容
+	task, err := container.NewTask(ctx, containerdio.NullIO, taskOpts...)
+	...
+	// wait is a long running background request, no timeout needed.
+	...//执行
+	if err := task.Start(ctx); err != nil {
+		return nil, errors.Wrapf(err, "failed to start sandbox container task %q", id)
+	}
+	...
+	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
+}
+```
+此时将调用task service的`Start`接口：
+```go
+func (t *task) Start(ctx context.Context) error {
+	r, err := t.client.TaskService().Start(ctx, &tasks.StartRequest{
+		ContainerID: t.id,
+	})
+	...
+	t.pid = r.Pid
+	return nil
+}
+```
+与上一节相同，具体的实现为：
+```go
+func (l *local) Start(ctx context.Context, r *api.StartRequest, _ ...grpc.CallOption) (*api.StartResponse, error) {
+	t, err := l.getTask(ctx, r.ContainerID)
+	...
+	p := runtime.Process(t)
+	if r.ExecID != "" {
+		if p, err = t.Process(ctx, r.ExecID); err != nil {
+			return nil, errdefs.ToGRPC(err)
+		}
+	}
+	if err := p.Start(ctx); err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	state, err := p.State(ctx)
+	...
+	return &api.StartResponse{
+		Pid: state.Pid,
+	}, nil
+}
+
+// p.Start()
+func (s *shim) Start(ctx context.Context) error {
+       //向shim发送请求
+        response, err := s.task.Start(ctx, &task.StartRequest{
+                ID: s.ID(),
+        })
+        ...
+}
+```
+上面这个函数主要就是做了一件事情：将请求转给containerd-shim(v2)进程处理。containerd-shim(v2)进程又会调用 runc --root ${root} --bundle ${bundle} --log ${log} --pid-file ${pidfile} start ${id}将先前创建的容器启动起来。
+
+到此,RunPodSandbox处理的解析结束。
 
 ## 参考
 

@@ -199,7 +199,7 @@ kubeadm join 192.168.182.134:6443 --token z34zii.ur84appk8h9r3yik --discovery-to
    echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> ~/.bash_profile
 ```
    
-# 安装pod 网络
+# 安装pod网络
 
 ## fanneld
 
@@ -309,3 +309,10 @@ kubeadm join 192.168.182.134:6443 --token lixsl8.v1auqmf91ty0xl0k \
 1. kubectl删除所有work node 
 2. master使用kubeadm reset重置，注意此时并没有重置 ~/.kube/config的描述
 3. 重新上线，使用`kubeadm init`后，将worknode加入，需要重新启用flaneld，kubectl delete -f kube-fanneld.yml / kubectl create -f kube-finneld.yml 
+
+# 设置代码自动补全
+```bash
+yum install bash-completion
+source /usr/share/bash-completion/bash_completion
+source <(kubectl completion bash)
+```

@@ -460,6 +460,7 @@ type Resource struct {
 	Metadata     *ResourceMetadata      `json:"metadata"`
 	//对应的registry描述，比如harbor 或其他私有仓库
 	Registry     *Registry              `json:"registry"`
+	//额外需要存储的信息
 	ExtendedInfo map[string]interface{} `json:"extended_info"`
 	// Indicate if the resource is a deleted resource
 	Deleted bool `json:"deleted"`

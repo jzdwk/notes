@@ -1,63 +1,20 @@
 # 规划
-- 环境 2CPU以上; docker18.09.0-3.el7 注意, 最新的19版不支持; k8s v1.16.3;
-- master： 192.168.182.134
-- work_1 192.168.182.135
-- work_2 192.168.182.136
+- 使用**kubeadm**安装k8s v1.20
+- 环境 2CPU以上; docker18.09.0-3.el7
+- master134： 192.168.182.134
+- node135 192.168.182.135
+- node136 192.168.182.136
 
 参考 ：https://segmentfault.com/a/1190000020738509?utm_source=tag-newest
 
-# Master CentOS 7 134
 
-## 环境准备
+# 环境准备
 
-1. 关闭防火墙
+如无特殊说明，需要在**各节点**执行。
 
-```bash
-	systemctl disable firewalld
-	systemctl stop firewalld
-```
-原因为，master与node间有大量通信。
-更安全的做法是在防火墙上配置各个组件互通的端口号。
-这里选择关闭即省事。
+## network配置 
 
-2. 关闭selinux
- 
-- 临时禁用selinux:`setenforce 0`
- 
-- 永久关闭 修改/etc/sysconfig/selinux文件设置:
-
-```bash
-    sed -i 's/SELINUX=permissive/SELINUX=disabled/' /etc/sysconfig/selinux
-    sed -i "s/SELINUX=enforcing/SELINUX=disabled/g" /etc/selinux/config
-```
-
-关闭的原因为，容器需要读取主机文件系统（比如容器网络的pod）。
-
-3. 关闭swap
-
-- `swapoff -a`
-
--  永久禁用 打开`/etc/fstab`注释掉swap那一行
-```bash
-	sed -i 's/.*swap.*/#&/' /etc/fstab
-```   
-关闭的原因为，k8s在调度pod时需要评估node的内存，swap增加了此项工作的复杂度，同时影响了性能。
-  
-4. 修改 `/etc/hosts`,向其中添加 192.168.182.13x的本地域名
-
-- 修改内核参数 
-```
-   /etc/sysctl.d/k8s.conf
-   net.bridge.bridge-nf-call-ip6tables = 1
-   net.bridge.bridge-nf-call-iptables = 1
-   sysctl --system
-```
-
-## 软件安装
-
-1. network配置 
-
-- 将ip配置为192.168.182.134
+将ip配置为192.168.182.134
 ```bash    
 	cd /etc/sysconfig/network-scripts/ 
     vi ifcfg-ens33 #视具体网卡名称而定
@@ -93,19 +50,172 @@ NAME=ens33
 	service network restart	
 ```
 
-2. 配置yum源
+## 配置yum源
 
 使用阿里yum源，请查看指定OS的`帮助`：https://opsx.alibaba.com/mirror
 	 
-3. docker配置，[详见]()
-  
-4. 安装kubectl  [详见](https://www.kubernetes.org.cn/installkubectl)
-  
-5. 安装kubeadm kubelet [详见](https://www.kubernetes.org.cn/4256.html)
+## 安装docker，不再赘述
 
-6. 配置k8s的源`/etc/yum.repos.d/kubernetes.repo`
+## 关闭防火墙
+
 ```bash
-[root@master yum.repos.d]# cat kubernetes.repo 
+	systemctl disable firewalld
+	systemctl stop firewalld
+```
+原因为，master与node间有大量通信。
+更安全的做法是在防火墙上配置各个组件互通的端口号。
+这里选择关闭即省事。
+
+## 关闭selinux
+ 
+- 临时禁用selinux:`setenforce 0`
+ 
+- 永久关闭 修改/etc/sysconfig/selinux文件设置:
+
+```bash
+    sed -i 's/SELINUX=permissive/SELINUX=disabled/' /etc/sysconfig/selinux
+    sed -i "s/SELINUX=enforcing/SELINUX=disabled/g" /etc/selinux/config
+```
+
+关闭的原因为，容器需要读取主机文件系统（比如容器网络的pod）。
+
+## 关闭swap
+
+- `swapoff -a`
+
+-  永久禁用 打开`/etc/fstab`注释掉swap那一行
+```bash
+	sed -i 's/.*swap.*/#&/' /etc/fstab
+```   
+关闭的原因为，k8s在调度pod时需要评估node的内存，swap增加了此项工作的复杂度，同时影响了性能。
+  
+## 设置主机名
+
+``` bash
+hostnamectl set-hostname master134 # 将 master134 替换为当前主机名
+```
+同理，在`135`和`136`上设置hostname
+
+在每台机器的 `/etc/hosts` 文件中添加主机名和 IP 的对应关系：
+
+``` bash
+cat >> /etc/hosts <<EOF
+192.168.182.134 master134
+192.168.182.135 node135
+192.168.182.136 node136
+EOF
+```
+
+## 添加节点信任
+
+只需要在**master134 节点上执行**，设置 root 账户可以无密码登录**所有节点**：
+``` bash
+ssh-keygen -t rsa 
+ssh-copy-id root@master134
+ssh-copy-id root@node135
+ssh-copy-id root@node136
+```
+`ssh-copy-id`命令用于将本地主机的公钥复制到远程主机的authorized_keys文件上，ssh-copy-id命令也会给远程主机的用户主目录（home）和~/.ssh, 和~/.ssh/authorized_keys设置合适的权限。
+
+
+## 优化内核参数 
+
+``` bash
+cat > k8s.conf <<EOF
+# 设置二层的网桥在转发包被iptables的FORWARD规则所过滤
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+# 开启IP转发，使宿主机机像路由器一样将数据从一个网络发送到另一个网络
+net.ipv4.ip_forward=1
+net.ipv4.tcp_tw_recycle=0
+
+net.ipv4.neigh.default.gc_thresh1=1024
+net.ipv4.neigh.default.gc_thresh1=2048
+net.ipv4.neigh.default.gc_thresh1=4096
+
+vm.swappiness=0
+vm.overcommit_memory=1
+vm.panic_on_oom=0
+
+fs.inotify.max_user_instances=8192
+fs.inotify.max_user_watches=1048576
+fs.file-max=52706963
+fs.nr_open=52706963
+
+net.ipv6.conf.all.disable_ipv6=1
+net.netfilter.nf_conntrack_max=2310720
+EOF
+cp k8s.conf  /etc/sysctl.d/k8s.conf
+sysctl -p /etc/sysctl.d/k8s.conf
+```
+
+## 设置时间
+
+设置时区
+``` bash
+timedatectl set-timezone Asia/Shanghai
+```
+设置系统时钟同步
+``` bash
+systemctl enable chronyd
+systemctl start chronyd
+```
+查看同步状态：
+``` bash
+timedatectl status
+```
+
+输出：
+``` text
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+```
+`System clock synchronized: yes`，表示时钟已同步；
+`NTP service: active`，表示开启了时钟同步服务；
+
+``` bash
+# 将当前的 UTC 时间写入硬件时钟
+timedatectl set-local-rtc 0
+
+# 重启依赖于系统时间的服务
+systemctl restart rsyslog 
+systemctl restart crond
+```
+## 关闭无关的服务
+
+``` bash
+systemctl stop postfix && systemctl disable postfix
+```
+
+## 升级内核
+
+CentOS 7.x 系统自带的 3.10.x 内核存在一些 Bugs，导致运行的 Docker、Kubernetes 不稳定，例如：
+- 高版本的 docker(1.13 以后) 启用了 3.10 kernel 实验支持的 kernel memory account 功能(无法关闭)，当节点压力大如频繁启动和停止容器时会导致 cgroup memory leak；
+- 网络设备引用计数泄漏，会导致类似于报错："kernel:unregister_netdevice: waiting for eth0 to become free. Usage count = 1";
+
+``` bash
+rpm -Uvh http://www.elrepo.org/elrepo-release-7.0-3.el7.elrepo.noarch.rpm
+# 安装完成后检查 /boot/grub2/grub.cfg 中对应内核 menuentry 中是否包含 initrd16 配置，如果没有，再安装一次！
+yum --enablerepo=elrepo-kernel install -y kernel-lt
+# 设置开机从新内核启动
+grub2-set-default 0
+```
+
+重启机器：
+
+``` bash
+sync
+reboot
+```
+
+# master134配置
+  
+## 安装kubectl kubeadm kubelet
+
+配置k8s的源，这里使用aliyun的替换官方的google
+```bash
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
 [kubernetes]
 name=Kubernetes
 baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
@@ -113,36 +223,43 @@ gpgcheck=1
 enabled=1
 repo_gpgcheck=1
 gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
 ```
-	
-2. 安装 kubelet kubeadm  
+安装指定版本v1.20
 ```
-    setenforce 0
-    yum install -y kubelet kubeadm
-    systemctl enable kubelet && systemctl start kubelet
+yum install -y kubelet-1.20.0 kubeadm-1.20.0 kubectl-1.20.0 --disableexcludes=kubernetes
 ```
+- 将`/usr/bin/kubectl`拷贝到`/usr/local/bin/kubectl`
 
-3. 至此，节点的准备工作完毕，可将此虚拟机复制copy N份作为work的环境
+## kubeadm init
 
-## 使用kubeadm 创建 master 
-
-1. 选择安装过kubeadm的机器 执行`kubeadm init`
+选择安装过kubeadm的机器 执行`kubeadm init`
 
 该命令首先会下载k8s的组件，如apiserver/etcd等等
 由于墙，访问不了国外repo，所以从阿里云下载镜像，首先，参考: https://segmentfault.com/a/1190000020738509?utm_source=tag-newest
 
 - 确认版本信息`kubeadm config images list`
-
-- 编写脚本，注意将脚本的版本内容替换为本机实际值：
+```bash
+[root@master134 yum.repos.d]# kubeadm config images list
+I0605 11:03:59.755418    3401 version.go:251] remote version is much newer: v1.21.1; falling back to: stable-1.20
+k8s.gcr.io/kube-apiserver:v1.20.7
+k8s.gcr.io/kube-controller-manager:v1.20.7
+k8s.gcr.io/kube-scheduler:v1.20.7
+k8s.gcr.io/kube-proxy:v1.20.7
+k8s.gcr.io/pause:3.2
+k8s.gcr.io/etcd:3.4.13-0
+k8s.gcr.io/coredns:1.7.0
+```
+- 编写脚本，注意将脚本的版本内容替换为**上条命令返回的版本信息**：
 ```bash
   #!/bin/bash
   # 脚本的目的为从aliyun上pull镜像，tag为官方镜像
   set -e
 
-  KUBE_VERSION=v1.16.0
-  KUBE_PAUSE_VERSION=3.1
-  ETCD_VERSION=3.3.15-0
-  CORE_DNS_VERSION=1.6.2
+  KUBE_VERSION=v1.20.7
+  KUBE_PAUSE_VERSION=3.2
+  ETCD_VERSION=3.4.13-0
+  CORE_DNS_VERSION=1.7.0
 
   GCR_URL=k8s.gcr.io
   ALIYUN_URL=registry.cn-hangzhou.aliyuncs.com/google_containers
@@ -161,45 +278,69 @@ gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors
     docker rmi $ALIYUN_URL/$imageName
   done
 ```
-运行`sh ./kubeadm.sh`后，执行kubeadm:
+运行`sh k8s_image.sh`.
+
+- 执行kubeadm:
 
 ```bash
  sudo kubeadm init \
  --apiserver-advertise-address 192.168.182.134 \
- --kubernetes-version=v1.16.3 \
+ --kubernetes-version=v1.20.7 \
  --pod-network-cidr=10.244.0.0/16
 ```
 
 该命令需要注意： 
-- pod-network-cidr指的是pod的网络域
-- docker的驱动模式改为systemd，在/etc/docker下创建daemon.json并编辑`mkdir /etc/docker/daemon.json`,加入以下内容：
-```
+- **pod-network-cidr**指的是pod的网络域
+- docker的驱动模式要改为**systemd**，在`/etc/docker`下创建`daemon.json`并加入以下内容：
+```json
 {
+    //other configs
+	"xxxx":"xxxx",
 	"exec-opts":["native.cgroupdriver=systemd"]
 }
 ```
-- cpu 2个以上 
-- 内核环境配置，见`环境配置`
+当出现以下输出，说明配置成功:
+```bash
+Then you can join any number of worker nodes by running the following on each as root:
 
-- 当出现 kubeadm join XXXX 以及token 时，说明配置成功。
+kubeadm join 192.168.182.134:6443 --token u68djx.q40ejbwsrsct8g0w \
+    --discovery-token-ca-cert-hash sha256:17ddf76718a5249b3407c39e95c02887684c8f16a682efa0dd0816f18293acab
+```
 
-- 添加work节点使用命令:
+- 要使**非root用户**可以运行**kubectl**，执行：
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
 ```
-kubeadm join 192.168.182.134:6443 --token z34zii.ur84appk8h9r3yik --discovery-token-ca-cert-hash sha256:dae426820f2c6073763a3697abeb14d8418c9268288e37b8fc25674153702801 --control- 
-     plane --certificate-key 1b9b0f1fdc0959a9decef7d812a2f606faf69ca44ca24d2e557b3ea81f415afe
+
+# node节点加入
+
+根据上面`kubeadm join`的输出，添加work节点使用命令:
 ```
-- 将kube相关文件粘贴至home下
-```mkdir -p $HOME/.kube;
-   cp -i /etc/kubernetes/admin.conf $HOME/.kube/config;
-   chown $(id -u):$(id -g) $HOME/.kube/config
+kubeadm join 192.168.182.134:6443 --token u68djx.q40ejbwsrsct8g0w \
+    --discovery-token-ca-cert-hash sha256:17ddf76718a5249b3407c39e95c02887684c8f16a682efa0dd0816f18293acab
 ```
+
 - 重复获取token的join命令为 `kubeadm token create --print-join-command`
+
 - 执行kubectl get pods等命令，如果提示命令拒绝，将配置文件添加至环境变量
 ```bash   
    echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> ~/.bash_profile
 ```
    
 # 安装pod网络
+
+## calico(推荐)
+
+https://docs.projectcalico.org/getting-started/kubernetes/quickstart
+
+```bash
+#1
+kubectl create -f https://docs.projectcalico.org/manifests/tigera-operator.yaml
+#2
+kubectl create -f https://docs.projectcalico.org/manifests/custom-resources.yaml
+```
 
 ## fanneld
 
@@ -254,7 +395,7 @@ EOF
 删除`--network-plugin=cni`
 systemctl restart kubelet
 ```
-## weave（推荐）
+## weave
 
 - 获取yaml文件
 ```bash
@@ -264,51 +405,40 @@ kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl versio
 
 因codedns组件会被调度到node上，所以确保node上存在`k8s.gcr.io/coredns:{version}`
 
-# Work CentOS 7
+# 重启集群
 
-工作节点 需要以下安装 kubeadm kubelet flanneld docker
+master和work都可以使用`kubeadm reset`重置，work节点的退出同样使用该命令
 
-## 安装kubectl kubelet kubeadm 
+- work节点上/下线：
+1. work节点使用`kubeadm reset`清空配置
+2. 在master节点使用 kubectl delete nodes <nodename>
+3. 重新上线 使用`kubeadm join`
 
-与master相同 
+- master节点上下线
+1. kubectl删除所有work node 
+2. master使用`kubeadm reset`重置，注意此时并没有重置 ~/.kube/config的描述
+3. 重新上线，使用`kubeadm init`后，将work node加入，需要重新部署网络插件
 
-## 配置环境
+# 删除集群
 
-涉及selinux/内核等，与master相同
+1. 卸载服务:`kubeadm reset`
 
-## node加入
-在master执行命令：
+2. 删除组件
 ```bash
-kubeadm token create --print-join-command
+yum remove kubelet kubeadm kubectl -y
 ```
-将结果赋值，给node节点执行，比如:
+3. 删除容器及镜像
 ```bash
-kubeadm join 192.168.182.134:6443 --token lixsl8.v1auqmf91ty0xl0k \
-    --discovery-token-ca-cert-hash 
-    sha256:c3f92a6ed9149ead327342f48a545e7e127a455d5b338129feac85893d918a55 \
-   --ignore-preflight-errors=all
+docker images -qa|xargs docker rmi -f
 ```
 
+# 其他说明
    
 1. docker的驱动模式改为systemd,在/etc/docker下创建daemon.json并编辑：`mkdir /etc/docker/daemon.json`加入以下内容：
 ```{"exec-opts":["native.cgroupdriver=systemd"]}```
 
 2. 提示加入成功后，查看master的node状态`kubectl get nodes`
 
-# 其他说明
-- master和work都可以使用kubeadm reset重置，work节点的退出同样使用该命令
-
-- work节点上/下线：
-
-1. work节点使用kubeadm reset清空配置
-2. 在master节点使用 kubectl delete nodes <nodename>
-3. 重新上线 使用`kubeadm join`
-
-- master节点上下线
-
-1. kubectl删除所有work node 
-2. master使用kubeadm reset重置，注意此时并没有重置 ~/.kube/config的描述
-3. 重新上线，使用`kubeadm init`后，将worknode加入，需要重新启用flaneld，kubectl delete -f kube-fanneld.yml / kubectl create -f kube-finneld.yml 
 
 # 设置代码自动补全
 ```bash

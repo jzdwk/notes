@@ -113,7 +113,7 @@ m = r.sub == p.sub && r.act == p.act && r.obj == p.obj
 //如果匹配策略结果p.eft 存在(some) allow的结果，那么最终结果就为 真
 e = some(where(p.eft == allow))
 
-//如果有匹配出结果为alllow的策略并且没有匹配出结果为deny的策略则结果为真，换句话说，就是匹配的策略都为allow时才为真，如果有任何deny，都为假
+//如果有匹配出结果为allow的策略并且没有匹配出结果为deny的策略则结果为真，换句话说，就是匹配的策略都为allow时才为真，如果有任何deny，都为假
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 ```
 
@@ -195,11 +195,12 @@ r = sub, obj, act
 [policy_definition]
 p = sub, obj, act, eft
 
-# Role definition , 只定义用户和角色（）
+# Role definition , 只定义用户和角色
 [role_definition]
 g = _, _
 
 # Policy effect， 鉴权结果约束
+# 要求所有的结果都为allow，如果一个为deny则不成功
 [policy_effect]
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 
@@ -273,6 +274,7 @@ func (a *userAdapter) getUserPolicyLines() []string {
 	...
 	for _, policy := range a.GetPolicies() {
 		//format为policy的合法格式
+		//比如一条policy记录为 p, zhangsan, helm-chart, read , allow
 		line := fmt.Sprintf("p, %s, %s, %s, %s", username, policy.Resource, policy.Action, policy.GetEffect())
 		lines = append(lines, line)
 	}
@@ -330,9 +332,14 @@ allPolicies = []*rbac.Policy{
 		...
 	}
 ```
-回到userAdapter的`getUserPolicyLines`，可知返回的user policy大致内容为：
+回到userAdapter的`getUserPolicyLines`，可知返回的user policy描述了一个权限集合(数组形式)，大致内容为：
 ```
+...
 p, zhangsan, porject/{pid}/label, read, allow
+p, zhangsan, porject/{pid}/label, create, allow
+p, zhangsan, porject/{pid}/label, delete, allow
+p, zhangsan, project/{pid}/chart, read, allow
+...
 ```
 
 2. **Role Policy**
@@ -344,6 +351,7 @@ func (a *userAdapter) getUserAllPolicyLines() []string {
 	lines = append(lines, a.getUserPolicyLines()...)
 	//a.GetRole获取a的所有Role
 	for _, role := range a.GetRoles() {
+	    //获取user对应的role对project的策略
 		lines = append(lines, a.getRolePolicyLines(role)...)
 		lines = append(lines, fmt.Sprintf("g, %s, %s", username, role.GetRoleName()))
 	}
@@ -361,7 +369,7 @@ func (a *userAdapter) getRolePolicyLines(role Role) []string {
 	return lines
 }
 ```
-其中role相关policy的定义如下：
+其中role相关policy的定义如下，下述记录**描述了一个角色的所有权限**：
 ```go
 rolePoliciesMap = map[string][]*rbac.Policy{
 		"projectAdmin": {
@@ -375,9 +383,14 @@ rolePoliciesMap = map[string][]*rbac.Policy{
 		}
 		...			
 ```
-因此，role poicy的内容最终为：
+因此，role poicy的内容同样返回了zhangsan(user)作为某个项目的projectAdmin(role)，可操作的权限有：
 ```
-p, projectAdmin, project/{pid}/label, allow
+...
+p, projectAdmin, project/{pid}/label ,read ,allow
+p, projectAdmin, project/{pid}/label ,list , allow
+p, projectAdmin, project/{pid}/label ,create , allow
+p, projectAdmin, project/{pid}/label ,update , allow
+...
 ```
 
 3. **UserName&Role Policy**
@@ -389,6 +402,7 @@ func (a *userAdapter) getUserAllPolicyLines() []string {
 	lines = append(lines, a.getUserPolicyLines()...)
 	//a.GetRole获取a的所有Role
 	for _, role := range a.GetRoles() {
+	    //获取user对应的role对project的策略
 		lines = append(lines, a.getRolePolicyLines(role)...)
 		//获取username和role的关系
 		lines = append(lines, fmt.Sprintf("g, %s, %s", username, role.GetRoleName()))

@@ -344,11 +344,19 @@ net namespace隔离了网络栈，容器网络的隔离使用了net namespace。
 ```
 ### Bridge
 
-Bridge工作在**链路层**，是一种**虚拟网络设备**，所以具备虚拟网络设备的所有特性，比如可以配置 IP、MAC 等。除此之外，Bridge还是一个**交换机**，具有交换机所有的功能。因此，Bridge可以接入其他的网络设备，比如物理设备、虚拟设备、VLAN 设备等。Bridge通常充当主设备，其他设备为从设备，这样的效果就等同于物理交换机的端口连接了一根网线。
+veth的问题在于，当在多个network namespace之间通信时，veth需要类似点对点的架构，形成网状网络，整个管理会非常复杂，任意两个namespace之间都需要创建veth pair。使用linux网桥可以解决这种困扰，充当交换机的功能，将**网状网络转化为星状网络**。
 
-而它把其他的从设备虚拟为一个port。当把一个网卡设备(或虚拟网卡)加入的网桥后，网卡将**共享网桥的ip，网卡的接受、发送数据包就交给网桥决策**。
 
-因此，Bridge可以作为容器/虚拟机通信的媒介，将不同net namespace上的Veth设备加入Bridge实现通信。
+Bridge工作在**链路层**，是一种**虚拟网络设备**，可类比为一个**交换机**，具有交换机所有的功能。因此，Bridge可以接入其他的网络设备，比如物理设备、虚拟设备、VLAN 设备等。Bridge通常充当主设备，其他设备为从设备，这样的效果就等同于物理交换机的端口连接了一根网线。
+
+而它把其他的从设备虚拟为一个port。当把一个网卡设备(或虚拟网卡)加入的网桥后，网卡将**共享网桥的ip，网卡的接受、发送数据包就交给网桥决策**。具体来说
+
+- 在收到一个数据帧时，记录其源mac地址和对应的PORT的映射关系，进行一轮学习
+- 在收到一个数据帧时，检查目的mac地址是否在本地缓存，如果在，则将数据帧转发到具体的PORT，如果不在，则进行泛洪，给除了入PORT之外的所有PORT都拷贝这个帧
+
+那么，将veth桥接到网桥当中，这样通过网桥的自学习和泛洪功能，就可以将数据包从一个namespace发送到另外一个namespace当中。
+
+因此，Bridge可以作为容器/虚拟机通信的媒介，**将不同net namespace上的Veth设备加入Bridge**实现通信。
 
 示例：
 ```shell
@@ -356,10 +364,10 @@ Bridge工作在**链路层**，是一种**虚拟网络设备**，所以具备虚
 [/]$ sudo ip netns add ns1
 [/]$ sudo ip link add veth0 type veth peer name veth1
 [/]$ #将veth1移入ns1
-[/]$ sudo ip link set vethl netns nsl
+[/]$ sudo ip link set veth1 netns ns1
 [/]$ #创建网桥br0
 [/]$ sudo brctl addbr br0
-[/]$ #挂载网络设备,其中将veth0挂载到网桥
+[/]$ #挂载网络设备,其中将veth0和eth0挂载到网桥，注意，当eth0被挂载到网桥后，将不支持外部链接访问
 [/]$ sudo brctl addif br0 eth0
 [/]$ sudo brctl addif br0 veth0
 ```
@@ -380,7 +388,7 @@ linux的路由表功能和路由器中的route table一致，定义路由表来�
 [/]$ #在宿主机上将172.18.0.0/24 的网段请求路由到br0的网桥
 [/]$ sudo route add -net 172.18.0.0/24 dev br0
 [/]$ #从ns1中访问宿主机的地址,假设为10.0.2.15
-[/]$ 此时的路径为:首先根据ns1的路由表配置，所有流量从veth1流出，流向对端设备veth0，而后者和eth0均挂载与网桥上，因此通信成功
+[/]$ 此时的路径为:首先根据ns1的路由表配置，所有流量从veth1流出，流向对端设备veth0，而后者和eth0均挂载与网桥上，网桥执行泛洪，因此通信成功
 [/]$ sudo ip netns exec nsl ping -c 1 10.0.2.15
 [/]$ #从宿主机访问Namespace中的网络地址
 [/]$ #此时的路径为：根据宿主的route配置，172流量均流向网桥br0，因此br0接收流量，根据mac地址转发至veth0的对端veth1,
@@ -388,9 +396,10 @@ linux的路由表功能和路由器中的route table一致，定义路由表来�
 ```
 
 
+
 ### iptables
 
-netfilter/iptables(iptables是Linux管理工具，位于/sbin/iptables。实现功能的是netfilter，它是Linux内核中实现包过滤的内部结构)是Linux平台下的包过滤防火墙，它通过配置**规则**，完成封包过滤、封包重定向和网络地址转换（NAT）等功能。实现上，通过**表和链**来完成具体功能。
+netfilter/iptables(iptables是Linux管理工具，位于/sbin/iptables。实现功能的是netfilter，它是Linux内核中实现包过滤的内部结构，是Linux平台下的包过滤防火墙，它通过配置**规则**，完成封包过滤、封包重定向和网络地址转换（NAT）等功能。实现上，通过**表和链**来完成具体功能。
 
 - **表（tables）**提供特定的功能，iptables内置了**4个表，即filter表、nat表、mangle表和raw表**，分别用于实现包过滤，网络地址转换、包重构(修改)和数据跟踪处理。具体的划分如下：
 
@@ -413,7 +422,7 @@ netfilter/iptables(iptables是Linux管理工具，位于/sbin/iptables。实现�
 
 表描述了实现功能模块上的划分，链描述了对数据包的处理时机。
 
-这样设计的原因在于：**对于一个数据包的处理，有两个维度需要考虑，一个是如何处理，另一个是处理时机。如何处理的逻辑即为包过滤、重构等，处理时机则分为了路由前/后等。**因此，在对一个数据包的整体处理上，遵循**先表后链**的原则，因此会有。
+这样设计的原因在于：对于一个数据包的处理，有**两个维度**需要考虑，**一个是如何处理，另一个是处理时机。如何处理**的逻辑即为包过滤、重构等，对应于**表的功能**，**处理时机**则分为了路由前/后等，**对应于链的描述。**因此，在对一个数据包的整体处理上，遵循**先表后链**的原则，因此会有。
 
 可见图[!tables&chains](../images/docker/base-table-chain.png)
 
@@ -466,7 +475,7 @@ iptables [-t 表名] 命令选项 ［链名］ ［条件匹配］ ［-j 目标�
 
 1. MASQUERADE
 
-在理解这个规则之前，先梳理SNAT（Source Network Address Translation，源地址转换）,SNAT在数据包流出这台机器之前的最后一个链，也就是POSTROUTING链来，进行操作。比如：
+在理解这个规则之前，先梳理SNAT（Source Network Address Translation，源地址转换）,SNAT在数据包流出这台机器之前的最后一个链，也就是POSTROUTING链，进行操作。比如：
 ```shell
 # iptables -t nat -A POSTROUTING -s 192.168.0.0/24 -j SNAT --to-source 58.20.51.66
 ```

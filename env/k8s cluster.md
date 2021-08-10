@@ -279,6 +279,14 @@ k8s.gcr.io/coredns:1.7.0
   done
 ```
 运行`sh k8s_image.sh`.
+node也需要上述镜像，所以：
+```bash
+[root@master134 install]# scp k8s_images.sh root@node135:/root/k8sdemo/
+k8s_images.sh                                                                             100%  579   198.2KB/s   00:00    
+[root@master134 install]# scp k8s_images.sh root@node136:/root/k8sdemo/
+k8s_images.sh                                                                             100%  579   272.9KB/s   00:00    
+[root@master134 install]# 
+```
 
 - 执行kubeadm:
 
@@ -315,6 +323,8 @@ sudo chown $(id -u):$(id -g) $HOME/.kube/config
 ```
 
 # node节点加入
+
+首先执行`/root/k8sdemo/k8s_image.sh`，下载镜像。
 
 根据上面`kubeadm join`的输出，添加work节点使用命令:
 ```

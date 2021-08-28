@@ -441,3 +441,18 @@ yum remove kubelet kubeadm kubectl -y
 ```bash
 docker images -qa|xargs docker rmi -f
 ```
+
+# 其他说明
+   
+1. docker的驱动模式改为systemd,在/etc/docker下创建daemon.json并编辑：`mkdir /etc/docker/daemon.json`加入以下内容：
+```{"exec-opts":["native.cgroupdriver=systemd"]}```
+
+2. 提示加入成功后，查看master的node状态`kubectl get nodes`
+
+
+# 设置代码自动补全
+```bash
+yum install bash-completion
+source /usr/share/bash-completion/bash_completion
+source <(kubectl completion bash)
+```

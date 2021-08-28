@@ -204,7 +204,7 @@ type NotificationWatcher struct {
 }
 ```
 
-而handlers这map，即注册逻辑则在`core/notifier/topic/tipics.go`的init函数中初始化：
+而handlers这map，即注册逻辑则在`core/notifier/topic/topics.go`的init函数中初始化：
 
 ```go
 func init() {

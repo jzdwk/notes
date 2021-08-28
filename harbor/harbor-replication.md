@@ -116,8 +116,7 @@ func Init(closing, done chan struct{}) error {
 
 ## execute replication
 
-执行replication的操作位于`policy`处，入口为`beego.Router("/api/replication/executions", &api.ReplicationOperationAPI{}, "get:ListExecutions;post:CreateExecution")
-` 函数，函数首先根据execution实体，获取policy以及policy的registry信息，以及trigger策略，最终调用operation包中的controller接口`StartReplication(policy *model.Policy, resource *model.Resource, trigger model.TriggerType) (int64, error)`，接口的具体实现由controller结构完成，controller中封装了执行policy的各个组件，通过New函数对外暴露：
+执行replication的操作位于`policy`处，入口为`beego.Router("/api/replication/executions", &api.ReplicationOperationAPI{}, "get:ListExecutions;post:CreateExecution")`函数，函数首先根据execution实体，获取policy以及policy的registry信息，以及trigger策略，最终调用operation包中的controller接口`StartReplication(policy *model.Policy, resource *model.Resource, trigger model.TriggerType) (int64, error)`，接口的具体实现由controller结构完成，controller中封装了执行policy的各个组件，通过New函数对外暴露：
 ```go
 func NewController(js job.Client) Controller {
 	ctl := &controller{
@@ -455,17 +454,41 @@ type ChartRegistry interface {
 每一个resource的最终对象对应了project。最终返回的resources定义如下：
 ```go
 type Resource struct {
-	//资源类型
+	//资源类型,比如chart/image等
 	Type         ResourceType           `json:"type"`
 	//具体的资源描述
 	Metadata     *ResourceMetadata      `json:"metadata"`
-	//对应的registry
+	//对应的registry描述，比如harbor 或其他私有仓库
 	Registry     *Registry              `json:"registry"`
+	//额外需要存储的信息
 	ExtendedInfo map[string]interface{} `json:"extended_info"`
 	// Indicate if the resource is a deleted resource
 	Deleted bool `json:"deleted"`
 	// indicate whether the resource can be overridden
 	Override bool `json:"override"`
+}
+// ResourceMetadata of resource
+type ResourceMetadata struct {
+	//repo信息，名称为{peojectName}/{repoName}
+	Repository *Repository `json:"repository"`
+	//某一个repo下，具体要操作的资源集合，比如iamge的tag, chart的version等
+	Artifacts  []*Artifact `json:"artifacts"`
+	Vtags      []string    `json:"v_tags"` // deprecated, use Artifacts instead
+}
+// Repository info of the resource
+type Repository struct {
+    //名称为{peojectName}/{repoName}
+	Name     string                 `json:"name"`
+	//所属project的metadata
+	Metadata map[string]interface{} `json:"metadata"`
+}
+// Artifact is the individual unit that can be replicated
+type Artifact struct {
+	Type   string   `json:"type"`
+	Digest string   `json:"digest"`
+	Labels []string `json:"labels"`
+	//image的最小单元，chart的version和image的tag都由此字段描述
+	Tags   []string `json:"tags"`
 }
 ```
 上述代码完成了srcResources对于policy中描述的资源的fetch，接下来继续对resource的字段进行赋值：
@@ -650,7 +673,7 @@ func (d *defaultScheduler) Schedule(items []*ScheduleItem) ([]*ScheduleResult, e
 
 job service的工作分为两步，第一步为入队操作，第二步为消费队中元素。
 首先，
-harbor的各个组件通过post请求，将job任务发送至job service的api接口，然后，api接收job后执行消息入队，具体代码分析参考[job service](harbor-job-service.md)。在job service服务启动时，会注册消息的消费hander，具体的执行根据job类别的不同进入不同的实现，对于replication来说，最终的执行逻辑位于`jobservice/job/impl/replication/replication.go`的Run函数中：
+harbor的各个组件通过post请求，将job任务发送至job service的api接口，然后，api接收job后执行消息入队，具体代码分析参考[job service](harbor-job-service.md)。在job service服务启动时，会注册消息的消费hander，具体的执行根据job类别的不同进入不同的实现，对于replication来说，最终的执行逻辑位于`/harbor/src/jobservice/job/impl/replication/replication.go`的Run函数中：
 ```go
 // Run gets the corresponding transfer according to the resource type
 // and calls its function to do the real work

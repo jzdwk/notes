@@ -144,7 +144,7 @@ jzd@jzd:~/kong/https_test$ curl -X GET -H 'Host:myhttpbin.com' --cacert ca.crt  
 
 ```
 
-2. kong接收https请求后，**根据http header中的Host值，匹配到某个sni**，从而找到绑定的server.pem证书，然后给client发送这个证书。
+2. kong接收https请求后，**根据http header中的Host值，匹配到某个sni**，从而找到绑定的server证书，然后给client发送这个证书。
 
-3. client接收到server.pem证书后，使用ca去验证服务器证书。此时，根据https对证书的验证策略，请求头的**Host**字段值需要和证书的CN描述`myhttpbin.com`保持一致。
+3. client接收到server证书后，使用ca去验证服务器证书。此时，根据https对证书的验证策略，请求头的**Host**字段值需要和证书的CN描述`myhttpbin.com`保持一致。
 

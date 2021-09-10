@@ -29,7 +29,7 @@ openssl genrsa -des3 -out server.key 1024
 openssl rsa -in server.key -out server.key
 ```
 
-5. 生成证书的请求文件csr，此时同样会填写证书各个域的信息，，其中**证书的CN域的值，即是http请求时，header中的Host值，两者必须保持一致，这里设置为myhttpbin.com**： 
+5. 生成证书的请求文件csr，此时同样会填写证书各个域的信息，，其中**证书的CN域的值，即是http请求时，header中的Host值，两者必须保持一致，这里设置为myhttpbin.com，另，也可设置含有通配符的CN，比如\*.apigw.cn**： 
 ```shell
 openssl req -new -key server.key -out server.csr
 
@@ -68,6 +68,7 @@ Getting CA Private Key
 7. 使用ca去验证服务器证书：
 ```shell
 openssl verify -CAfile ca.crt server.crt
+server.crt: OK
 ```
 
 8. 其他：

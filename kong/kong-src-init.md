@@ -631,6 +631,93 @@ kong的事件机制[参考](https://ms2008.github.io/2018/06/11/kong-events-cach
   kong.worker_events = worker_events
 ```
 
+work-events的使用示例，首先是conf文件：
+```
+#user  nobody;
+worker_processes  4;
+error_log  /root/openresty/logs/error.log  info;
+events {
+    worker_connections  1024;
+}
+
+http {
+    # 定义要加载的work-events位置
+    lua_package_path "/usr/local/openresty/lualib/resty/?.lua;;";
+
+    # the size depends on the number of event to handle:
+    lua_shared_dict process_events 1m;
+    # 根据文档说明，handler的定义和注册 以及configuer在init_worker阶段
+    init_worker_by_lua_block {
+        local ev = require "resty.worker.events"
+        # 定义事件配置
+        local ok, err = ev.configure {
+            shm = "process_events", -- defined by "lua_shared_dict"
+            timeout = 2,            -- life time of unique event data in shm
+            interval = 1,           -- poll interval (seconds)
+
+            wait_interval = 0.010,  -- wait before retry fetching event data
+            wait_max = 0.5,         -- max wait time before discarding event
+            shm_retries = 999,      -- retries for shm fragmentation (no memory)
+        }
+        if not ok then
+            ngx.log(ngx.ERR, "failed to start event system: ", err)
+            return
+        end
+		# handler定义与注册
+		local handler = function(data, event, source, pid)
+            print("received event; source=",source,
+                  ", event=",event,
+                  ", data=", tostring(data),
+                  ", from process ",pid)
+        end
+
+        ev.register(handler)
+        
+    }
+
+    server {
+        listen 30001;
+
+        # example for post:
+        location = /events {
+             
+            default_type text/plain;
+            content_by_lua_block {
+                -- manually call `poll` to stay up to date, can be used instead,
+                -- or together with the timer interval. Polling is efficient,
+                -- so if staying up-to-date is important, this is preferred.
+				# 当访问events路径时，发送事件给各个worker
+                local ok, err = require("resty.worker.events").post("jzd","test","123")
+                if ok then
+                        ngx.say("hello")
+                end
+                ngx.say("= =")
+                -- do regular stuff here
+
+            }
+        }
+    }
+}
+```
+当访问conf监听的端口时，根据conf定义查看error.log信息，可以看到：
+```
+# 可以看到事件通知来自31969进程
+2021/10/25 09:55:27 [notice] 31971#0: *72 [lua] init_worker_by_lua:19: received event; source=jzd, event=test, data=123, from process 31969, context: ngx.timer
+2021/10/25 09:55:27 [notice] 31972#0: *74 [lua] init_worker_by_lua:19: received event; source=jzd, event=test, data=123, from process 31969, context: ngx.timer
+2021/10/25 09:55:27 [notice] 31969#0: *76 [lua] init_worker_by_lua:19: received event; source=jzd, event=test, data=123, from process 31969, context: ngx.timer
+2021/10/25 09:55:27 [notice] 31970#0: *78 [lua] init_worker_by_lua:19: received event; source=jzd, event=test, data=123, from process 31969, context: ngx.timer
+```
+查看openresty启动的所有worker进程，看到31969为第一个worker进程：
+```
+[root@iZ2zebl327dijrrsaeq81zZ ~]# ps -ef|grep nginx
+root     25632     1  0 Oct23 ?        00:00:00 nginx: master process openresty -c /root/openresty/conf/work-events.conf
+root     31969 25632  0 09:53 ?        00:00:00 nginx: worker process
+root     31970 25632  0 09:53 ?        00:00:00 nginx: worker process
+root     31971 25632  0 09:53 ?        00:00:00 nginx: worker process
+root     31972 25632  0 09:53 ?        00:00:00 nginx: worker process
+```
+
+
 2. **cluster_events**
 
 
@@ -760,7 +847,7 @@ function _M.new(opts)
     local channel_name  = (i == 1) and "mlcache"                 or "mlcache_2"
     local shm_name      = (i == 1) and opts.shm_name             or opts.shm_name .. "_2"
     local shm_miss_name = (i == 1) and opts.shm_name .. "_miss"  or opts.shm_name .. "_miss_2"
-    -- 在ngx.shared中检查共享变量kong_db_cache和kong_db_cache_miss
+    -- 在ngx.shared中检查共享变量kong_db_cache和kong_db_cache_miss，疑问，这几个key是何时set入shared的？
 	...
     if ngx.shared[shm_name] then
 	  -- 调用多级缓存库resty.mlcache
@@ -776,14 +863,16 @@ function _M.new(opts)
         resty_lock_opts  = opts.resty_lock_opts,
         -- mlcache的L1缓存在各个worker中独立，ipc提供了用于在各个worker间进行缓存同步的机制
 		ipc = {
-		  -- 注册事件与广播
+		  -- 注册事件handler与广播事件
           register_listeners = function(events)
             for _, event_t in pairs(events) do
+			  -- 向worker_events注册事件的handler
               opts.worker_events.register(function(data)
                 event_t.handler(data)
               end, channel_name, event_t.channel)
             end
           end,
+		  -- 注册广播方法，channel_name为事件源，channel为事件名，data为事件内容
           broadcast = function(channel, data)
             local ok, err = opts.worker_events.post(channel_name, channel, data)
             ...
@@ -809,9 +898,10 @@ function _M.new(opts)
     shm_names         = shm_names,
     curr_mlcache      = curr_mlcache,
   }
-  -- 订阅缓存失效事件，调用cache中定义的invalidate_local
+  -- 订阅缓存失效事件，subscribe的实现为 向cluster_events的callbackes表中注册名为invalidations的function
   local ok, err = self.cluster_events:subscribe("invalidations", function(key)
     log(DEBUG, "received invalidate event from cluster for key: '", key, "'")
+	-- 从mlcache中删除指定key
 	self:invalidate_local(key)
   end)
   ...
@@ -819,19 +909,34 @@ function _M.new(opts)
 
   return setmetatable(self, mt)
 end
-
 ...
--- 清理本地缓存实现
-function _M:invalidate_local(key)
-  ...
-  local ok, err = self.mlcache:delete(key)
-  if not ok then
-    log(ERR, "failed to delete entity from node cache: ", err)
-  end
-end
 ```
 
+2. **core cache**
 
+core cache的实现与cache相同，只是名称为`kong_core_db_cache`,不再赘述。
+```lua
+function _GLOBAL.init_core_cache(kong_config, cluster_events, worker_events)
+  local db_cache_ttl = kong_config.db_cache_ttl
+  local cache_pages = 1
+  ...
+  -- 与 cache相同
+  return kong_cache.new {
+    shm_name          = "kong_core_db_cache",
+    cluster_events    = cluster_events,
+    worker_events     = worker_events,
+    ttl               = db_cache_ttl,
+    neg_ttl           = db_cache_ttl,
+    resurrect_ttl     = kong_config.resurrect_ttl,
+    cache_pages       = cache_pages,
+    resty_lock_opts   = {
+      exptime = 10,
+      timeout = 5,
+    },
+  }
+end
+
+```
 
 
   ok, err = runloop.set_init_versions_in_cache()

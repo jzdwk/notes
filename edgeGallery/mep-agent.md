@@ -195,9 +195,12 @@ func (ser *ser) Start(confPath string) {
 	_, errAppInst := util.GetAppInstanceID()
 	...
 	// signed ak and sk, then request the token
-	//向mep-auth请求 POST https://${MEP_IP}:${MEP_APIGW_PORT}/mep/token
+	// 封装ak sk
 	var auth = model.Auth{SecretKey: util.AppConfig["SECRET_KEY"], AccessKey: string(*util.AppConfig["ACCESS_KEY"])}
-	//业务全局变量util.MepToken
+	// 根据ak sk生成待验证token，写入req的header，key为Authorization
+	// 向mep-auth发送token验证请求
+    // POST https://${MEP_IP}:${MEP_APIGW_PORT}/mep/token
+	// token计入业务全局变量util.MepToken
 	errGetMepToken := GetMepToken(auth)
 	...
 	util.FirstToken = true

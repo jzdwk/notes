@@ -938,13 +938,13 @@ end
 
 ```
 
+### 路由处理
 
+```lua
+  -- 从core_cache中检查key为router:version 和 plugins_iterator:version的值
   ok, err = runloop.set_init_versions_in_cache()
-  if not ok then
-    stash_init_worker_error(err) -- 'err' fully formatted
-    return
-  end
-
+  ...
+  -- 置为全局单例 singletons
   -- LEGACY
   singletons.cache          = cache
   singletons.core_cache     = core_cache
@@ -952,13 +952,55 @@ end
   singletons.cluster_events = cluster_events
   -- /LEGACY
 
+  -- 遍历每个资源对象的dao，dao.events = worker_events
   kong.db:set_events_handler(worker_events)
-
+  
+  -- 重要，将db的相关配置load到cache
   ok, err = load_declarative_config(kong.configuration, declarative_entities)
-  if not ok then
-    stash_init_worker_error("failed to load declarative config file: " .. err)
-    return
+```
+
+`load_declarative_config`的函数实现如下:
+
+```lua
+local function load_declarative_config(kong_config, entities)
+  ...
+  if not kong_config.declarative_config then
+    -- no configuration yet, just build empty plugins iterator
+	-- load plugin的iterator，这个迭代器包含了plugin的handler、与routes/services/consumers的关系等描述
+    local new_version, err = kong.core_cache:get("plugins_iterator:version", TTL_ZERO, utils.uuid)
+    ...
+    local ok, err = runloop.build_plugins_iterator(new_version)
+    ...
+    return true
   end
+
+  local opts = {
+    name = "declarative_config",
+  }
+  -- concurrency.with_worker_mutex(opts,fn) 为根据opts配置获取resty.lock锁，执行fn后释放锁
+  return concurrency.with_worker_mutex(opts, function()
+    
+	local value = ngx.shared.kong:get("declarative_config:loaded")
+    ...
+
+    local ok, err = declarative.load_into_cache(entities)
+    if not ok then
+      return nil, err
+    end
+    
+    ok, err = runloop.build_plugins_iterator("init")
+    ...
+    -- 重要，根据load的资源配置，创建router，实现位于kong/router.lua的new中
+    assert(runloop.build_router("init"))
+
+    ok, err = ngx.shared.kong:safe_set("declarative_config:loaded", true)
+    ...
+
+    return true
+  end)
+end
+```
+
 
   ok, err = execute_cache_warmup(kong.configuration)
   if not ok then

@@ -1,5 +1,5 @@
 # mep-agent
-mep-agent扮演部署的应用的cide-car，为实际部署的mep服务提供了获取token接口，从而实现与mep服务的交互。另一方面，也将自身注册在mep服务上。
+mep-agent扮演部署的应用的cide-car，为实际部署的mep服务提供了获取token接口，从而实现与mep服务的交互。另一方面，通过挂载的`app_instance_info.yaml`，将描述的app开放api注册在mep服务上（具体为注册在mep网关上）。
 
 ## cide car yaml
 服务包部署时，其yaml描述如下：
@@ -90,7 +90,10 @@ spec:
   type: NodePort
 ```
 
-其中，主要看mep-agent的配置，主要包括环境变量的配置：
+其中，主要看mep-agent的配置，主要包括**环境变量的配置**和**关联应用的开放api配置**：
+
+1. **环境变量**
+
 - MEP-APIGW地址相关，明文配置
 - CA证书相关，使用k8s secret
 - App Instance相关，使用k8s secret
@@ -114,6 +117,9 @@ echo ai9QWjIrK3plSWRkZ0ZrL1ZkbjZqUTkveUZxYUpBMDQ5L3NjSDNpUHRsMjc2NmRyYVFLbWdGcDA
 ```
 这个secret在部署chart包时被创建，详情查看applcm组件相关内容。secret中的值来源于appo组件或developer组件(取决于沙箱部署还是边缘节点部署)。
 
+2. **开放api**
+
+关联的应用的api将通过mep-agent注册在mepserver上作为开放能力，api通过`app_instance_info.yaml`来描述。
 挂载的`app_instance_info.yaml`内容可通过kubectl进入容器查看：
 
 ```
@@ -127,7 +133,9 @@ httpbin-pod:~$ cd conf/
 httpbin-pod:~/conf$ ls
 app_conf.yaml           app_instance_info.yaml
 httpbin-pod:~/conf$ cat app_instance_info.yaml 
+# serviceInfoPosts用于描述注册的api信息
 serviceInfoPosts:
+# 注册服务的回调信息
 serAvailabilityNotificationSubscriptions:
   - subscriptionType: SerAvailabilityNotificationSubscription
     callbackReference: string
@@ -181,7 +189,9 @@ func main() {
 }
 
 ```
-以上工作除了从环境变量读取信息，配置为service的全局变量，剩下是通过`app_instance_info.yaml`启动服务：
+
+### 开放api注册
+以上工作除了从环境变量读取信息，配置为service的全局变量，剩下是通过`app_instance_info.yaml`启动服务，即将开放api注册到mep：
 
 ```go
 // Start service entrance
@@ -210,13 +220,14 @@ func (ser *ser) Start(confPath string) {
 	if conf.ServiceInfoPosts != nil {
 	    //携带从mep-auth得到的token
 	    //调用 POST https://${MEP_IP}:${MEP_APIGW_PORT}/mep/mec_service_mgmt/v1/applications/${appInstanceId}/services
-	    //向mep服务注册中心将mep-agent注册为mep的服务
+	    //向mep服务注册中心将conf，即app_instance_info.yaml配置描述的开放api，注册为mep的服务
 	    //和mep的通信将使用https，ca证书即从env中读取的环境变量
 		responseBody, errRegisterToMep := RegisterToMep(conf, wg)
 		...
-        //如果注册失败，retry
+        //注册后，根据返回的heartbeat url，访问mep的网关，保证服务的可用
 		for _, serviceInfo := range responseBody {
 			if serviceInfo.LivenessInterval != 0 && serviceInfo.Links.Self.Liveness != "" {
+				// 每个service add一次
 				wg.Add(1)
 				heartBeatTicker(serviceInfo)
 			} else {
@@ -224,7 +235,26 @@ func (ser *ser) Start(confPath string) {
 			}
 		}
 	}
+	//如果有service需要heartbeat，将一直阻塞
 	wg.Wait()
+}
+
+//heartBeat实现如下
+func heartBeatTicker(serviceInfo model.ServiceInfoPost) {
+	for range time.Tick(time.Duration(serviceInfo.LivenessInterval) * time.Second) {
+		go HeartBeatRequestToMep(serviceInfo)
+	}
+}
+// HeartBeatRequestToMep Send service heartbeat to MEP.
+func HeartBeatRequestToMep(serviceInfo model.ServiceInfoPost) {
+	heartBeatRequest := serviceLivenessUpdate{State: "ACTIVE"}
+	data, errJSONMarshal := json.Marshal(heartBeatRequest)
+	...
+	//url = https://{MEP_IP}:{MEP_APIGW_PORT}/{serviceInfo.Links.Self.Liveness}
+	url := config.ServerURLConfig.MepHeartBeatURL + serviceInfo.Links.Self.Liveness
+	var heartBeatInfo = heartBeatData{data: string(data), url: url, token: &util.MepToken}
+	_, errPostRequest := sendHeartBeatRequest(heartBeatInfo)
+	...
 }
 ```
 
@@ -245,5 +275,5 @@ func init() {
 mep-agent在启动时：
 1. 根据从应用中获取的ak/sk，向mep-auth获取token
 2. 提供了rest api，提供token的查询和服务发现接口
-3. 将自身注册为mep服务
+3. 将app的api信息注册到mep上
 

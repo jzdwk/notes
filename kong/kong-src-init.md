@@ -955,7 +955,7 @@ end
   -- 遍历每个资源对象的dao，dao.events = worker_events
   kong.db:set_events_handler(worker_events)
   
-  -- 重要，将db的相关配置load到cache
+  -- 重要，将db的相关配置load到kong.core_cache
   ok, err = load_declarative_config(kong.configuration, declarative_entities)
 ```
 
@@ -1000,15 +1000,68 @@ local function load_declarative_config(kong_config, entities)
   end)
 end
 ```
+**runloop.build_router("init")**中根据db的表述执行route资源的创建，其中同样定义的**find_route方法**，之后单独分析。
 
+### init最终阶段
+init的最终阶段包括
+- 缓存加载
+- 注册缓存事件、route刷新定义
+- 插件
 
+```lua
+  -- 将dao层资源加载进kong.core_cache
   ok, err = execute_cache_warmup(kong.configuration)
   if not ok then
     ngx_log(ngx_ERR, "failed to warm up the DB cache: " .. err)
   end
-
+  -- 这里的before函数比较重要
   runloop.init_worker.before()
+```
+查看`runloop.init_worker.before()`的实现：
+```lua
+  init_worker = {
+    before = function()
+      if kong.configuration.anonymous_reports then
+        reports.configure_ping(kong.configuration)
+        reports.add_ping_value("database_version", kong.db.infos.db_ver)
+        reports.toggle(true)
+        reports.init_worker()
+      end
+	  -- 清理缓存ngx.shared.kong
+      update_lua_mem(true)
+	  -- 重要，注册kong.worker_events与cluster_events的事件，此处之后单独分析
+      register_events()
 
+	  -- 负载均衡的Init	
+      -- initialize balancers for active healthchecks
+      timer_at(0, function()
+        balancer.init()
+      end)
+
+      local router_update_frequency = kong.configuration.router_update_frequency or 1
+      -- 根据配置的刷新频率，更新路由以及plugin
+      timer_every(router_update_frequency, function(premature)
+        ...
+        local ok, err = rebuild_router(ROUTER_ASYNC_OPTS)
+        ...
+      end)
+
+      timer_every(router_update_frequency, function(premature)
+        ...
+        local ok, err = rebuild_plugins_iterator(PLUGINS_ITERATOR_ASYNC_OPTS)
+        if not ok then
+          log(ERR, "could not rebuild plugins iterator via timer: ", err)
+        end
+      end)
+	...
+
+    end
+  },
+
+```
+## plugin 迭代器
+```
+  --
   local init_worker_plugins_iterator = runloop.build_plugins_iterator_for_init_worker_phase()
   execute_plugins_iterator(init_worker_plugins_iterator, "init_worker")
 

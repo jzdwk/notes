@@ -27,7 +27,9 @@ init_worker_by_lua_block {
 
 在openresty的init_by_lua_block阶段，首先调用了Kong.init()。
 
-`Kong.init()`位于`/usr/local/share/lua/5.1/kong/init.lua`中，首先看一下`init.lua`中的变量定义：
+`Kong.init()`位于`/usr/local/share/lua/5.1/kong/init.lua`中，**该文件中定义了kong在openresty各个阶段**[(init/rewrite/access/balancer)](https://moonbingbing.gitbooks.io/openresty-best-practices/content/ngx_lua/phase.html) 的函数入口与实现。
+
+首先看一下`init.lua`中的变量定义：
 ```lua
 local kong_global = require "kong.global"
 -- 在_G中定义填写kong对象

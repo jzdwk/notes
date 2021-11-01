@@ -1006,7 +1006,7 @@ end
 init的最终阶段包括
 - 缓存加载
 - 注册缓存事件、route刷新定义
-- 插件
+- 加载插件迭代器
 
 ```lua
   -- 将dao层资源加载进kong.core_cache
@@ -1059,25 +1059,111 @@ init的最终阶段包括
   },
 
 ```
-## plugin 迭代器
-```
-  --
-  local init_worker_plugins_iterator = runloop.build_plugins_iterator_for_init_worker_phase()
-  execute_plugins_iterator(init_worker_plugins_iterator, "init_worker")
+### 执行插件init worker逻辑
 
+该步主要用于解析每个加载的plugin中，对于**init worker**阶段的定义。具体可以参考kong的插件开发中，plugin的各个阶段：
+```lua
+  -- 返回一个init_worker的迭代器
+  local init_worker_plugins_iterator = runloop.build_plugins_iterator_for_init_worker_phase()
+```
+其中创建的关键代码如下：
+```lua
+function PluginsIterator.new_for_init_worker_phase()
+  --已加载插件
+  loaded_plugins = get_loaded_plugins()
+  local loaded_plugins_with_init_worker = {}
+  
+  for _, plugin in ipairs(loaded_plugins) do
+    -- 解析每个plugin的init worker定义
+    local phase_handler = plugin.handler.init_worker
+    if type(phase_handler) == "function" then
+      insert(loaded_plugins_with_init_worker, plugin)
+    end
+  end
+  ...
+  -- 封装迭代器并返回
+  return {
+    iterate = iterate,
+  }
+end
+```
+接着执行迭代器中的每一个init work逻辑：
+```lua
+  -- 执行每个插件的init worker()阶段
+  execute_plugins_iterator(init_worker_plugins_iterator, "init_worker")
+```
+核心实现如下：
+```lua
+local function execute_plugins_iterator(plugins_iterator, phase, ctx)
+  -- 遍历
+  for plugin, configuration in plugins_iterator:iterate(phase, ctx) do
+    ...-- go handler，暂时忽略
+    kong_global.set_namespaced_log(kong, plugin.name)
+	-- phase=init_worker，执行plugin的注册函数
+    plugin.handler[phase](plugin.handler, configuration)
+    kong_global.reset_log(kong)
+  end
+end
+```  
+其他操作，如果发现版本不一致，更新插件的迭代器
+```lua
   -- run plugins init_worker context
   local retries = 5
   ok, err = runloop.update_plugins_iterator(retries)
-  if not ok then
-    ngx_log(ngx_ERR, "failed to build the plugins iterator: ", err)
-  end
-
+  ...
   if go.is_on() then
     go.manage_pluginserver()
   end
+```
 
+### CP/DP处理
+
+当kong提供http服务时，如果Kong为[混合部署模式](https://docs.konghq.com/gateway-oss/2.0.x/hybrid-mode/) 则做特殊处理：
+
+```lua
   if subsystem == "http" then
     clustering.init_worker(kong.configuration)
+  end
+end
+```
+具体实现：
+```lua
+function _M.init_worker(conf)
+  -- kong.conf中的role字段配置，
+  -- role = data_plane表示节点为数据面，主要用于转发流量，其转发策略route从控制面节点接收
+  -- role = control_plane 表示节点为控制面，用于控制route策略等
+  ...
+  if conf.role == "data_plane" then
+    -- ROLE = "data_plane"
+    -- 在一个worker节点上执行
+    if ngx.worker.id() == 0 then
+	  ...从config.cache.json
+      local f = io_open(CONFIG_CACHE, "r")
+		...
+		-- 
+        if config then
+         ...
+            res, err = update_config(config, false)
+        end
+      end
+      assert(ngx.timer.at(0, communicate, conf))
+    end
+  elseif conf.role == "control_plane" then
+    -- ROLE = "control_plane"
+	-- 重新注册事件，将资源更新事件广播给data plane节点
+    kong.worker_events.register(function(data)
+      -- we have to re-broadcast event using `post` because the dao
+      -- events were sent using `post_local` which means not all workers
+      -- can receive it
+      local res, err = kong.worker_events.post("clustering", "push_config")
+      ...
+    end, "dao:crud")
+
+    kong.worker_events.register(function(data)
+      local res, err = declarative.export_config()
+      ...
+      push_config(res)
+    end, "clustering", "push_config")
   end
 end
 ```

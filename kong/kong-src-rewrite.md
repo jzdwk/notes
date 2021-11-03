@@ -2,11 +2,13 @@
 
 查看kong的配置文件nginx-kong.conf，其rewrite阶段定义如下：
 ```
-...
-rewrite_by_lua_block {
+server {
+	...
+	rewrite_by_lua_block {
         Kong.rewrite()
     }
-...
+	...
+}
 ```
 
 ## rewrite

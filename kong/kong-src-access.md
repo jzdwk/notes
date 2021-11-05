@@ -729,4 +729,170 @@ after = function(ctx)
     end
 ```
 
-#### balancer 实现
+#### 执行lb 负载均衡
+
+balancer是Kong实现负载均衡的核心，涉及的点包括了：
+- 相关资源对象：service - upstream - target，当路由根据route匹配到service后，会根据service绑定的upstream以及upstream之后的target来负载到具体的endpoint
+- 会话保持：kong的负载支持不同维护的会话保持，比如根据consumer/ip等
+- 负载均衡算法选择
+
+```lua
+-- Resolves the target structure in-place (fields `ip`, `port`, and `hostname`).
+--
+-- If the hostname matches an 'upstream' pool, then it must be balanced in that
+-- pool, in this case any port number provided will be ignored, as the pool
+-- provides it.
+--
+-- @param target the data structure as defined in `core.access.before` where
+-- it is created.
+-- @return true on success, nil+error message+status code otherwise
+-- target = ctx.balancer_data，即由上一步balancer_prepare返回的表
+
+local function execute(target, ctx)
+  -- 如果service后直接配置的ip，就没有lb什么事了，直接返回
+  if target.type ~= "name" then
+    -- it's an ip address (v4 or v6), so nothing we can do...
+    target.ip = target.host
+    target.port = target.port or 80 -- TODO: remove this fallback value
+    target.hostname = target.host
+    return true
+  end
+  
+  -- when tries == 0,
+  --   it runs before the `balancer` context (in the `access` context),
+  -- when tries >= 2,
+  --   then it performs a retry in the `balancer` context
+  local dns_cache_only = target.try_count ~= 0
+  local balancer, upstream, hash_value
+  -- 缓存判断，如果已经执行过lb，则直接返回lb对象
+  if dns_cache_only then
+    -- retry, so balancer is already set if there was one
+    balancer = target.balancer
+  else
+    -- first try, so try and find a matching balancer/upstream object
+	-- 根据target的hostname，从init_worker阶段加载的upstream取出对象，并根据upstream.id，从balancer.lua的balancers表中得到对应的lb对象
+	-- 其中balancers表来自于init_worker时注册的worker_events事件，重要，稍后分析
+    balancer, upstream = get_balancer(target)
+    if balancer == nil then -- `false` means no balancer, `nil` is error
+      return nil, upstream, 500
+    end
+```
+从balancer表中获取lb对象后，通过lb对象是否为空来判断是否需要执行lb：
+```lua
+    if balancer then
+      -- store for retries
+      target.balancer = balancer
+      -- calculate hash-value
+      -- only add it if it doesn't exist, in case a plugin inserted one
+      hash_value = target.hash_value
+      if not hash_value then
+	    -- 根据upstream的hash_on计算hash，hash_on即设定的lb会话保持规则，比如consumer,ip,header,cookie
+        hash_value = create_hash(upstream, ctx)
+        target.hash_value = hash_value
+      end
+    end
+  end
+  local ip, port, hostname, handle
+  -- 如果需要负载均衡lb，则根据lb选择endpoint
+  if balancer then
+    -- have to invoke the ring-balancer
+    ip, port, hostname, handle = balancer:getPeer(dns_cache_only,
+                                          target.balancer_handle,
+                                          hash_value)
+    ...
+    hostname = hostname or ip
+    target.hash_value = hash_value
+    target.balancer_handle = handle
+  -- 否则，直接根据dns得到endpoint，赋值给target
+  else
+    -- have to do a regular DNS lookup
+    local try_list
+    ip, port, try_list = toip(target.host, target.port, dns_cache_only)
+    hostname = target.host
+    ...
+  end
+  ...
+  target.ip = ip
+  target.port = port
+  ...
+  return true
+end
+```
+
+##### balancer的创建
+上一节中，`balancer, upstream = get_balancer(target)`根据target获取了balancer，此对象为负载均衡的实现。其创建过程与调用链如下：
+```lua
+--1. /kong/runloop/handler.lua init_worker阶段注册事件
+init_worker = {
+    before = function()
+	  ...
+      register_events()
+	  ...
+	end
+}
+-- 其中worker_events注册了balancer
+  -- worker_events node handler
+  worker_events.register(function(data)
+    local operation = data.operation
+    local upstream = data.entity
+
+    -- => to balancer update
+    balancer.on_upstream_event(operation, upstream)
+  end, "balancer", "upstreams")
+
+--2. on_upstream_event用于创建/更新balancer对象
+-- Called on any changes to an upstream.
+-- @param operation "create", "update" or "delete"
+-- @param upstream_data table with `id` and `name` fields
+local function on_upstream_event(operation, upstream_data)
+  if operation == "reset" then
+    init()
+  ...
+  else
+    do_upstream_event(operation, upstream_data.id, upstream_data.name)
+  end
+end
+-- 调用create_balancer
+local function do_upstream_event(operation, upstream_id, upstream_name)
+  if operation == "create" then
+    ...
+    local _, err = create_balancer(upstream)
+    ...
+  elseif operation == "delete" or operation == "update" then
+	...
+  end
+end
+
+--3. create_balancer实现如下：
+  create_balancer = function(upstream, recreate, history, start)
+   ...
+    local balancer, err = create_balancer_exclusive(upstream, history, start)
+    return balancer, err
+  end
+	--其最终调用的是/kong/runloop/balancer.lua的function create_balancer_exclusive
+  local function create_balancer_exclusive(upstream, history, start)
+    local health_threshold = upstream.healthchecks and
+                              upstream.healthchecks.threshold or nil
+	-- 这里，根据不同的balancer类型，执行其new方法，返回balancer实例
+    local balancer, err = balancer_types[upstream.algorithm].new({
+      log_prefix = "upstream:" .. upstream.name,
+      wheelSize = upstream.slots,  -- will be ignored by least-connections
+      dns = dns_client,
+      healthThreshold = health_threshold,
+    })
+    ...
+    target_histories[balancer] = {}
+    ...
+	-- 写入全局balancer
+    set_balancer(upstream.id, balancer)
+    return balancer
+  end
+  
+--4. lb的balancer_types[upstream.algorithm]根据upstream的算法类型，返回lb对象，其type定义如下：
+  local balancer_types = {
+    ["consistent-hashing"] = require("resty.dns.balancer.ring"),
+    ["least-connections"] = require("resty.dns.balancer.least_connections"),
+    ["round-robin"] = require("resty.dns.balancer.ring"),
+  }
+
+```

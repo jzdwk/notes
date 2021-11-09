@@ -284,3 +284,146 @@ http {
 }
 
 ```
+
+## 常用变量
+
+在conf文件中，`ngx_http_core_module`在处理请求时，提供了常用变量供业务逻辑，access.log等读取：
+```
+$args                    #请求中的参数值
+$query_string            #同 $args
+$arg_NAME                #GET请求中NAME的值
+$is_args                 #如果请求中有参数，值为"?"，否则为空字符串
+$uri                     #请求中的当前URI(不带请求参数，参数位于$args)
+$document_uri            #同 $uri
+$document_root           #当前请求的文档根目录或别名
+$host                    #优先级：HTTP请求行的主机名>"HOST"请求头字段>符合请求的服务器名.请求中的主机头字段，如果请求中的主机头不可用，则为服务器处理请求的服务器名称
+$hostname                #主机名
+$https                   #如果开启了SSL安全模式，值为"on"，否则为空字符串。
+$binary_remote_addr      #客户端地址的二进制形式，固定长度为4个字节
+$body_bytes_sent         #传输给客户端的字节数，响应头不计算在内；这个变量和Apache的mod_log_config模块中的"%B"参数保持兼容
+$bytes_sent              #传输给客户端的字节数
+$connection              #TCP连接的序列号
+$connection_requests     #TCP连接当前的请求数量
+$content_length          #"Content-Length" 请求头字段
+$content_type            #"Content-Type" 请求头字段
+$cookie_name             #cookie名称
+$limit_rate              #用于设置响应的速度限制
+$msec                    #当前的Unix时间戳
+$nginx_version           #nginx版本
+$pid                     #工作进程的PID
+$pipe                    #如果请求来自管道通信，值为"p"，否则为"."
+$proxy_protocol_addr     #获取代理访问服务器的客户端地址，如果是直接访问，该值为空字符串
+$realpath_root           #当前请求的文档根目录或别名的真实路径，会将所有符号连接转换为真实路径
+$remote_addr             #客户端地址
+$remote_port             #客户端端口
+$remote_user             #用于HTTP基础认证服务的用户名
+$request                 #代表客户端的请求地址
+$request_body            #客户端的请求主体：此变量可在location中使用，将请求主体通过proxy_pass，fastcgi_pass，uwsgi_pass和scgi_pass传递给下一级的代理服务器
+$request_body_file       #将客户端请求主体保存在临时文件中。文件处理结束后，此文件需删除。如果需要之一开启此功能，需要设置client_body_in_file_only。如果将次文件传 递给后端的代理服务器，需要禁用request body，即设置proxy_pass_request_body off，fastcgi_pass_request_body off，uwsgi_pass_request_body off，or scgi_pass_request_body off
+$request_completion      #如果请求成功，值为"OK"，如果请求未完成或者请求不是一个范围请求的最后一部分，则为空
+$request_filename        #当前连接请求的文件路径，由root或alias指令与URI请求生成
+$request_length          #请求的长度 (包括请求的地址，http请求头和请求主体)
+$request_method          #HTTP请求方法，通常为"GET"或"POST"
+$request_time            #处理客户端请求使用的时间,单位为秒，精度毫秒； 从读入客户端的第一个字节开始，直到把最后一个字符发送给客户端后进行日志写入为止。
+$request_uri             #这个变量等于包含一些客户端请求参数的原始URI，它无法修改，请查看$uri更改或重写URI，不包含主机名，例如："/cnphp/test.php?arg=freemouse"
+$scheme                  #请求使用的Web协议，"http" 或 "https"
+$server_addr             #服务器端地址，需要注意的是：为了避免访问linux系统内核，应将ip地址提前设置在配置文件中
+$server_name             #服务器名
+$server_port             #服务器端口
+$server_protocol         #服务器的HTTP版本，通常为 "HTTP/1.0" 或 "HTTP/1.1"
+$status                  #HTTP响应代码
+$time_iso8601            #服务器时间的ISO 8610格式
+$time_local              #服务器时间（LOG Format 格式）
+$cookie_NAME             #客户端请求Header头中的cookie变量，前缀"$cookie_"加上cookie名称的变量，该变量的值即为cookie名称的值
+$http_NAME               #匹配任意请求头字段；变量名中的后半部分NAME可以替换成任意请求头字段，如在配置文件中需要获取http请求头："Accept-Language"，$http_accept_language即可
+$http_cookie
+$http_host               #请求地址，即浏览器中你输入的地址（IP或域名）
+$http_referer            #url跳转来源,用来记录从那个页面链接访问过来的
+$http_user_agent         #用户终端浏览器等信息
+$http_x_forwarded_for
+$sent_http_NAME          #可以设置任意http响应头字段；变量名中的后半部分NAME可以替换成任意响应头字段，如需要设置响应头Content-length，$sent_http_content_length即可
+$sent_http_cache_control 
+$sent_http_connection
+$sent_http_content_type
+$sent_http_keep_alive
+$sent_http_last_modified
+$sent_http_location
+$sent_http_transfer_encoding
+```
+
+## 负载均衡与反向代理
+
+### 负载均衡
+
+Nginx作为负载均衡器的常见配置如下：
+```
+upstream backend {
+	# server 后跟上游服务器的地址，可以是域名、ip、unix套接字
+	# 地址后可跟参数
+	# weight=num 权重，默认1   max_fails=num/fail_timeout=time 在fail_timeout时间内，如果失败次数超过max_fails 则不可用。
+	# down 表示服务器下线，在ip_hash配置项时才有用
+	# backup 在非ip_hash模式下启用，作为备用server，只有所有的server不可用后，才接收请求
+	server backend1.example.com
+	server backend2.example.com
+	# 根据client端ip算key 根据upstream内服务数量取模，保证同一客户端只发指定backend。
+	# 和权重模式不可同时使用；服务器下线不能删除配置，使用down标识；
+	ip_hash；
+}
+```
+在upstream块中，可使用如下变量：
+```
+$upstream_addr 处理请求的上游服务器地址
+$upstream_cache_status 是否命中缓存
+$upstream_status 上游服务器返回的HTTP响应码
+$upstream_response_time 上游服务器响应时间，单位ms
+$upstream_http_$HEADER 返回的HTTP头部，如upsteam_http_host
+```
+
+
+### 反向代理
+```
+server{
+
+	listen 80;
+
+	server_name b.com;
+
+	location / {
+		 
+		# 将当前请求代理到指定服务器上，可以是upstream/ip/unix套接字
+		proxy_pass http://backend;
+		# 转发时方法名
+		proxy_method POST;
+		# 指定哪些HTTP头不能被转发
+		proxy_hide_header Cache-Control;
+		# 指定哪些http头可以被转发，nginx默认不转发Date,Server,X-Accel-*等头
+		proxy_pass_header X-Accel-Redirect；
+		# 是否向upstream转发body，默认On
+		proxy_pass_request_body on;
+		# 是否转发http头部 默认on
+		proxy_pass_request_headers on;
+		# 当上游的返回是一个重定向，则重设其HTTP头部的location或者refresh字段
+		# 比如上游返回location为 http://localhost/a/b 则实际返回http://frontend/uri
+		# 使用off表示维持原Location不变
+		proxy_redirect  http://localhost/a/b http://frontend/uri
+		# 当向某一上游server转发请求出错时，继续换一台处理请求
+		proxy_next_upstream error timeout;
+		# 设置转发时增加的http头
+		proxy_set_header Host $host;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+	}
+}
+···
+
+
+
+
+
+
+
+
+
+
+

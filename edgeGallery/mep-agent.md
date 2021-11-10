@@ -135,6 +135,31 @@ app_conf.yaml           app_instance_info.yaml
 httpbin-pod:~/conf$ cat app_instance_info.yaml 
 # serviceInfoPosts用于描述注册的api信息
 serviceInfoPosts:
+  - serName: {{ .servicename }}
+	serCategory:
+	  href: "/example/catalogue1"
+	  id: id12345
+	  name: RNI
+	  version: {{ .version}}
+	version: {{ .version }}
+	state: ACTIVE
+	transportId: Rest1
+	transportInfo:
+	  id: 33b13d69-79ff-4d4f-bb61-eb7d81f59b44
+	  name: REST
+	  description: REST API
+	  type: REST_HTTP
+	  protocol: {{ .protocol }}
+	  version: '2.0'
+	  endpoint:
+		addresses:
+		  - host: {{ .servicename}}.{{ .appnamespace}}
+			port: {{ .port}}
+	  implSpecificInfo: {}
+	serializer: JSON
+	scopeOfLocality: MEC_SYSTEM
+	consumedLocalOnly: false
+	isLocal: true
 # 注册服务的回调信息
 serAvailabilityNotificationSubscriptions:
   - subscriptionType: SerAvailabilityNotificationSubscription

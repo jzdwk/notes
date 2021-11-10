@@ -998,7 +998,8 @@ public class ReleaseConfig {
 具体发布时，分为两个场景(待验证)：
 - 发布project到应用市场 :
 3.11 POST upload to store  /mec/developer/v1/projects/{projectId}/action/upload
-- 将project发布为mep平台服务 3.16 POST open project api 
+- 将project发布为mep平台服务 
+3.16 POST open project api 
 首先看发布到appStore的操作：
 ```java
 /**

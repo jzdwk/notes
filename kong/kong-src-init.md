@@ -27,7 +27,9 @@ init_worker_by_lua_block {
 
 在openresty的init_by_lua_block阶段，首先调用了Kong.init()。
 
-`Kong.init()`位于`/usr/local/share/lua/5.1/kong/init.lua`中，首先看一下`init.lua`中的变量定义：
+`Kong.init()`位于`/usr/local/share/lua/5.1/kong/init.lua`中，**该文件中定义了kong在openresty各个阶段**[(init/rewrite/access/balancer)](https://moonbingbing.gitbooks.io/openresty-best-practices/content/ngx_lua/phase.html) 的函数入口与实现。
+
+首先看一下`init.lua`中的变量定义：
 ```lua
 local kong_global = require "kong.global"
 -- 在_G中定义填写kong对象
@@ -955,7 +957,7 @@ end
   -- 遍历每个资源对象的dao，dao.events = worker_events
   kong.db:set_events_handler(worker_events)
   
-  -- 重要，将db的相关配置load到cache
+  -- 重要，将db的相关配置load到kong.core_cache
   ok, err = load_declarative_config(kong.configuration, declarative_entities)
 ```
 
@@ -1000,31 +1002,170 @@ local function load_declarative_config(kong_config, entities)
   end)
 end
 ```
+**runloop.build_router("init")**中根据db的表述执行route资源的创建，其中同样定义的**find_route方法**，之后单独分析。
 
+### init最终阶段
+init的最终阶段包括
+- 缓存加载
+- 注册缓存事件、route刷新定义
+- 加载插件迭代器
 
+```lua
+  -- 将dao层资源加载进kong.core_cache
   ok, err = execute_cache_warmup(kong.configuration)
   if not ok then
     ngx_log(ngx_ERR, "failed to warm up the DB cache: " .. err)
   end
-
+  -- 这里的before函数比较重要
   runloop.init_worker.before()
+```
+查看`runloop.init_worker.before()`的实现：
+```lua
+  init_worker = {
+    before = function()
+      if kong.configuration.anonymous_reports then
+        reports.configure_ping(kong.configuration)
+        reports.add_ping_value("database_version", kong.db.infos.db_ver)
+        reports.toggle(true)
+        reports.init_worker()
+      end
+	  -- 清理缓存ngx.shared.kong
+      update_lua_mem(true)
+	  -- 重要，注册kong.worker_events与cluster_events的事件，此处之后单独分析
+      register_events()
 
+	  -- 负载均衡的Init	
+      -- initialize balancers for active healthchecks
+      timer_at(0, function()
+        balancer.init()
+      end)
+
+      local router_update_frequency = kong.configuration.router_update_frequency or 1
+      -- 根据配置的刷新频率，更新路由以及plugin
+      timer_every(router_update_frequency, function(premature)
+        ...
+        local ok, err = rebuild_router(ROUTER_ASYNC_OPTS)
+        ...
+      end)
+
+      timer_every(router_update_frequency, function(premature)
+        ...
+        local ok, err = rebuild_plugins_iterator(PLUGINS_ITERATOR_ASYNC_OPTS)
+        if not ok then
+          log(ERR, "could not rebuild plugins iterator via timer: ", err)
+        end
+      end)
+	...
+
+    end
+  },
+
+```
+### 执行插件init worker逻辑
+
+该步主要用于解析每个加载的plugin中，对于**init worker**阶段的定义。具体可以参考kong的插件开发中，plugin的各个阶段：
+```lua
+  -- 返回一个init_worker的迭代器
   local init_worker_plugins_iterator = runloop.build_plugins_iterator_for_init_worker_phase()
+```
+其中创建的关键代码如下：
+```lua
+function PluginsIterator.new_for_init_worker_phase()
+  --已加载插件
+  loaded_plugins = get_loaded_plugins()
+  local loaded_plugins_with_init_worker = {}
+  
+  for _, plugin in ipairs(loaded_plugins) do
+    -- 解析每个plugin的init worker定义
+    local phase_handler = plugin.handler.init_worker
+    if type(phase_handler) == "function" then
+      insert(loaded_plugins_with_init_worker, plugin)
+    end
+  end
+  ...
+  -- 封装迭代器并返回
+  return {
+    iterate = iterate,
+  }
+end
+```
+接着执行迭代器中的每一个init work逻辑：
+```lua
+  -- 执行每个插件的init worker()阶段
   execute_plugins_iterator(init_worker_plugins_iterator, "init_worker")
-
+```
+核心实现如下：
+```lua
+local function execute_plugins_iterator(plugins_iterator, phase, ctx)
+  -- 遍历
+  for plugin, configuration in plugins_iterator:iterate(phase, ctx) do
+    ...-- go handler，暂时忽略
+    kong_global.set_namespaced_log(kong, plugin.name)
+	-- phase=init_worker，执行plugin的注册函数
+    plugin.handler[phase](plugin.handler, configuration)
+    kong_global.reset_log(kong)
+  end
+end
+```  
+其他操作，如果发现版本不一致，更新插件的迭代器
+```lua
   -- run plugins init_worker context
   local retries = 5
   ok, err = runloop.update_plugins_iterator(retries)
-  if not ok then
-    ngx_log(ngx_ERR, "failed to build the plugins iterator: ", err)
-  end
-
+  ...
   if go.is_on() then
     go.manage_pluginserver()
   end
+```
 
+### CP/DP处理
+
+当kong提供http服务时，如果Kong为[混合部署模式](https://docs.konghq.com/gateway-oss/2.0.x/hybrid-mode/) 则做特殊处理：
+
+```lua
   if subsystem == "http" then
     clustering.init_worker(kong.configuration)
+  end
+end
+```
+具体实现：
+```lua
+function _M.init_worker(conf)
+  -- kong.conf中的role字段配置，
+  -- role = data_plane表示节点为数据面，主要用于转发流量，其转发策略route从控制面节点接收
+  -- role = control_plane 表示节点为控制面，用于控制route策略等
+  ...
+  if conf.role == "data_plane" then
+    -- ROLE = "data_plane"
+    -- 在一个worker节点上执行
+    if ngx.worker.id() == 0 then
+	  ...从config.cache.json
+      local f = io_open(CONFIG_CACHE, "r")
+		...
+		-- 
+        if config then
+         ...
+            res, err = update_config(config, false)
+        end
+      end
+      assert(ngx.timer.at(0, communicate, conf))
+    end
+  elseif conf.role == "control_plane" then
+    -- ROLE = "control_plane"
+	-- 重新注册事件，将资源更新事件广播给data plane节点
+    kong.worker_events.register(function(data)
+      -- we have to re-broadcast event using `post` because the dao
+      -- events were sent using `post_local` which means not all workers
+      -- can receive it
+      local res, err = kong.worker_events.post("clustering", "push_config")
+      ...
+    end, "dao:crud")
+
+    kong.worker_events.register(function(data)
+      local res, err = declarative.export_config()
+      ...
+      push_config(res)
+    end, "clustering", "push_config")
   end
 end
 ```

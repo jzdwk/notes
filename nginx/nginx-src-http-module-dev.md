@@ -153,7 +153,7 @@ typedef struct ngx_command_s         ngx_command_t;
 struct ngx_command_s {
     ngx_str_t             name;		//配置项名称
 	
-    //配置项类型，即可以出现在conf中哪个块，比如server/location。
+    //配置项类型，即可以出现在nginx.conf中哪个块，比如server/location。
 	//具体值由src/http/ngx_http_config.h中定义的宏确定
 	/**
 	*	#define NGX_HTTP_MAIN_CONF        0x02000000        //可以直接出现在http配置指令里

@@ -167,7 +167,7 @@ struct ngx_command_s {
 	ngx_uint_t            type;		
 	
     char               *(*set)(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);	//当出现name中指定的配置项，则调用set方法处理配置项的参数
-    /下面两个偏移量用于定位该配置的存储地址
+    //下面两个偏移量用于定位该配置的存储地址
 	ngx_uint_t            conf;		
     ngx_uint_t            offset;	//
     void                 *post;		//配置项读取后的处理方法，必须是ngx_conf_post_t结构的指针

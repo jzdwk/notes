@@ -336,9 +336,9 @@ static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
 ```
 下面，看下几个回调函数的实现：
 
-	1. **create_request**
+ 1. **create_request**
 	
-	根据上节的创建upstream请求，create_request接下来的工作主要为设置r->upstream->request_bufs，来确定发送什么样的请求到上游服务器。
+根据上节的创建upstream请求，create_request接下来的工作主要为设置r->upstream->request_bufs，来确定发送什么样的请求到上游服务器。
 ```c
 static ngx_int_t mytest_upstream_create_request(ngx_http_request_t *r){
     //发往www.baidu上游服务器的请求很简单，就是模仿正常的搜索请求，
@@ -378,13 +378,13 @@ static ngx_int_t mytest_upstream_create_request(ngx_http_request_t *r){
 }
 ```
 
-	2. **process_header**
+ 2. **process_header**
 
-	第2个必须实现的回调为process_header函数。它负责解析上游服务器响应的基于TCP的包头，即HTTP的响应行(主要描述HTTP协议版本、状态码)和HHTP头信息。
+第2个必须实现的回调为process_header函数。它负责解析上游服务器响应的基于TCP的包头，即HTTP的响应行(主要描述HTTP协议版本、状态码)和HHTP头信息。
 
-	其中，解析HTTP响应行使用`mytest_process_status_line`方法，解析HTTP响应头使用`mytest_upstream_process_header`。使用两个函数的其原因在于HTTP的响应行和响应头都是不定长的。当nginx接收到TCP流后，通过回调**从上下文中**判断是否接收完成，如果返回NGX_AGAIN，则需要继续。
+其中，解析HTTP响应行使用`mytest_process_status_line`方法，解析HTTP响应头使用`mytest_upstream_process_header`。使用两个函数的其原因在于HTTP的响应行和响应头都是不定长的。当nginx接收到TCP流后，通过回调**从上下文中**判断是否接收完成，如果返回NGX_AGAIN，则需要继续。
 	
-	其流程如下：
+其流程如下：
 
 1) nginx主循环定期调用事件模块，检查是否有网络事件
 2) 接收上游服务器的响应后，调用upstream模块处理。后者从套接字缓冲区中读取来自上游的TCP流。
@@ -397,7 +397,7 @@ static ngx_int_t mytest_upstream_create_request(ngx_http_request_t *r){
 
 其代码实现如下：
 
-	- **mytest_process_status_line**
+- **mytest_process_status_line**
 
 ```c
 static	ngx_int_t	mytest_process_status_line(ngx_http_request_t *r){
@@ -463,7 +463,7 @@ static	ngx_int_t	mytest_process_status_line(ngx_http_request_t *r){
 }
 ```
 
-	- **mytest_upstream_process_header**
+- **mytest_upstream_process_header**
 
 ```c
 static ngx_int_t
@@ -557,9 +557,8 @@ mytest_upstream_process_header(ngx_http_request_t *r)
 }
 ```
 
-	3. **finalize_request**
-
-	当调用ngx_http_upstream_init启动upstream后，因各种原因导致的请求被销毁前都会调用finalize_request方法。finalize_request方法可以释放我们希望释放的资源，比如打开的句柄等。如果没有资源需要释放，记录日志即可：
+ 3. **finalize_request**
+  当调用ngx_http_upstream_init启动upstream后，因各种原因导致的请求被销毁前都会调用finalize_request方法。finalize_request方法可以释放我们希望释放的资源，比如打开的句柄等。如果没有资源需要释放，记录日志即可：
 ```c
 static void mytest_upstream_finalize_request(ngx_http_request_t *r, ngx_int_t rc){
     ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
@@ -567,9 +566,9 @@ static void mytest_upstream_finalize_request(ngx_http_request_t *r, ngx_int_t rc
 }
 ```
 
-	4. **其他回调**
+ 4. **其他回调**
 	
-	其他的回调包括了`reinit_request/rewrite_redirect`，此处略过。
+  其他的回调包括了`reinit_request/rewrite_redirect`，此处略过。
 
 
 

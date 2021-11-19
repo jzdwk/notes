@@ -219,12 +219,128 @@ typedef struct{
 } ngx_http_mytest_ctx_t;
 ```
 
-4. **构造请求**
 
-前文曾说过，在upstream中有3个必须实现回调函数。其中，构造请求由create_request回调方法定义：
+4. **启动upstream**
+
+当nginx接收到客户端的请求后，会根据请求url匹配到HTTP模块内具体的某个location。根据demo场景，当配置项为mytest时，将由mytest模块来处理业务。因此。启动upstream的时机将由配置项解析函数完成：
 ```c
-static ngx_int_t
-mytest_upstream_create_request(ngx_http_request_t *r){
+//commands定义
+static ngx_command_t  ngx_http_mytest_commands[] ={
+	{
+		//set方法，执行配置项的解析
+        ngx_http_mytest,
+        ....
+    },
+    ngx_null_command
+};
+//set方法定义
+static char *ngx_http_mytest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
+    ngx_http_core_loc_conf_t  *clcf;
+
+    //首先找到mytest配置项所属的配置块，clcf貌似是location块内的数据
+	//结构，其实不然，它可以是main、srv或者loc级别配置项，也就是说在每个
+	//http{}和server{}内也都有一个ngx_http_core_loc_conf_t结构体
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+
+    //http框架在处理用户请求进行到NGX_HTTP_CONTENT_PHASE阶段时，如果
+	//请求的主机域名、URI与mytest配置项所在的配置块相匹配，就将调用我们
+	//实现的ngx_http_mytest_handler方法处理这个请求
+    clcf->handler = ngx_http_mytest_handler;
+
+    return NGX_CONF_OK;
+}
+```
+在介绍handler方法之前，首先看下**nginx接收客户端请求以及构造upstream，创建访问第三方请求的步骤**：
+
+1) nginx主循环定期调用事件模块，检查是否有网络事件
+2) 接收到HTTP请求后，调用HTTP框架处理。此时比如匹配到了location块，发现其中有mytest配置项，则交给mytest模块。
+**3) 调用mytest的配置项解析函数(即handler方法)，设置upstram限制参数、回调函数(process_header等)与第三方的服务地址(resolved)**
+**4) 调用ngx_http_upstream_init启动upstream**
+5) 如果使用了反向代理文件缓存，则检查，如果有合适响应包，则返回；如果没有，继续。
+6) 回调mytest的create_request方法
+7) mytest设置r->upstream->request_bufs确定要发送给上游服务器的具体信息
+8) upstream模块检查resolved成员，设置上游服务器的地址r->upstream->peer。
+9) 使用无阻塞方法connect建立TCP套接字连接，建立后即可返回
+10) ngx_http_upstream_init返回
+11) mytest模块的ngx_http_mytest_handler返回NGX_DONE
+12) 事件模块处理完该网络事件后，控制权交还给nginx主循环。
+
+以上步骤由2个部分，1是解析配置项，设置限制参数、回调、resolverd等，2是构造请求。其中1的工作即由handler实现：
+```c
+//handler方法
+static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
+    //首先建立http上下文结构体ngx_http_mytest_ctx_t
+	//这里有一个疑问，ngx_http_get_module_ctx(r, ngx_http_mytest_module)返回的不应该是ngx_http_mytest_module的ctx么，按上文定义，应该是ngx_http_module_t类型的ngx_http_mytest_module_ctx
+    ngx_http_mytest_ctx_t* myctx = ngx_http_get_module_ctx(r, ngx_http_mytest_module);
+    if (myctx == NULL)
+    {
+        myctx = ngx_palloc(r->pool, sizeof(ngx_http_mytest_ctx_t));
+        if (myctx == NULL)
+        {
+            return NGX_ERROR;
+        }
+        //将新建的上下文与请求关联起来
+        ngx_http_set_ctx(r, myctx, ngx_http_mytest_module);
+    }
+    //对每1个要使用upstream的请求，必须调用且只能调用1次
+	//ngx_http_upstream_create方法，它会初始化r->upstream成员
+    if (ngx_http_upstream_create(r) != NGX_OK){
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ngx_http_upstream_create() failed");
+        return NGX_ERROR;
+    }
+
+	//1. 设置upstream的限制参数
+	
+    //得到配置结构体ngx_http_mytest_conf_t
+    ngx_http_mytest_conf_t  *mycf = (ngx_http_mytest_conf_t  *) ngx_http_get_module_loc_conf(r, ngx_http_mytest_module);
+    ngx_http_upstream_t *u = r->upstream;
+    //这里用配置文件中的结构体来赋给r->upstream->conf成员
+    u->conf = &mycf->upstream;
+    //决定转发包体时使用的缓冲区
+    u->buffering = mycf->upstream.buffering;
+
+    //2. 设置resolved
+	//初始化resolved结构体，用来保存上游服务器的地址
+    u->resolved = (ngx_http_upstream_resolved_t*) ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_resolved_t));
+    ...
+    //这里的上游服务器就是www.baidu.com
+    static struct sockaddr_in backendSockAddr;
+    struct hostent *pHost = gethostbyname((char*) "www.baidu.com");
+    ...
+
+    //访问上游服务器的80端口
+    backendSockAddr.sin_family = AF_INET;
+    backendSockAddr.sin_port = htons((in_port_t) 80);
+    char* pDmsIP = inet_ntoa(*(struct in_addr*) (pHost->h_addr_list[0]));
+    backendSockAddr.sin_addr.s_addr = inet_addr(pDmsIP);
+    myctx->backendServer.data = (u_char*)pDmsIP;
+    myctx->backendServer.len = strlen(pDmsIP);
+
+    //将地址设置到resolved成员中
+    u->resolved->sockaddr = (struct sockaddr *)&backendSockAddr;
+    u->resolved->socklen = sizeof(struct sockaddr_in);
+    u->resolved->naddrs = 1;
+
+    //3. 设置三个必须实现的回调方法
+    u->create_request = mytest_upstream_create_request;
+    u->process_header = mytest_process_status_line;
+    u->finalize_request = mytest_upstream_finalize_request;
+
+    //这里必须将count成员加1，理由见5.1.5节
+    r->main->count++;
+    //启动upstream
+    ngx_http_upstream_init(r);
+    //必须返回NGX_DONE
+    return NGX_DONE;
+}
+```
+下面，看下几个回调函数的实现：
+
+	1. **create_request**
+	
+	根据上节的创建upstream请求，create_request接下来的工作主要为设置r->upstream->request_bufs，来确定发送什么样的请求到上游服务器。
+```c
+static ngx_int_t mytest_upstream_create_request(ngx_http_request_t *r){
     //发往www.baidu上游服务器的请求很简单，就是模仿正常的搜索请求，
 	//以/s?wd=…的URL来发起搜索请求。backendQueryLine中的%V等转化
 	//格式的用法，请参见4.4节中的表4-7
@@ -262,15 +378,26 @@ mytest_upstream_create_request(ngx_http_request_t *r){
 }
 ```
 
-5. **解析响应**
+	2. **process_header**
 
-第2个必须实现的回调为process_header函数。它负责解析上游服务器响应的基于TCP的包头，即HTTP的响应行(主要描述HTTP协议版本、状态码)和头部信息。
+	第2个必须实现的回调为process_header函数。它负责解析上游服务器响应的基于TCP的包头，即HTTP的响应行(主要描述HTTP协议版本、状态码)和HHTP头信息。
 
-其中，解析HTTP响应行使用`mytest_process_status_line`方法，解析HTTP响应头使用`mytest_upstream_process_header`。
+	其中，解析HTTP响应行使用`mytest_process_status_line`方法，解析HTTP响应头使用`mytest_upstream_process_header`。使用两个函数的其原因在于HTTP的响应行和响应头都是不定长的。当nginx接收到TCP流后，通过回调**从上下文中**判断是否接收完成，如果返回NGX_AGAIN，则需要继续。
+	
+	其流程如下：
 
-使用两个函数的其原因在于HTTP的响应行和响应头都是不定长的。当nginx接收到TCP流后，通过回调**从上下文中**判断是否接收完成，如果返回AGAIN，则需要继续。
+1) nginx主循环定期调用事件模块，检查是否有网络事件
+2) 接收上游服务器的响应后，调用upstream模块处理。后者从套接字缓冲区中读取来自上游的TCP流。
+3) 将响应放到r->upstream->buffer指向的内存（即使多次接收TCP流，其上游的响应都会存放到r->upstream->buffer缓冲区中，因此，如果precess_header返回NGX_AGAIN而缓冲区满，则报错）
+4) 回调mytest的process_header方法
+5) process_header的工作为解析r->upstream->buffer缓冲区，试图读取完整的响应头部(即HTTP头)
+6) 如果返回NGX_AGAIN，表示还没有解析到完整的响应头，会继续调用process_header处理
+7) upstream模块调用无阻塞的读取套接字接口，如果有值，转3）; 如果为空，说明响应事件处理完毕。
+8) 控制权交还给事件模块，处理完本轮网络事件，控制权交还给nginx主循环。
 
-- **mytest_process_status_line**
+其代码实现如下：
+
+	- **mytest_process_status_line**
 
 ```c
 static	ngx_int_t	mytest_process_status_line(ngx_http_request_t *r){
@@ -336,7 +463,7 @@ static	ngx_int_t	mytest_process_status_line(ngx_http_request_t *r){
 }
 ```
 
-- **mytest_upstream_process_header**
+	- **mytest_upstream_process_header**
 
 ```c
 static ngx_int_t
@@ -430,9 +557,9 @@ mytest_upstream_process_header(ngx_http_request_t *r)
 }
 ```
 
-6. **释放资源**
+	3. **finalize_request**
 
-当请求结束后，会调用finalize_request方法来释放我们希望释放的资源，比如打开的句柄等。
+	当调用ngx_http_upstream_init启动upstream后，因各种原因导致的请求被销毁前都会调用finalize_request方法。finalize_request方法可以释放我们希望释放的资源，比如打开的句柄等。如果没有资源需要释放，记录日志即可：
 ```c
 static void mytest_upstream_finalize_request(ngx_http_request_t *r, ngx_int_t rc){
     ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
@@ -440,113 +567,11 @@ static void mytest_upstream_finalize_request(ngx_http_request_t *r, ngx_int_t rc
 }
 ```
 
-7. **启动upstream**
+	4. **其他回调**
+	
+	其他的回调包括了`reinit_request/rewrite_redirect`，此处略过。
 
-前面几步均为设置回调的实现，当客户端请求到达后，将在ngx_http_mytest_handler方法中启动upstream机制。该handler用于实现commands的set方法：
-```c
-//commands定义
-static ngx_command_t  ngx_http_mytest_commands[] ={
-	{
-		//set方法
-        ngx_http_mytest,
-        ....
-    },
-    ngx_null_command
-};
-//set方法定义
-static char *ngx_http_mytest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
-    ngx_http_core_loc_conf_t  *clcf;
 
-    //首先找到mytest配置项所属的配置块，clcf貌似是location块内的数据
-	//结构，其实不然，它可以是main、srv或者loc级别配置项，也就是说在每个
-	//http{}和server{}内也都有一个ngx_http_core_loc_conf_t结构体
-    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-
-    //http框架在处理用户请求进行到NGX_HTTP_CONTENT_PHASE阶段时，如果
-	//请求的主机域名、URI与mytest配置项所在的配置块相匹配，就将调用我们
-	//实现的ngx_http_mytest_handler方法处理这个请求
-    clcf->handler = ngx_http_mytest_handler;
-
-    return NGX_CONF_OK;
-}
-
-//handler方法
-static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
-    //首先建立http上下文结构体ngx_http_mytest_ctx_t
-	//这里有一个疑问，ngx_http_get_module_ctx(r, ngx_http_mytest_module)返回的不应该是ngx_http_mytest_module的ctx么，按上文定义，应该是ngx_http_module_t类型的ngx_http_mytest_module_ctx
-    ngx_http_mytest_ctx_t* myctx = ngx_http_get_module_ctx(r, ngx_http_mytest_module);
-    if (myctx == NULL)
-    {
-        myctx = ngx_palloc(r->pool, sizeof(ngx_http_mytest_ctx_t));
-        if (myctx == NULL)
-        {
-            return NGX_ERROR;
-        }
-        //将新建的上下文与请求关联起来
-        ngx_http_set_ctx(r, myctx, ngx_http_mytest_module);
-    }
-    //对每1个要使用upstream的请求，必须调用且只能调用1次
-	//ngx_http_upstream_create方法，它会初始化r->upstream成员
-    if (ngx_http_upstream_create(r) != NGX_OK)
-    {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ngx_http_upstream_create() failed");
-        return NGX_ERROR;
-    }
-
-    //得到配置结构体ngx_http_mytest_conf_t
-    ngx_http_mytest_conf_t  *mycf = (ngx_http_mytest_conf_t  *) ngx_http_get_module_loc_conf(r, ngx_http_mytest_module);
-    ngx_http_upstream_t *u = r->upstream;
-    //这里用配置文件中的结构体来赋给r->upstream->conf成员
-    u->conf = &mycf->upstream;
-    //决定转发包体时使用的缓冲区
-    u->buffering = mycf->upstream.buffering;
-
-    //以下代码开始初始化resolved结构体，用来保存上游服务器的地址
-    u->resolved = (ngx_http_upstream_resolved_t*) ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_resolved_t));
-    if (u->resolved == NULL)
-    {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "ngx_pcalloc resolved error. %s.", strerror(errno));
-        return NGX_ERROR;
-    }
-
-    //这里的上游服务器就是www.google.com
-    static struct sockaddr_in backendSockAddr;
-    struct hostent *pHost = gethostbyname((char*) "www.google.com");
-    if (pHost == NULL)
-    {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "gethostbyname fail. %s", strerror(errno));
-
-        return NGX_ERROR;
-    }
-
-    //访问上游服务器的80端口
-    backendSockAddr.sin_family = AF_INET;
-    backendSockAddr.sin_port = htons((in_port_t) 80);
-    char* pDmsIP = inet_ntoa(*(struct in_addr*) (pHost->h_addr_list[0]));
-    backendSockAddr.sin_addr.s_addr = inet_addr(pDmsIP);
-    myctx->backendServer.data = (u_char*)pDmsIP;
-    myctx->backendServer.len = strlen(pDmsIP);
-
-    //将地址设置到resolved成员中
-    u->resolved->sockaddr = (struct sockaddr *)&backendSockAddr;
-    u->resolved->socklen = sizeof(struct sockaddr_in);
-    u->resolved->naddrs = 1;
-
-    //设置三个必须实现的回调方法，也就是5.3.3节至5.3.5节中实现的3个方法
-    u->create_request = mytest_upstream_create_request;
-    u->process_header = mytest_process_status_line;
-    u->finalize_request = mytest_upstream_finalize_request;
-
-    //这里必须将count成员加1，理由见5.1.5节
-    r->main->count++;
-    //启动upstream
-    ngx_http_upstream_init(r);
-    //必须返回NGX_DONE
-    return NGX_DONE;
-}
-```
 
  
 

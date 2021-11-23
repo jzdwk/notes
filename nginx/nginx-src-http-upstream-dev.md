@@ -40,7 +40,7 @@ struct ngx_http_upstream_s {
 	ngx_chain_t *request_bufs;                          // 用链表将ngx_buf_t缓冲区链接起来，表示所有需要发送到上游的请求内容，在实现create_request方法时需要设置
                                                    
     ...
-    ngx_http_upstream_conf_t *conf;                     // upstream相关的配置信息，即上节的第4条，比如第三方访问时的过期时间等
+    ngx_http_upstream_conf_t *conf;                     // upstream相关的配置信息，即上节的第5条，比如第三方访问时的过期时间等
 	...
     ngx_http_upstream_resolved_t *resolved;             // 解析主机域名，或设置上游服务器的地址，即上节的第2条
 
@@ -154,7 +154,7 @@ typedef struct
 static void* ngx_http_mytest_create_loc_conf(ngx_conf_t *cf)
 {
     ngx_http_mytest_conf_t  *mycf;
-	//申请内存
+	//初始化mytest的配置项存储
     mycf = (ngx_http_mytest_conf_t  *)ngx_pcalloc(cf->pool, sizeof(ngx_http_mytest_conf_t));
 	...
     //以下简单的硬编码ngx_http_upstream_conf_t结构中的各成员，例如
@@ -209,7 +209,27 @@ static char *ngx_http_mytest_merge_loc_conf(ngx_conf_t *cf, void *parent, void *
 
 3. **设置请求上下文**
 
-设置请求上下文的目的在于，当nginx的TCP连接操作是异步的，当upstream模块收到一段TCP流后，才会回调mytest实现的process_header方法，此时需要一个上下文来保存解析的状态。
+nginx中，对于请求的操作是异步的，所以一个请求不会在epoll的一次调度中处理完成，换句话说，需要有一个*变量*来保存每个HTTP模块对于请求的处理状态信息：nginx处理某请求时，将信息写入该变量，当nginx处理其他请求时，把之前的信息存储。当nginx回过头再次调用时，从该变量中取出上一次处理的状态。
+
+与上下文相关的宏定义有：
+```c
+//定义位于ngx_http.h中
+
+//从请求r中返回模块module的上下文，其中r为ngx_http_request的指针，module为HTTP的模块对象
+#define ngx_http_get_module_ctx(r, module)  (r)->ctx[module.ctx_index]
+//将上下文写入请求中，其中r为ngx_http_request的指针，c为上下文结构体的指针，module为HTTP模块
+#define ngx_http_set_ctx(r, c, module)      r->ctx[module.ctx_index] = c;
+```
+nginx对于上下文的定义如下：
+```c
+struct ngx_http_request_s {
+	...
+	//一个指向void*指针的指针数组，保存所有HTTP模块上下文结构体
+	void **ctx;
+	...
+};
+```
+因此，设置upstream相关上下文：
 ```c
 //上下文解析定义如下
 typedef struct{
@@ -237,9 +257,10 @@ static ngx_command_t  ngx_http_mytest_commands[] ={
 static char *ngx_http_mytest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
     ngx_http_core_loc_conf_t  *clcf;
 
-    //首先找到mytest配置项所属的配置块，clcf貌似是location块内的数据
-	//结构，其实不然，它可以是main、srv或者loc级别配置项，也就是说在每个
-	//http{}和server{}内也都有一个ngx_http_core_loc_conf_t结构体
+	//这里注意，ngx_http_conf_get_module_loc_conf的宏定义如下：
+	//#define ngx_http_conf_get_module_loc_conf(cf, module) ((ngx_http_conf_ctx_t *) cf->ctx)->loc_conf[module.ctx_index]  
+	//结合nginx的conf解析笔记，可以看到，其实现即为从ngx_http_conf_ctx_t中，取出对应模块的loc_conf数据
+	//所以，此处为获取ngx_http_core_module模块的loc_conf数据
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
 
     //http框架在处理用户请求进行到NGX_HTTP_CONTENT_PHASE阶段时，如果
@@ -269,9 +290,8 @@ static char *ngx_http_mytest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
 ```c
 //handler方法
 static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
-    //首先建立http上下文结构体ngx_http_mytest_ctx_t
-	//这里有一个疑问，ngx_http_get_module_ctx(r, ngx_http_mytest_module)返回的不应该是ngx_http_mytest_module的ctx么，按上文定义，应该是ngx_http_module_t类型的ngx_http_mytest_module_ctx
-    ngx_http_mytest_ctx_t* myctx = ngx_http_get_module_ctx(r, ngx_http_mytest_module);
+    //首先建立ngx_http_mytest_module的上下文myctx
+	ngx_http_mytest_ctx_t* myctx = ngx_http_get_module_ctx(r, ngx_http_mytest_module);
     if (myctx == NULL)
     {
         myctx = ngx_palloc(r->pool, sizeof(ngx_http_mytest_ctx_t));
@@ -279,7 +299,7 @@ static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
         {
             return NGX_ERROR;
         }
-        //将新建的上下文与请求关联起来
+        //将新建的上下文写入请求的ngx_http_mytest_module模块
         ngx_http_set_ctx(r, myctx, ngx_http_mytest_module);
     }
     //对每1个要使用upstream的请求，必须调用且只能调用1次
@@ -291,7 +311,7 @@ static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
 
 	//1. 设置upstream的限制参数
 	
-    //得到配置结构体ngx_http_mytest_conf_t
+    //根据nginx对于配置项的解析，根据扫描的具体块，从对应的ngx_http_conf_ctx_t取出ngx_http_mytest_module模块的loc_conf配置项，也就是由ngx_http_mytest_create_loc_conf创建的配置项
     ngx_http_mytest_conf_t  *mycf = (ngx_http_mytest_conf_t  *) ngx_http_get_module_loc_conf(r, ngx_http_mytest_module);
     ngx_http_upstream_t *u = r->upstream;
     //这里用配置文件中的结构体来赋给r->upstream->conf成员

@@ -112,6 +112,7 @@ typedef struct {
 
     /**
      * 当需要创建数据结构来存储main级别(直属于http{...}块的配置项)的全局配置项时，使用此回调创建存储main级配置的结构体
+	 * 注意，该函数的返回值可以作为ngx_http_conf_get_module_main_conf和ngx_http_get_module_main_conf的结果
      */
     void       *(*create_main_conf)(ngx_conf_t *cf);
     
@@ -122,6 +123,7 @@ typedef struct {
 
     /**
      * 当需要创建数据结构来存储server级别(直属于server{...}块的配置项)的配置项时，使用此回调创建存储server配置的结构体
+	 * 注意，该函数的返回值可以作为ngx_http_conf_get_module_srv_conf和ngx_http_get_module_srv_conf的结果
      */
     void       *(*create_srv_conf)(ngx_conf_t *cf);
     
@@ -131,7 +133,8 @@ typedef struct {
     char       *(*merge_srv_conf)(ngx_conf_t *cf, void *prev, void *conf);
 
     /**
-     * 当需要创建数据结构来存储location级别(直属于location{...}块的配置项)的配置项时，使用此回调创建存储server配置的结构体
+     * 当需要创建数据结构来存储location级别(直属于location{...}块的配置项)的配置项时，使用此回调创建存储location配置的结构体
+	 * 注意，该函数的返回值可以作为ngx_http_conf_get_module_loc_conf和ngx_http_get_module_loc_conf的结果
      */
     void       *(*create_loc_conf)(ngx_conf_t *cf);
     

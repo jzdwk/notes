@@ -85,9 +85,7 @@ subrequest的创建时机同样是在command定义的set方法中，即ngx_http_
 static char *ngx_http_mytest(ngx_conf_t * cf, ngx_command_t * cmd, void * conf){
     ngx_http_core_loc_conf_t  *clcf;
 
-    //首先找到mytest配置项所属的配置块，clcf貌似是location块内的数据
-	//结构，其实不然，它可以是main、srv或者loc级别配置项，也就是说在每个
-	//http{}和server{}内也都有一个ngx_http_core_loc_conf_t结构体
+    //根据nginx对于配置项的解析，根据扫描的具体块，从对应的ngx_http_conf_ctx_t取出ngx_http_core_module模块的loc_conf配置项
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
 
     //http框架在处理用户请求进行到NGX_HTTP_CONTENT_PHASE阶段时，如果
@@ -198,9 +196,7 @@ static ngx_int_t mytest_subrequest_post_handler(ngx_http_request_t *r, void *dat
     //当前请求r是子请求，它的parent成员就指向父请求
     ngx_http_request_t          *pr = r->parent;
 	
-    //注意，上下文是保存在父请求中的，所以要由pr中取上下文。
-	//其实初始化subrequest时，已经将data设置为上下文myctx（见第2步），所以不必再取，这里仅起示例作用
-	//这里仅为了说明如何获取到父请求的上下文
+    //根据nginx对于配置项的解析，根据扫描的具体块，从对应的ngx_http_conf_ctx_t取出ngx_http_mytest_module模块的loc_conf配置项，也就是由ngx_http_mytest_create_loc_conf创建的配置项
     ngx_http_mytest_ctx_t* myctx = ngx_http_get_module_ctx(pr, ngx_http_mytest_module);
 
     pr->headers_out.status = r->headers_out.status;

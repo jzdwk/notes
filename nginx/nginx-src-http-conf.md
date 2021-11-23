@@ -249,7 +249,7 @@ http{
 
 3. 初始化所有HTTP模块的序列号，并创建**ngx_http_conf_ctx_t结构**，该结构用于存储所有HTTP模块的配置项，具体解析下节分析。
 
-4. 依次调用每个HTTP模块的**create_main_conf、create_srv_conf、create_loc_conf方法**：**每个HTTP模块都实现自己的ngx_module_t**。ngx_module_t的**ctx**项中定义了create_main_conf等回调方法，此时，将调用这些方法。因此，上节实现的`ngx_http_mytest_module_ctx`中的`ngx_http_mytest_create_loc_conf`将被调用。
+4. 依次调用每个HTTP模块的**create_main_conf、create_srv_conf、create_loc_conf方法**：**每个HTTP模块都实现自己的ngx_module_t**。ngx_module_t的**ctx**项中定义了create_main_conf等回调方法，此时，将调用这些方法，并根据模块序号，将返回值写入ngx_http_conf_ctx_t对应数组的项中。因此，上节实现的`ngx_http_mytest_module_ctx`中的`ngx_http_mytest_create_loc_conf`将被调用，被写入`ngx_http_conf_ctx_t->loc_conf[ngx_http_mytest_module_ctx.模块序号]`。
 
 5. 把各HTTP模块上述3个方法返回的地址依次保存到ngx_http_conf_ctx_t结构体的3个数组中(如果某个模块没有定义相应的方法，则为NULL)。
 

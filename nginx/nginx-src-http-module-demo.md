@@ -32,7 +32,8 @@ static ngx_command_t ngx_http_mydemo_commands[] = {
 static char* ngx_http_mydemo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)  
 {  
     ngx_http_core_loc_conf_t *clcf;
-	//ngx_http_conf_get_module_loc_conf为main/http/server/location块的数据结构
+	//ngx_http_conf_get_module_loc_conf的作用是通过cf配置的上下文，找到指定的module中的location configuration。
+	//这里即为获取ngx_http_core_module模块的location配置
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
 	//注册handler方法，当请求进行到NGX_HTTP_CONTENT_PHASE阶段时调用
     clcf->handler = ngx_http_mydemo_handler;

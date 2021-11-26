@@ -311,7 +311,22 @@ static ngx_int_t ngx_http_mytest_handler(ngx_http_request_t *r){
 
 	//1. 设置upstream的限制参数
 	
-    //根据nginx对于配置项的解析，根据扫描的具体块，从对应的ngx_http_conf_ctx_t取出ngx_http_mytest_module模块的loc_conf配置项，也就是由ngx_http_mytest_create_loc_conf创建的配置项
+    //宏定义为：#define ngx_http_get_module_loc_conf(r, module)  (r)->loc_conf[module.ctx_index] 
+	//ngx_http_request_t中保存了模块所对应的上下文结构体指针：
+	/* struct  ngx_http_request_s  {
+	 *	...
+	 *	以下四个保存的是模块所对应的上下文结构体的指针。
+	 *	其中ctx对应于自定义的上下文结构体指针
+	 *	main_conf对应于main的上下文结构体指针
+	 *	loc_conf对应于loc的上下文结构体指针
+	 *	src_conf对应于srv的上下文结构体指针
+     *  void                             **  ctx ;
+     *  void                             **  main_conf ;
+     *  void                             **  srv_conf ;
+     *  void                             **  loc_conf ;
+	 */	
+	 //故http根据nginx对于配置项的解析，在调用handler时已扫描到了具体的块(http/server/location)，
+	 //从对应的ngx_http_conf_ctx_t取出ngx_http_mytest_module模块的loc_conf配置项，也就是由ngx_http_mytest_create_loc_conf创建的配置项
     ngx_http_mytest_conf_t  *mycf = (ngx_http_mytest_conf_t  *) ngx_http_get_module_loc_conf(r, ngx_http_mytest_module);
     ngx_http_upstream_t *u = r->upstream;
     //这里用配置文件中的结构体来赋给r->upstream->conf成员

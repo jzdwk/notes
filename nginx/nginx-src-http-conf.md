@@ -27,7 +27,8 @@ struct ngx_module_s {
 	NGX_MODULE_V1_PADDING;
 };
 
-//2. ngx_http_module_t定义回调函数，在解析http{}等块时，执行回调，主要用于对配置项所占存储进行Init操作
+//2. ngx_http_module_t定义回调函数，在解析http{}等块时，执行回调，主要用于对配置项所占存储进行init操作
+//这里需要注意参数ngx_conf_t cf，该结构用于存储nginx的各配置项，此处猜测为nginx框架调用init后，将其关联到cf，待后续验证
 typedef struct {  
     ngx_int_t   (*preconfiguration)(ngx_conf_t *cf);
     ngx_int_t   (*postconfiguration)(ngx_conf_t *cf);

@@ -157,14 +157,23 @@ NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_myfilter_module.c"
 
 3. **配置项数据结构**
 ```c
+//配置项的数据结构存储
+typedef struct{
+    ngx_flag_t		enable;
+} ngx_http_myfilter_conf_t;
+
+//上下文数据结构
+typedef struct{
+    ngx_int_t   	add_prefix;
+} ngx_http_myfilter_ctx_t;
+
 ```
 4. **HTTP模块三板斧**
 
 定义ngx_module_t、ngx_http_module_t、ngx_command_t：
 ```c
 //command定义，解析add_prefix配置项
-static ngx_command_t  ngx_http_myfilter_commands[] =
-{
+static ngx_command_t  ngx_http_myfilter_commands[] ={
     {
         ngx_string("add_prefix"),
         NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_FLAG,
@@ -178,8 +187,7 @@ static ngx_command_t  ngx_http_myfilter_commands[] =
 };
 
 //ngx_http_module_t定义
-static ngx_http_module_t  ngx_http_myfilter_module_ctx =
-{
+static ngx_http_module_t  ngx_http_myfilter_module_ctx ={
     NULL,                                  /* preconfiguration方法  */
 	//注意，这里实现了模块的init方法，主要作用是使用头插法更新过滤模块链表
     ngx_http_myfilter_init,            /* postconfiguration方法 */
@@ -195,8 +203,7 @@ static ngx_http_module_t  ngx_http_myfilter_module_ctx =
 };
 
 //ngx_module_t模块定义，依旧属于NGX_HTTP_MODULE模块
-ngx_module_t  ngx_http_myfilter_module =
-{
+ngx_module_t  ngx_http_myfilter_module ={
     NGX_MODULE_V1,
     &ngx_http_myfilter_module_ctx,     /* module context */
     ngx_http_myfilter_commands,        /* module directives */
@@ -231,15 +238,15 @@ static char * ngx_http_myfilter_merge_conf(ngx_conf_t *cf, void *parent, void *c
 }
 
 ```
-5. 实现初始化方法
+5. **实现初始化方法**
 
+初始化方法被引用在ngx_http_module_t中的postconfiguration回调函数，用于向过滤链表中加入ngx_http_myfilter_header_filter
 ```c
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 
-static ngx_int_t ngx_http_myfilter_init(ngx_conf_t *cf)
-{
+static ngx_int_t ngx_http_myfilter_init(ngx_conf_t *cf){
     //插入到头部处理方法链表的首部
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_myfilter_header_filter;
@@ -252,8 +259,98 @@ static ngx_int_t ngx_http_myfilter_init(ngx_conf_t *cf)
 }
 ```
 
-上文中说明，对于
-6. 处理http头部方法
-7. 处理http包体方法
-8. 编译安装
+6. **处理http头部方法**
+
+唯一需要注意的两点是：
+- 判断该模块是否已经执行
+- 只处理Content-Type是"text/plain"类型的http响应并修改Content-Length
+
+```c
+//预定义要处理的字符串
+static ngx_str_t filter_prefix = ngx_string("[my filter prefix]");
+
+//http头过滤函数实现
+static ngx_int_t ngx_http_myfilter_header_filter(ngx_http_request_t *r){
+    ngx_http_myfilter_ctx_t   *ctx;
+    ngx_http_myfilter_conf_t  *conf;
+
+    //如果不是返回成功，这时是不需要理会是否加前缀的，直接交由下一个过滤模块处理响应码非200的情形
+    if (r->headers_out.status != NGX_HTTP_OK){
+        return ngx_http_next_header_filter(r);
+    }
+	
+	//获取http上下文
+    ctx = ngx_http_get_module_ctx(r, ngx_http_myfilter_module);
+    if (ctx){
+        //该请求的上下文已经存在，这说明ngx_http_myfilter_header_filter已经被调用过1次，直接交由下一个过滤模块处理
+        return ngx_http_next_header_filter(r);
+    }
+
+	//获取存储配置项的ngx_http_myfilter_conf_t结构体
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_myfilter_module);
+
+	//如果enable成员为0，也就是配置文件中没有配置add_prefix配置项，或者add_prefix配置项的参数值是off，这时直接交由下一个过滤模块处理
+    if (conf->enable == 0){
+        return ngx_http_next_header_filter(r);
+    }
+
+	//构造http上下文结构体ngx_http_myfilter_ctx_t
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_myfilter_ctx_t));
+    ...
+
+	//add_prefix为0表示不加前缀
+    ctx->add_prefix = 0;
+
+	//将构造的上下文设置到当前请求中
+    ngx_http_set_ctx(r, ctx, ngx_http_myfilter_module);
+
+	//myfilter过滤模块只处理Content-Type是"text/plain"类型的http响应
+    if (r->headers_out.content_type.len >= sizeof("text/plain") - 1
+        && ngx_strncasecmp(r->headers_out.content_type.data, (u_char *) "text/plain", sizeof("text/plain") - 1) == 0){
+        //1表示需要在http包体前加入前缀
+        ctx->add_prefix = 1;
+		//如果处理模块已经在Content-Length写入了http包体的长度，由于我们需要在包体加入filter_prefix定义的字符串，所以需要把这个字符串的长度也加入到Content-Length中
+        if (r->headers_out.content_length_n > 0)
+            r->headers_out.content_length_n += filter_prefix.len;
+    }
+
+	//交由下一个过滤模块继续处理
+    return ngx_http_next_header_filter(r);
+}
+```
+7. **处理http包体方法**
+
+包体的数据结构为ngx_chain_t，因此需要将filter_prefix字符串创建为ngx_chain_t后加入原来的响应链表：
+```c
+static ngx_int_t ngx_http_myfilter_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    ngx_http_myfilter_ctx_t   *ctx;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_myfilter_module);
+	//如果获取不到上下文，或者上下文结构体中的add_prefix为0或不为1时，说明已经执行过过滤，则都不会添加前缀，这时直接交给下一个http过滤模块处理
+    if (ctx == NULL || ctx->add_prefix != 1){
+        return ngx_http_next_body_filter(r, in);
+    }
+
+	//将add_prefix设置为2，这样即使ngx_http_myfilter_body_filter再次回调时，也不会重复添加前缀
+    ctx->add_prefix = 2;
+
+	//从请求的内存池中分配内存，用于存储字符串前缀
+    ngx_buf_t* b = ngx_create_temp_buf(r->pool, filter_prefix.len);
+	//将ngx_buf_t中的指针正确地指向filter_prefix字符串
+    b->start = b->pos = filter_prefix.data;
+    b->last = b->pos + filter_prefix.len;
+
+	//从请求的内存池中生成ngx_chain_t链表，将刚分配的ngx_buf_t设置到其buf成员中，并将它添加到原先待发送的http包体前面
+    ngx_chain_t *cl = ngx_alloc_chain_link(r->pool);
+    cl->buf = b;
+    cl->next = in;
+
+	//调用下一个模块的http包体处理方法，注意这时传入的是新生成的cl链表
+    return ngx_http_next_body_filter(r, cl);
+}
+```
+
+8. **编译安装**
+
+
 

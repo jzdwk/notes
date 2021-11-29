@@ -352,5 +352,9 @@ static ngx_int_t ngx_http_myfilter_body_filter(ngx_http_request_t *r, ngx_chain_
 
 8. **编译安装**
 
-
+```
+./configure --add-module=/模块路径
+make
+make install
+```
 

@@ -555,5 +555,177 @@ int main(){
 
 ### ngx_radix_tree_t
 
+基数树是一种二叉查找树，它具备二叉查找树的全部长处：检索、插入、删除节点速度快，支持范围查找。ngx_radix_tree_t要求存储的每一个节点都必须以32位整型作为唯一标识。
+与红黑树或avl树的不同在于，**它的每一个节点key已经决定了这个节点处于树中的位置**，其位置计算为：*将key转化为二进制后，遇到0时进入左子树，遇到1后进入右子树*。另外，通过给基数树分配**掩码**，确定树的有效高度，比如`0Xe0000000（即11100..000）`表示树的高度为3：
+```
+比如0X20000000在基数树中，其中掩码为0Xe0000000：
+		root
+	   /\
+	  0  1
+	 /\  /\
+    0 1  0 1 
+   /\ /\ /\ /\
+  0 1 0 1 ... 
+	    此处为0X20000000，树高只有3层
+```
+
+ngx_radix_tree_t基数树会负责分配每一个节点占用的内存，基数树的每一个节点中可存储的值仅仅是一个指针，这个指针指向实际的数据。
+
+节点结构ngx_radix_node_t：
+```c
+typedef struct ngx_radix_node_s  ngx_radix_node_t;
+//基数树的节点
+struct ngx_radix_node_s {
+    ngx_radix_node_t  *right;//右子指针
+    ngx_radix_node_t  *left;//左子指针
+    ngx_radix_node_t  *parent;//父节点指针
+    uintptr_t          value;//指向存储数据的指针
+};
+//基数树ngx_radix_tree_t:
+typedef struct {
+    ngx_radix_node_t  *root;//根节点
+    ngx_pool_t        *pool;//内存池，负责 分配内存
+    ngx_radix_node_t  *free;//回收释放的节点，在加入新节点时，会首先查看free中是否有空暇可用的节点
+    char              *start;//已分配内存中还未使用内存的首地址
+    size_t             size;//已分配内存内中还未使用内存的大小
+} ngx_radix_tree_t;
+```
+这里要注意free这个成员。它用来回收删除基数树上的节点，并这些节点连接成一个空暇节点链表。当要插入新节点时。首先查看这个链表是否有空暇节点，假设有就不申请节点空间。就从上面取下一个节点。
+
+1. **相关函数**
+```c
+//创建基数树。preallocate是预分配节点的个数，如果为-1 会根据当前os的一个页面大小来分配
+ngx_radix_tree_t *ngx_radix_tree_create(ngx_pool_t *pool, ngx_int_t preallocate);
+
+//依据key值和掩码mask向基数树中插入value,返回值可能是NGX_OK,NGX_ERROR, NGX_BUSY
+ngx_int_t ngx_radix32tree_insert(ngx_radix_tree_t *tree, uint32_t key, uint32_t mask, uintptr_t value);
+
+//依据key值和掩码mask删除节点（value的值）
+ngx_int_t ngx_radix32tree_delete(ngx_radix_tree_t *tree, uint32_t key, uint32_t mask);
+
+//依据key值在基数树中查找返回value数据
+uintptr_t ngx_radix32tree_find(ngx_radix_tree_t *tree, uint32_t key);
+```
+
+2. **示例**
+```c
+#include <stdio.h>
+#include <string.h>
+#include "ak_core.h"
+#include "pt.h"
+
+int main(){
+    ngx_pool_t *p;
+
+    p = ngx_create_pool(NGX_DEFAULT_POOL_SIZE); //16KB
+    if(p == NULL)
+        return -1;
+
+    ngx_radix_tree_t *radixTree = ngx_radix_tree_create(p, -1); //传入-1是想让ngx_pool_t只使用一个页面来尽可能的分配基数树节点
+    ngx_uint_t tv1 = 0x20000000;
+    ngx_uint_t tv2 = 0x40000000;
+    ngx_uint_t tv3 = 0x60000000;
+    ngx_uint_t tv4 = 0x80000000;
+
+    //将上述节点添加至radixTree中，掩码0xe0000000
+    int rc = NGX_OK;
+    rc |= ngx_radix32tree_insert(radixTree, 0x20000000, 0xe0000000, (uintptr_t)&tv1);
+    rc |= ngx_radix32tree_insert(radixTree, 0x40000000, 0xe0000000, (uintptr_t)&tv2);
+    rc |= ngx_radix32tree_insert(radixTree, 0x60000000, 0xe0000000, (uintptr_t)&tv3);
+    rc |= ngx_radix32tree_insert(radixTree, 0x80000000, 0xe0000000, (uintptr_t)&tv4);
+
+    //查找节点
+    ngx_uint_t *ptv = (ngx_uint_t *)ngx_radix32tree_find(radixTree, 0x80000000);
+    if(ptv == NGX_RADIX_NO_VALUE){
+        PT_Warn("not found!\n");
+    }
+    else
+        PT_Info("the node address:%x    val:%x\n", ptv, *ptv);
+
+    ngx_destroy_pool(p);
+    return 0;
+}
+```
+
 ### 散列表
+
+#### 基本散列表
+
+没啥说的，使用开放寻址法实现的散列表，定义位于`ngx_hash.h`：
+```c
+//槽定义
+typedef struct {
+    void             *value;	//指向用户自定义元素的数据指针，如果槽为空，则为0
+    u_short           len;		//元素关键字的长度
+    u_char            name[1];	//元素关键字首地址
+} ngx_hash_elt_t;
+
+//散列表定义
+typedef struct {
+    ngx_hash_elt_t  **buckets;	//指向第一个槽的地址
+    ngx_uint_t        size;		//散列表槽总数，即容量
+} ngx_hash_t;
+
+```
+
+#### 通配符散列表
+
+nginx通过设计散列表hash_combined_t来支持简单的前置/后置通配符。所谓支持通配符的散列表, 就是把基本散列表中元素的关键字, 用去除通配符以后的字符作为关键字加入. 
+
+例如, 对于关键字` www.ben.*`, 这样带通配符的情况, 直接**建立一个专用的后置通配符散列表**, 存储元素的关键字为`www.ben`. 这样, 如果要检索`www.ben.com`是否匹配`www.ben.`, 可以用Nginx提供的方法`ngx_hash_find_wc_tail`检索, 此函数会把要查询的`www.ben.com`转化为`www.ben`，然后在后置通配符散列表中查找。
+
+同理, 对于关键字为`*.ben.com`的元素, 也直接建立一个**前置通配符的散列表**, 存储元素的关键字为`com.ben.`(这里需要注意，前置散列表的key为把通配符去掉后按.分割的倒序，所以为com.ben) , 如果要检索`smtp.ben.com`是否匹配`.ben.com`, 直接使用Nginx提供的 `ngx_hash_find_wc_head`方法查询. 该方法会把要查询的`smtp.ben.com`转化为`com.ben.`，然后在前置通配符散列表中查找。
+
+1. **数据结构**
+
+其数据结构定义如下，位于`/src/core/ngx_hash.h`：
+```c
+//对ngx_hash_t的简单封装
+typedef struct {
+    ngx_hash_t        hash;	
+    void             *value;	//当作为容器的元素是，指向用户数据
+} ngx_hash_wildcard_t;
+
+//通配符散列表定义
+typedef struct {
+    ngx_hash_t            hash;		//精确匹配的基本散列表
+    ngx_hash_wildcard_t  *wc_head;	//前置通配符散列表
+    ngx_hash_wildcard_t  *wc_tail;	//后置通配符散列表
+} ngx_hash_combined_t;
+//通配符查找方法，它将会按照  精确->前置->后置的匹配顺序查找相应的散列表
+void *ngx_hash_find_combined(ngx_hash_combined_t *hash, ngx_uint_t key, u_char *name, size_t len);
+
+//精确查询方法
+void *ngx_hash_find(ngx_hash_t *hash, ngx_uint_t key, u_char *name, size_t len);
+//前置与后置查询方法，name为关键字指针，len为关键字长度
+void *ngx_hash_find_wc_head(ngx_hash_wildcard_t *hwc, u_char *name, size_t len);
+void *ngx_hash_find_wc_tail(ngx_hash_wildcard_t *hwc, u_char *name, size_t len);
+```
+2. **初始化**
+
+nginx定义了一个结构体，用于初始化散列表：
+```c
+typedef struct {
+    /* 指向普通的完全匹配散列表 */
+    ngx_hash_t       *hash;
+    
+    /* 用于初始化添加元素的散列方法 */
+    ngx_hash_key_pt   key;
+
+    /* 散列表中槽的最大数目 */
+    ngx_uint_t        max_size;
+    /* 散列表中一个槽的大小，它限制了每个散列表元素关键字的最大长度 */
+    ngx_uint_t        bucket_size;
+
+    /* 散列表的名称 */
+    char             *name;
+    /* 内存池，用于分配散列表（最多3个，包括1个普通散列表、1个前置通配符散列表、1个后置通配符散列表）
+     * 中的所有槽 */
+    ngx_pool_t       *pool;
+    /* 临时内存池，仅存在于初始化散列表之前。它主要用于分配一些临时的动态数组，
+     * 带通配符的元素在初始化时需要用到这些数组 */
+    ngx_pool_t       *temp_pool;
+} ngx_hash_init_t;
+```
+
 

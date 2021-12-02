@@ -1,6 +1,10 @@
-# nginx 基本数据结构
+# nginx数据结构
 
-## int
+nginx的数据结构分为了高级与基本数据结构
+
+## nginx 基本数据结构
+
+### int
 
 nginx对整形的封装，没啥说的
 ```c
@@ -10,7 +14,7 @@ typedef inptr_t		ngx_int_t;
 typedef uintptr_t	ngx_uint_t;
 ```
 
-## ngx_str_t
+### ngx_str_t
 
 nginx字符串中，data指向字符串起始地址，len表示字符串长度。因此，字符串不必以'\0'结尾：
 ```c
@@ -20,7 +24,7 @@ typedef struct{
 } ngx_str_t;
 ```
 
-## ngx_list_t
+### ngx_list_t
 
 nginx中的链表ngx_list_t为一个数组链表，链表结构中的每一个元素ngx_list_part_t为一个数组，代码定义位于`https://github.com/nginx/nginx/blob/affbe0b8e14a3ce17d1a40f0fa4518d1309a917d/src/core/ngx_list.h#L25`：
 ```c
@@ -51,7 +55,7 @@ typedef	struct	{
 }ngx_list_t;
 ```
 
-## ngx_table_elt_t
+### ngx_table_elt_t
 
 ngx_table_elt_t用于存储一个K/V对，用于处理HTTP头部：
 
@@ -69,7 +73,7 @@ typedef struct {
 } ngx_table_elt_t;
 ```
 
-## ngx_buf_t
+### ngx_buf_t
 
 nginx处理大数据的数据结构，定义位于https://github.com/nginx/nginx/blob/affbe0b8e14a3ce17d1a40f0fa4518d1309a917d/src/core/ngx_buf.h#L20:
 ```c
@@ -131,7 +135,7 @@ struct ngx_buf_s {
 };
 ```
 
-## ngx_chain_t
+### ngx_chain_t
 
 描述一个由ngx_buf_t组成的链表：
 ```c
@@ -144,3 +148,412 @@ struct ngx_chain_s {
     ngx_chain_t  *next; //指向下一个chain表的指针，如果本chain已是最后一个，则置NULL
 };
 ```
+
+## nginx高级数据结构
+
+### ngx_queue_t
+
+ngx_queue_t 是Nginx提供的一个轻量级**双向链表**容器，它不负责分配内存来存放链表元素。 其具备下列特点：
+- 可以高效的执行插入、删除、合并等操作
+- 具有排序功能
+- 支持两个链表间的合并
+- 支持将一个链表一分为二的拆分动作
+其定义位于`/src/core/ngx_queue.(h/c)`：
+```c
+typedef struct ngx_queue_s  ngx_queue_t;
+
+struct ngx_queue_s {
+    ngx_queue_t  *prev;
+    ngx_queue_t  *next;
+};
+```
+它有2个特点：
+
+1. 链表不包含数据域
+
+同于教科书中将链表节点的数据成员声明在链表节点的结构体中，**ngx_queue_t只是声明了前向和后向指针，而没有包含数据内容**，因此在使用时，链表的每一个元素可以是任意类型的struct，但**结构体中必须包含一个ngx_queue_t类型的成员**，在向链表中CRUD元素时，均使用ngx_queue_t成员的指针。因此，可以通过offset操作，从ngx_queue_t成员反向推出链表元素地址：
+```c
+//q为链表某元素中的ngx_queue_t指针，type为元素结构体，field为ngx_queue_t类型的变量名
+//因此，根据内存结构，使用(ngx_queue_t指针指向地址-field相对于type的偏移量)=元素地址
+#define ngx_queue_data(q, type, field) (type *) ((u_char *) q - offsetof(type, field))
+//offsetof也是一个宏定义，如下：
+#define offsetof(p_type,field) ((size_t)&(((p_type *)0)->field))
+```
+
+2. 链表存在头节点
+
+Nginx的ngx_queue_t存在**头节点**(或者叫链表容器)与**普通链表元素**之分，虽然两者的类型一致，这里需要注意。当需要操作链表是，入参为头节点，操作链表元素时，入参为元素的中ngx_queue_t字段指针.
+头节点需要通过ngx_queue_init初始化，头节点的类型即为ngx_queue_t。当作为头节点操作链表时：
+```c
+//1. 空链表，只有头节点，prev  next指向自身
+#define ngx_queue_init(q)     \
+    (q)->prev = q;            \
+    (q)->next = q;
+//2. 只有一个元素，头节点prev与next指向元素的ngx_queue_t指针，元素的prev与next都指向头节点
+//3. 有2个或以上元素，头节点prev指向最后一个元素，next指向下一元素；最后一个元素的prev指向前一个元素，next指向头节点
+#define ngx_queue_insert_head(h, x)                                           \
+    (x)->next = (h)->next;                                                    \
+    (x)->next->prev = x;                                                      \
+    (x)->prev = h;                                                            \
+    (h)->next = x
+#define ngx_queue_insert_tail(h, x)                                           \
+    (x)->prev = (h)->prev;                                                    \
+    (x)->prev->next = x;                                                      \
+    (x)->next = h;                                                            \
+    (h)->prev = x
+```
+链表操作常用函数如下：
+```c
+ngx_queue_init(q)            //初始化链表
+ngx_queue_empty(h)           //推断链表是否为空                                                   
+ngx_queue_insert_head(h, x)  //在头部插入一个元素                                       
+#define ngx_queue_insert_after   ngx_queue_insert_head      //在h元素前面插入一个元素
+ngx_queue_insert_tail(h, x)  //在h尾部插入一个元素 
+ngx_queue_head(h)            //返回第一个元素
+#define ngx_queue_last(h)    //返回最后一个元素 
+ngx_queue_sentinel(h)        //返回链表容器结构体的指针
+ngx_queue_next(q)            //返回下一个q的下一个元素  
+ngx_queue_prev(q)            //返回q的前一个元素
+ngx_queue_remove(x)          //删除x结点                                           
+ngx_queue_split(h, q, n)     //把h分为两个链表h和n，而且n的第一元素为q
+ngx_queue_add(h, n)          //把链表n添加到h链表的尾部
+ngx_queue_data(q, type, link)//取出包括q的type类型的地址。这样我们就能够訪问type内的成员
+
+```
+
+
+3. 例子
+
+来自https://www.cnblogs.com/zfyouxi/p/5177875.html
+
+```c
+//元素中包含ngx_queue_t
+typedef struct{
+	ngx_int_t num;
+	ngx_str_t str;
+	ngx_queue_t queue;
+}TestNode;
+//定义排序
+ngx_int_t compare_node(const ngx_queue_t *left, const ngx_queue_t *right){
+	//获取ngx_queue_t所在元素的指针
+	TestNode* left_node  = ngx_queue_data(left, TestNode, queue);
+	TestNode* right_node = ngx_queue_data(right, TestNode, queue);
+	
+	return left_node->num > right_node->num;
+}
+
+
+int main(){
+	//初始化链表的头节点
+    ngx_queue_t QueHead;
+	ngx_queue_init(&QueHead);
+	//初始化10个元素节点
+	TestNode Node[10];
+	ngx_int_t i;
+	for (i=0; i<10; ++i){
+		Node[i].num = rand()%100;
+	}
+	
+    ngx_queue_insert_head(&QueHead, &Node[0].queue);
+	ngx_queue_insert_tail(&QueHead, &Node[1].queue);
+	ngx_queue_insert_after(&QueHead, &Node[2].queue);
+    ngx_queue_insert_head(&QueHead, &Node[4].queue);
+	ngx_queue_insert_tail(&QueHead, &Node[3].queue);
+    ngx_queue_insert_head(&QueHead, &Node[5].queue);
+	ngx_queue_insert_tail(&QueHead, &Node[6].queue);
+	ngx_queue_insert_after(&QueHead, &Node[7].queue);
+    ngx_queue_insert_head(&QueHead, &Node[8].queue);
+	ngx_queue_insert_tail(&QueHead, &Node[9].queue);
+	ngx_queue_t *q;
+	
+	for (q = ngx_queue_head(&QueHead); q != ngx_queue_sentinel(&QueHead); q = ngx_queue_next(q)){
+		TestNode* Node = ngx_queue_data(q, TestNode, queue);
+		printf("Num=%d\n", Node->num);
+	}
+    ngx_queue_sort(&QueHead, compare_node);
+	for (q = ngx_queue_head(&QueHead); q != ngx_queue_sentinel(&QueHead); q = ngx_queue_next(q)){
+		TestNode* Node = ngx_queue_data(q, TestNode, queue);
+		printf("Num=%d\n", Node->num);
+	}
+	return 0;
+}
+```
+
+### ngx_array_t
+
+nginx的动态数组主要用于解决数组动态扩容的问题，类似java中的arrayList等类，没啥说的，就是向数组添加元素时，如果数据满了，就扩：
+```c
+//数据定义位于src/core/ngx_array_t.(h/c)
+typedef struct {
+    void        *elts;		//数组起始地址
+    ngx_uint_t   nelts;		//已有元素个数
+    size_t       size;		//元素所占字节
+    ngx_uint_t   nalloc;	//可容纳元素总个数
+    ngx_pool_t  *pool;		//内存块，所有内存从其pool申请
+} ngx_array_t;
+
+//数组的create与init方法实现
+static ngx_inline ngx_int_t ngx_array_init(ngx_array_t *array, ngx_pool_t *pool, ngx_uint_t n, size_t size){
+    /*
+     * set "array->nelts" before "array->elts", otherwise MSVC thinks
+     * that "array->nelts" may be used without having been initialized
+     */
+
+    array->nelts = 0;
+    array->size = size;
+    array->nalloc = n;
+    array->pool = pool;
+	//从pool中申请n * size大小的内存，将内存首地址返回给array->elts
+    array->elts = ngx_palloc(pool, n * size);
+    if (array->elts == NULL) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+ngx_array_t * ngx_array_create(ngx_pool_t *p, ngx_uint_t n, size_t size)
+{
+    ngx_array_t *a;
+	//与init的不容仅在于先创建一块存储ngx_array_t的内存
+    a = ngx_palloc(p, sizeof(ngx_array_t));
+    if (a == NULL) {
+        return NULL;
+    }
+    if (ngx_array_init(a, p, n, size) != NGX_OK) {
+        return NULL;
+    }
+    return a;
+}
+```
+向动态数组Push元素以及扩容逻辑实现如下：
+```c
+//入参a为需要添加元素的数组
+void * ngx_array_push(ngx_array_t *a){
+    void        *elt, *new;
+    size_t       size;
+    ngx_pool_t  *p;
+
+    //a已经使用的元素个数nelts和a的容量nalloc相等，说明数组已满
+    if (a->nelts == a->nalloc) {           
+
+        //计算得到数组已经占用的内存大小
+        size = a->size * a->nalloc; 
+
+        p = a->pool;
+
+        //p->d.last指向当前已分配的内存位置，p->d.end指向内存池结束位置
+		//(u_char *) a->elts + size == p->d.last 验证所有数组元素均填充
+		//p->d.last + a->size <= p->d.end  pool中可以再填充一个元素
+		//因此if语句为 当pool中可以填充一个元素时
+        if ((u_char *) a->elts + size == p->d.last
+            && p->d.last + a->size <= p->d.end){
+            /*
+             * the array allocation is the last in the pool
+             * and there is space for new allocation
+             */
+            
+            //内存池尾指针后移一个元素大小，分配内存一个元素，并把nalloc+1
+            p->d.last += a->size;
+            a->nalloc++;
+
+        //否则，说明内存池没有多余空间了
+        } else {
+            /* allocate a new array */
+
+            //重新分配一个新的数组，大小为原容量的2倍
+            new = ngx_palloc(p, 2 * size);
+            if (new == NULL) {
+                return NULL;
+            }
+            
+            //将以前的数组拷贝到新数组，并将数组大小设置为以前二倍
+            ngx_memcpy(new, a->elts, size);
+            a->elts = new;
+            a->nalloc *= 2;
+        }
+    }
+
+    //已分配好待使用的元素起始地址 = 数组起始地址elts + 元素大小size * 已分配个数nelts
+    elt = (u_char *) a->elts + a->size * a->nelts;
+	//已分配个数+1 ，返回已分配好待使用的元素起始地址
+    a->nelts++;
+    return elt;
+}
+```
+
+### ngx_rbtree_t
+
+红黑树是指每个节点都带有颜色属性的二叉查找树，其中颜色为红色或黑色。除了二叉查找树的一般要求以外，对于红黑树还有如下的特性：
+
+1. 节点是红色或黑色。
+2. 根节点是黑色。
+3. 所有叶子节点都是黑色（叶子是 NIL 节点，也叫 “哨兵”）。
+4. 每个红色节点的两个子节点都是黑色，每个叶子节点到根节点的所有路径上不能有两个连续的红色节点。
+5. 从任一节点到每个叶子节点的所有简单路径都包含相同数目的黑色节点
+
+这些约束加强了红黑树的关键性质：**从根节点到叶子节点的最长可能路径长度不大于最短可能路径的两倍**，这样这个树大致上就是平衡了。其原因在于，由于特性4，根节点到叶子节点要么是`黑-红-黑`交替，要么是`黑-黑`全黑，所以其最短的可能路径只能是`黑-黑`全黑节点。又根据5，根节点到叶子节点中，黑节点数目相同，所以其最长路径最多为`黑-红-黑`交替且其中夹杂着红节点。
+
+#### 数据结构
+
+其数据结构定义位于`/src/core/ngx_rbtree.(h/c)`：
+
+1. **树与节点**
+```c
+//节点相关定义
+typedef ngx_uint_t  ngx_rbtree_key_t;
+typedef ngx_int_t   ngx_rbtree_key_int_t;
+
+typedef struct ngx_rbtree_node_s  ngx_rbtree_node_t;
+
+struct ngx_rbtree_node_s {
+    ngx_rbtree_key_t       key;		//重要，整型关键字，决定了树的形状
+    ngx_rbtree_node_t     *left;	//左子节点
+    ngx_rbtree_node_t     *right;	//右
+    ngx_rbtree_node_t     *parent;	//父
+    u_char                 color;	//红or黑
+    u_char                 data;	//1字节的节点数据，较少使用
+};
+
+//树结构相关定义
+typedef struct ngx_rbtree_s  ngx_rbtree_t;
+
+//定义函数指针的别名，函数返回值为void，入参为(ngx_rbtree_node_t *root, ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)，别称定义为*ngx_rbtree_insert_pt
+typedef void (*ngx_rbtree_insert_pt) (ngx_rbtree_node_t *root,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+
+struct ngx_rbtree_s {
+    ngx_rbtree_node_t     *root;		//树根
+    ngx_rbtree_node_t     *sentinel;	//指向NIL节点，或叫做哨兵节点
+    ngx_rbtree_insert_pt   insert;		//添加元素的函数指针，决定新节点是在添加时的具体行为，是替换还是新增
+};
+```
+
+2. **相关函数**
+
+- 元素插入函数：
+
+上节中，在ngx_rbtree_s结构中，对于插入元素的函数实现，nginx提供了以下几种
+```c
+//1. 插入的key都不同
+//2. 插入的key为时间戳
+//以下定义位于ngx_rbtree.h
+void ngx_rbtree_insert_value(ngx_rbtree_node_t *root, ngx_rbtree_node_t *node,
+    ngx_rbtree_node_t *sentinel);
+void ngx_rbtree_insert_timer_value(ngx_rbtree_node_t *root,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+//3. 插入的key有可能相同，但key为字符串
+//以下定义位于ngx_string.h
+void ngx_str_rbtree_insert_value(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+```
+- 作为容器实现的函数：
+```c
+/* 初始化红黑树，返回空的红黑树
+ * tree 是指向红黑树的指针
+ * s 是红黑树的一个NIL节点，即哨兵节点
+ * i 表示ngx_rbtree_insert_pt类型的函数指针
+ */
+#define ngx_rbtree_init(tree, s, i)                                           \
+    ngx_rbtree_sentinel_init(s);                                              \
+    (tree)->root = s;                                                         \
+    (tree)->sentinel = s;                                                     \
+    (tree)->insert = i
+
+//向树中添加和删除的函数，tree是红黑树指针，node是要添加/删除的节点
+void ngx_rbtree_insert(ngx_rbtree_t *tree, ngx_rbtree_node_t *node);
+void ngx_rbtree_delete(ngx_rbtree_t *tree, ngx_rbtree_node_t *node);
+```
+- 作为节点实现的函数：
+```c
+//设置节点颜色相关
+#define ngx_rbt_red(node)               ((node)->color = 1)
+#define ngx_rbt_black(node)             ((node)->color = 0)
+#define ngx_rbt_is_red(node)            ((node)->color)
+#define ngx_rbt_is_black(node)          (!ngx_rbt_is_red(node))
+#define ngx_rbt_copy_color(n1, n2)      (n1->color = n2->color)
+//初始化哨兵节点
+#define ngx_rbtree_sentinel_init(node)  ngx_rbt_black(node)
+
+//找到当前节点及其子树中的最小节点
+static ngx_inline ngx_rbtree_node_t * ngx_rbtree_min(ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel){...}
+```
+
+3. **例子**
+
+```c
+/*
+blog:   http://blog.csdn.net/u012819339
+email:  1216601195@qq.com
+author: arvik
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include "ak_core.h"
+#include "pt.h"
+
+//树节点定义
+typedef struct _testrbn{
+    ngx_rbtree_node_t node;	//注意，将node作为struct第一个元素可以灵活转换指针类型，为默认规则
+    ngx_uint_t num;
+}TestRBTreeNode;
+
+int main(){
+    ngx_rbtree_t rbtree;
+    ngx_rbtree_node_t sentinel;
+    int i=0;
+	//init tree  没啥说的，节点插入函数直接使用ngx_rbtree_insert_value
+    ngx_rbtree_init(&rbtree, &sentinel, ngx_rbtree_insert_value);
+
+    TestRBTreeNode rbn[10];
+    rbn[0].num = 1;
+    rbn[1].num = 6;
+    rbn[2].num = 8;
+    rbn[3].num = 11;
+    rbn[4].num = 13;
+    rbn[5].num = 15;
+    rbn[6].num = 17;
+    rbn[7].num = 22;
+    rbn[8].num = 25;
+    rbn[9].num = 27;
+
+    for(i=0; i<10; i++){
+        rbn[i].node.key = rbn[i].num;
+		//insert函数保证了树的平衡
+        ngx_rbtree_insert(&rbtree, &rbn[i].node);
+    }
+  
+    //查找红黑树中最小节点
+    ngx_rbtree_node_t *tmpnode = ngx_rbtree_min(rbtree.root, &sentinel);
+    PT_Info("the min key node num val:%u\n", ((TestRBTreeNode *)(tmpnode))->num );
+
+    //演示怎么查找key为13的节点
+    ngx_uint_t lookupkey = 13;
+    tmpnode = rbtree.root;
+    TestRBTreeNode *lknode;
+	//找到叶子节点就停止
+    while(tmpnode != &sentinel ){
+        if(lookupkey != tmpnode->key){
+			//红黑树是二叉树的变形，因此如果当前节点的key值大于要寻找的key，则递归遍历左子树；反之，遍历右子树
+            tmpnode = (lookupkey < tmpnode->key)?tmpnode->left:tmpnode->right;
+            continue;
+        }
+		 //这里强制转换类型，需要ngx_rbtree_node_t是TestRBTreeNode的第一个成员，也可以用类似于linux内核中的宏定义container_of获取自定义结构体地址
+        lknode = (TestRBTreeNode *)tmpnode;
+        break;
+    }
+    PT_Info("fine key == 13 node, TestRBTreeNode.num:%d\n", lknode->num);
+    //删除num为13的节点
+    ngx_rbtree_delete(&rbtree, &lknode->node);
+    PT_Info("delete the node which num is equal to 13 complete!\n");
+
+    return 0;
+}
+
+```
+
+### ngx_radix_tree_t
+
+### 散列表
+

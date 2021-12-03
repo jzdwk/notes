@@ -692,7 +692,7 @@ typedef struct {
     ngx_hash_wildcard_t  *wc_head;	//前置通配符散列表
     ngx_hash_wildcard_t  *wc_tail;	//后置通配符散列表
 } ngx_hash_combined_t;
-//通配符查找方法，它将会按照  精确->前置->后置的匹配顺序查找相应的散列表
+//通配符查找方法，它将会按照： 精确->前置->后置的匹配顺序查找相应的散列表
 void *ngx_hash_find_combined(ngx_hash_combined_t *hash, ngx_uint_t key, u_char *name, size_t len);
 
 //精确查询方法
@@ -709,7 +709,9 @@ typedef struct {
     /* 指向普通的完全匹配散列表 */
     ngx_hash_t       *hash;
     
-    /* 用于初始化添加元素的散列方法 */
+    /* 用于初始化添加元素的散列方法，将元素key计算得出散列码，这里是一个函数指针 */
+	//定义为 typedef ngx_uint_t (*ngx_hash_key_pt) (u_char *data, size_t len);
+	//nginx内置了2种BKDR算法的实现：1.ngx_uint_t ngx_hash_key(u_char *data, size_t len); 2.ngx_uint_t ngx_hash_key_lc(u_char *data, size_t len);
     ngx_hash_key_pt   key;
 
     /* 散列表中槽的最大数目 */
@@ -719,13 +721,203 @@ typedef struct {
 
     /* 散列表的名称 */
     char             *name;
-    /* 内存池，用于分配散列表（最多3个，包括1个普通散列表、1个前置通配符散列表、1个后置通配符散列表）
-     * 中的所有槽 */
+    /* 内存池，用于分配散列表（最多3个，包括1个普通散列表、1个前置通配符散列表、1个后置通配符散列表）中的所有槽 */
     ngx_pool_t       *pool;
     /* 临时内存池，仅存在于初始化散列表之前。它主要用于分配一些临时的动态数组，
      * 带通配符的元素在初始化时需要用到这些数组 */
     ngx_pool_t       *temp_pool;
 } ngx_hash_init_t;
 ```
+注意在初始化散列表时，其表中的槽数并不是`ngx_hash_init_t.max_size`，而是在做初始化准备时预先加入到散列表的所有元素决定的，它包括了元素总数、关键字长度以及操作系统的一个页面大小，初始化方法为：
+```c
+typedef struct {
+    ngx_str_t         key;		//元素关键字
+    ngx_uint_t        key_hash;	//散列方法计算得到的关键码
+    void             *value;	//指向实际的用户数据
+} ngx_hash_key_t;
 
+//初始化普通散列表，hinit为初始化结构体指针；names存储这预添加到散列表中的元素，是数组的首地址；nelts是names数组的元素数目
+ngx_int_t ngx_hash_init(ngx_hash_init_t *hinit, ngx_hash_key_t *names, ngx_uint_t nelts);
 
+//初始化通配符散列表，hinit为初始化结构体指针；names存储这预添加到散列表中的元素(元素的关键字要含有前置/后置通配符)，是数组的首地址；nelts是names数组的元素数目
+ngx_int_t ngx_hash_init(ngx_hash_init_t *hinit, ngx_hash_key_t *names, ngx_uint_t nelts);
+```
+3. **辅助类型的使用**
+
+以上是初始化散列表所需的结构体，在使用时，需要考虑这样一个问题：*当有一组key需要通过构造hash表去处理，这些里面既有无通配符的key，也有包含通配符的key的时候。我们就需要构建三个hash表，一个包含普通的key的hash表，一个包含前向通配符的hash表，一个包含后向通配符的hash表（或者也可以把这三个hash表组合成一个ngx_hash_combined_t）* 为了解决该问题，nginx提供了`ngx_hash_keys_arrays_t`这个**辅助类型**：
+```c
+//结构体定义
+typedef struct {
+    ngx_uint_t        hsize;		//将要构建的hash表的桶的个数。对于使用这个结构中包含的信息构建的三种类型的hash表都会使用此参数。
+
+    ngx_pool_t       *pool;			//暂时没有用到
+    ngx_pool_t       *temp_pool;	//在构建这个类型以及最终的三个hash表过程中可能用到临时pool。该temp_pool可以在构建完成以后，被销毁掉。这里只是存放临时的一些内存消耗。
+
+    ngx_array_t       keys;			//存放所有非通配符key的数组。
+	
+	/*这是个二维数组，第一个维度代表的是bucket的编号，
+	* 那么keys_hash[i]中存放的是所有的key算出来的hash值对hsize取模以后的值为i的key。
+	* 假设有3个key,分别是key1,key2和key3假设hash值算出来以后对hsize取模的值都是i，那么这三个key的值就顺序存放在keys_hash[i][0],keys_hash[i][1],keys_hash[i][2]。
+	* 该值在调用的过程中用来保存和检测是否有冲突的key值，也就是是否有重复。
+	*/
+    ngx_array_t      *keys_hash;	
+
+    ngx_array_t       dns_wc_head;	//放前向通配符key被处理完成以后的值。比如：“*.abc.com” 被处理完成以后，变成 “com.abc.” 被存放在此数组中。
+    ngx_array_t      *dns_wc_head_hash;		//同keys_hash，该值在调用的过程中用来保存和检测是否有冲突的前向通配符的key值，也就是是否有重复。
+
+    ngx_array_t       dns_wc_tail;	//存放后向通配符key被处理完成以后的值。比如：“mail.xxx.*” 被处理完成以后，变成 “mail.xxx.” 被存放在此数组中。
+    ngx_array_t      *dns_wc_tail_hash;	//同keys_hash，,该值在调用的过程中用来保存和检测是否有冲突的前向通配符的key值，也就是是否有重复。
+} ngx_hash_keys_arrays_t;
+
+//初始化该结构体的函数
+//ha为该结构的对象指针
+//type有2个值可选择，即NGX_HASH_SMALL和NGX_HASH_LARGE。用来指明将要建立的hash表的类型，如果是NGX_HASH_SMALL，则有比较小的桶的个数和数组元素大小。NGX_HASH_LARGE则相反。
+ngx_int_t ngx_hash_keys_array_init(ngx_hash_keys_arrays_t *ha, ngx_uint_t type);
+```
+在定义一个这个类型的变量，并对字段pool和temp_pool赋值以后，就可以调用函数`ngx_hash_add_key`把所有的key加入到这个结构中了，**该函数会自动实现普通key，前向通配符的key和后向通配符的key的分类和检查，并将这个些值存放到对应的字段中去**，:
+```c
+//一般是循环调用这个函数，把一组键值对加入到这个结构体中。返回NGX_OK是加入成功。返回NGX_BUSY意味着key值重复。
+//ha为该结构的对象指针，key与value即为需要处理的KV对
+//flags可以设置为NGX_HASH_WILDCARD_KEY、NGX_HASH_READONLY_KEY或NGX_HASH_WILDCARD_KEY|NGX_HASH_READONLY_KEY。
+//NGX_HASH_READONLY_KEY被设置的时候，在计算hash值的时候，key的值不会被转成小写字符，否则会。
+//NGX_HASH_WILDCARD_KEY被设置的时候，说明key里面可能含有通配符，会进行相应的处理。如果两个标志位都不设置，传0。
+ngx_int_t ngx_hash_add_key(ngx_hash_keys_arrays_t *ha, ngx_str_t *key, void *value, ngx_uint_t flags);
+```
+然后就可以通过检查这个结构体中的`keys、dns_wc_head、dns_wc_tail`三个数组是否为空，来决定是否构建普通hash表，前向通配符hash表和后向通配符hash表了（在构建这三个类型的hash表的时候，可以分别使用keys、dns_wc_head、dns_wc_tail三个数组）。
+构建出这三个hash表以后，可以组合在一个`ngx_hash_combined_t`对象中，使用`ngx_hash_find_combined`进行查找。或者是仍然保持三个独立的变量对应这三个hash表，自己决定何时以及在哪个hash表中进行查询。
+
+4. **示例**
+
+散列表元素ngx_hash_elt_t中value指针指向的数据结构为下面定义的TestWildcardHashNode结构体，代码如下：
+```c
+typedef struct {
+    /* 用于散列表中的关键字 */
+    ngx_str_t servername;
+    /* 这个成员仅是为了方便区别而已 */
+    ngx_int_t se;
+}TestWildcardHashNode;
+```
+每个散列表元素的关键字是servername字符串。下面先定义`ngx_hash_init_t`和`ngx_hash_keys_arrays_t`变量，为初始化散列
+表做准备，代码如下：
+```c
+	/* 定义用于初始化散列表的结构体 */
+	ngx_hash_init_t hash;
+	/* 定义辅助模型ngx_hash_keys_arrays_t，用于预先向散列表中添加元素，这里的元素支持带通配符 */
+	ngx_hash_keys_arrays_t ha;
+	/* 支持通配符的散列表 */
+	ngx_hash_combined_t combinedHash;
+
+	ngx_memzero(&ha, sizeof(ngx_hash_keys_arrays_t));
+```
+combinedHash 是我们定义的用于指向散列表的变量，它包括指向 3 个散列表的指针，下面依次给这 3 个散列表指针赋值。
+```c
+	/* 临时内存池只是用于初始化通配符散列表，在初始化完成后就可以销毁掉 */
+	ha.temp_pool = ngx_create_pool(16384, cf->log);
+	if (ha.temp_pool == NULL){
+		return NGX_ERROR;
+	}
+	/* 假设该例子是在ngx_http_xxx_postconf函数中的，所以就用了ngx_conf_t类型的cf下的内存池作为散列表的内存池 */
+	ha.pool = cf->pool;
+	/* 调用ngx_hash_keys_array_init方法来初始化ha，为下一步向ha中加入散列表元素做好准备 */
+	if (ngx_hash_keys_array_init(&ha, NGX_HASH_LARGE) != NGX_OK){
+		return NGX_ERROR;
+	}
+```
+如下代码，建立的 testHashNode[3] 这 3 个 TestWildcardHashNode 类型的结构体，分别表示可以用前置通配符匹配的散列表元素、可以用后置通配符匹配的散列表元素、需要完全匹配的散列表元素。然后调用`ngx_hash_add_key`向辅助模型添加元素：
+```c
+	TestWildcardHahsNode testHashNode[3];
+	testHashNode[0].servername.len = ngx_strlen("*.text.com");
+	testHashNode[0].servername.data = ngx_pcalloc(cf->pool, ngx_strlen("*.test.com"));
+	ngx_memcpy(testHashNode[0].servername.data, "*.test.com", ngx_strlen("*.test.com"));
+
+	testHashNode[1].servername.len = ngx_strlen("www.test.*");
+	testHashNode[1].servername.data = ngx_pcalloc(cf->pool, ngx_strlen("www.test.*"));
+	ngx_memcpy(testHashNode[1].servername.data, "www.test.*", ngx_strlen("www.test.*"));
+
+	testHashNode[2].servername.len = ngx_strlen("www.text.com");
+	testHashNode[2].servername.data = ngx_pcalloc(cf->pool, ngx_strlen("www.test.com"));
+	ngx_memcpy(testHashNode[2].servername.data, "www.test.com", ngx_strlen("www.test.com"));
+
+	for (i = 0; i < 3; i++){
+		testHashNode[i].seq = i;
+		/* 这里flag必须设置为NGX_HASH_WILDCARD_KEY，才会处理带通配符的关键字 */
+		ngx_hash_add_key(&ha, &testHashNode[i].servername, &testHashNode[i], NGX_HASH_WILDCARD_KEY);}
+```
+在调用`ngx_hash_init_t`的初始化函数前，先设置好`ngx_hash_init_t`中的成员，如槽的大小、散列方法等：
+```c
+	hash.key         = ngx_hash_key_lc;
+	hash.max_size    = 100;
+	hash.bucket_size = 48;
+	hash.name        = "test_server_name_hash";
+	hash.pool        = cf->pool;
+```
+ha的keys动态数组中存放的是需要完全匹配的关键字，如果keys数组不为空，那么开始初始化第 1 个散列表：
+```c
+	if (ha.keys.nelts){
+		/* 需要显式地把ngx_hash_init_t中的hash指针指向combinedHash中的完全匹配散列表 */
+		hash.hash = &combinedHash.hash;
+		/* 初始化完全匹配散列表时不会使用到临时内存池 */
+		hash.temp_pool = NULL;
+    
+		/* 将keys动态数组直接传给ngx_hash_init方法即可，ngx_hash_init_t中的
+		* hash指针就是初始化成功的散列表 */
+		if (ngx_hash_init(&hash, ha.keys.nelts, ha.keys.nelts) != NGX_OK){
+			return NGX_ERROR;
+		}
+	}
+```
+下面继续初始化前置通配符散列表：
+```c
+	if (ha.dns_wc_head.nelts){
+		hash.hash = NULL;
+		/* ngx_hash_wildcard_init方法需要用到临时内存池 */
+		hash.temp_pool = ha.temp_pool;
+		if (ngx_hash_wildcard_init(&hash, ha.dns_wc_head.elts, ha.dns_wc_head.nelts) != NGX_OK){
+			return NGX_ERROR;
+		}
+    
+		/* ngx_hash_init_t中的hash指针是ngx_hash_wildcard_init初始化成功的散列表，需要将它赋到combinedHash.wc_head前置通配符散列表指针中 */
+		combinedHash.wc_head = (ngx_hash_wildcard_t *)hash.hash;
+	}
+```
+接着继续初始化后置通配符散列表：
+```c
+	if (ha.dns_wc_tail.nelts){
+		hash.hash = NULL;
+		hash.temp_pool = hs.temp_pool;
+		if (ngx_hash_wildcard_init(&hash, ha.dns_wc_tail.elts, ha.dns_wc_tail.nelts) != NGX_OK){
+			return NGX_ERROR;
+		}
+    
+		/* ngx_hash_init_t中的hash指针是ngx_hash_wildcard_init初始化成功的散列表，需要将它赋到combinedHash.wc_tail后置通配符散列表指针中 */
+		combinedHash.wc_tail = (ngx_hash_wildcard_t *) hash.hash;
+	}
+```
+此时，临时内存池已经没有存在意义了，即`ngx_hash_keys_arrays_t`中的这些数组、简易散列表都可以销毁了。这里只需要简单地把temp_pool内存池销毁即可：
+```c
+	ngx_destroy_pool(ha.temp_pool);
+```
+下面检查一下散列表是否工作正常。首先，查询关键字www.test.org，实际上，它应该匹配后置通配符散列表中的元素`www.text.*`:
+```c
+	/* 首先定义待查询的关键字符串findServer */
+	ngx_str_t findServer;
+	findServer.len = ngx_strlen("www.test.org");
+	/* 为什么必须要在内存池中分配空间以保存关键字呢？因为我们使用的散列方法是 ngx_hash_key_l，它会试着把关键字全小写 */
+	findServer.data = ngx_pcalloc(cf->pool, ngx_strlen("www.test.org"));
+	ngx_memcpy(findServer.data, "www.test.org", ngx_strlen("www.test.org"));
+
+	/* ngx_hash_find_combined方法会查找出www.test.*对应的散列表元素，返回其指向的用户数据ngx_hash_find_combined， 也就是testHashNode[1] */
+	TestWildcardHashNode *findHashNode = ngx_hash_find_combined(&combinedHash, 
+        ngx_hash_key_lc(findServer.data, findServer.len), findServer.data, findServer.len);
+```
+如果没有查询到的话，那么findHashNode值为NULL。接着查询`www.test.com`，实际上，`testHashNode[0]、testHashNode[1]、testHashNode[2`这 3 个节点都是匹配的，因为
+`.test.com、www.test.、www.test.com`都是匹配的。但按照完全匹配最优先的规则，`ngx_hash_find_combined`方法会返回`testHashNode[2]`的地址，也就是`www.test.com`对应的元素。
+```c
+	findServer.len = ngx_strlen("www.test.com");
+	findServer.data = ngx_pcalloc(cf->pool, ngx_strlen("www.test.com"));
+	ngx_memcpy(findServer.data, "www.test.com", ngx_strlen("www.test.com");
+
+	findHashNode = ngx_hash_find_combined(&combinedHash, 
+                    ngx_hash_key_lc(findServer.data, findServer.len),
+                    findServer.data, findServer.len);
+```

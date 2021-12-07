@@ -43,22 +43,20 @@ struct ngx_module_s {
 	*/
     
 	
-	/*
-    ctx为ngx_module_s与各个模块的纽带，也可以说是具体模块的公共接口。
-    下文中我们会以核心模块为例说明下这个字段
-    */
+	/* ctx为ngx_module_s与各个模块的纽带，也可以说是具体模块的公共接口。
+     * 下文中我们会以核心模块为例说明下这个字段 */
     void                 *ctx;
 
     ngx_command_t        *commands;   // 模块支持的指令集，数组形式，最后用空对象表示结束
 	
 	
 	/* 模块的类型标识，可选值如下
-     #define NGX_CORE_MODULE      0x45524F43  /* 核心模块 */
-     #define NGX_CONF_MODULE      0x464E4F43  /* 配置模块 */
-     #define NGX_EVENT_MODULE     0x544E5645  /* event模块 */
-     #define NGX_HTTP_MODULE      0x50545448  /* http模块 */
-     #define NGX_MAIL_MODULE      0x4C49414D  /* mail模块 */
-    */  
+     * #define NGX_CORE_MODULE      0x45524F43  核心模块 
+     * #define NGX_CONF_MODULE      0x464E4F43  配置模块 
+     * #define NGX_EVENT_MODULE     0x544E5645  event模块 
+     * #define NGX_HTTP_MODULE      0x50545448  http模块 
+     * #define NGX_MAIL_MODULE      0x4C49414D  mail模块 
+    */ 
     ngx_uint_t            type; 
   
 

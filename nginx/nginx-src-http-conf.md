@@ -246,7 +246,7 @@ http{
 
 1. 主循环调用配置文件解析器解析nginx.conf文件
 
-2. 当发现配置文件中含有http{}关键字时，HTTP框架开始启动
+2. 当发现配置文件中含有http{}关键字时，HTTP框架开始启动，注意这里的启动由核心模块的`ngx_http_module`完成，详细可参考[nginx-act-main.md](./nginx-act-main.md)
 
 3. 初始化所有HTTP模块的序列号，并创建**ngx_http_conf_ctx_t结构**，该结构用于存储所有HTTP模块的配置项，具体解析下节分析。
 

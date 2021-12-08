@@ -1,6 +1,6 @@
 # nginx架构
 
-nginx架构概述笔记
+nginx架构概述笔记，核心为介绍模块化的设计与关键的结构体
 
 ## 模块化设计
 
@@ -255,11 +255,15 @@ Nginx不会使用进程或线程来作为事件消费者，所谓的事件消费
 3. 对于必须等待的方法调用，使用定时器划分阶段
 4. 如果实在无法划分，使用独立进程
 
-## 核心结构体
+## nginx的启动
+
+### 核心结构体
 
 nginx核心的框架代码围绕着一个结构体展开，即`ngx_cycle_t`，master进程与worker进程在初始化、正常运行时，都是以该结构体为核心的。因此，结构体中肯定需要涵盖nginx配置与module等相关的信息。
 
-### ngx_cycle_t
+对于结构体中详细字段的使用，将在nignx初始化流程中说明。
+
+1. **ngx_cycle_t**
 
 首先看下定义:
 ```c
@@ -271,9 +275,9 @@ struct ngx_cycle_s {
     /*
      * 保存着所有模块存储配置项的结构体的指针，这是一个四级指针。
 	 * 它首先是一个数组，每个数组成员又是一个指针，这个指针指向另一个存储着指针的数组
-	 * p->[p1,...,pn]：conf_ctx指向一个数组，数组中的元素p1,...,pn都是指针
-	 * p1->[m1,...,mn]：每个px指向一个数组，数组中的元素m1,...,mn也是指针
-	 * m1->data：每个mx指向实际数据
+	 * p->[p1,...,pn]：conf_ctx指向一个数组，数组中的元素p1,...,pn都是指针，再看其中某个px
+	 * p1->[m1,...,mn]：每个px指向一个数组，数组中的元素m1,...,mn也是指针，最后看某个mx
+	 * m1->data：每个mx是一个指针，指向实际数据
      */
     void                  ****conf_ctx;
     /*
@@ -405,8 +409,322 @@ struct ngx_cycle_s {
     ngx_str_t                 hostname;
 };
 ```
-### ngx_listening_t
-## work进程
-### 信号量
-### 主循环
-## master进程
+2. **ngx_listening_t**
+
+`ngx_cycle_t`对象中有一个动态数组成员叫做`listening`，它的每个数组元素都是`ngx_listening_t`结构体，而每个`ngx_listening_t`结构体又代表着nginx服务器监听的一个端口:
+```c
+//定义位于/src/core/ngx_connection.h
+typedef struct ngx_listening_s  ngx_listening_t;
+
+struct ngx_listening_s {
+    // socket 套接字句柄
+    ngx_socket_t        fd;
+
+    // 监听 sockaddr 地址
+    struct sockaddr    *sockaddr;
+    // sockaddr 地址长度
+    socklen_t           socklen;    /* size of sockaddr */
+    // 存储 IP 地址的字符串 addr_text 最大长度，即它指定了 addr_text 所分配的内存大小
+    size_t              addr_text_max_len;
+    // 以字符串形式存储IP地址
+    ngx_str_t           addr_text;
+
+    // 套接字类型
+    int                 type;
+
+    // TCP 实现监听时的 backlog 队列，它表示允许正在通过三次握手建立 TCP 
+    // 连接但没有任何进程开始处理的连接最大个数
+    int                 backlog;
+    // 内核中对于这个套接字的接收缓存区大小
+    int                 rcvbuf;
+    // 内核中对于这个套接字的发送缓冲区大小
+    int                 sndbuf;
+#if (NGX_HAVE_KEEPALIVE_TUNABLE)
+    int                 keepidle;
+    int                 keepintvl;
+    int                 keepcnt;
+#endif
+
+    // 当新的 TCP 连接建立成功后调用的回调处理函数
+    /* handler of accepted connection */
+    ngx_connection_handler_pt   handler;
+
+    // 实际上框架并不使用 servers 指针，它更多的是作为一个保留指针，目前
+    // 主要用于HTTP或mail等模块，用于保存当前监听端口对应着的所有主机名
+    void               *servers;  /* array of ngx_http_in_addr_t, for example */
+
+    ngx_log_t           log;
+    ngx_log_t          *logp;
+
+    // 如果为新的 TCP 连接创建内存池，则内存池的大小为 pool_size
+    size_t              pool_size;
+    /* should be here because of the AcceptEx() preread */
+    size_t              post_accept_buffer_size;
+    // TCP_DEFER_ACCEPT选项将在建立TCP连接成功且接收到用户的请求数据后，才向对监听套接字
+    // 感兴趣的进程发送事件通知，而连接建立成功后，如果post_accept_timeout秒后仍然
+    // 没有收到用户数据，则内核直接丢弃连接
+    /* should be here because of the deferred accept */
+    ngx_msec_t          post_accept_timeout;
+
+    // 前一个ngx_listening_t结构，多个ngx_listening_t结构体之间由previous指针组成单链表
+    ngx_listening_t    *previous;
+    // 当前监听句柄对应着的ngx_connection_t结构体
+    ngx_connection_t   *connection;
+
+    ngx_uint_t          worker;
+
+    // 标志位，为1则表示当前监听句柄有效，且执行ngx_init_cycle时不关闭监听端口，
+    // 为0时则正常关闭。该标志位框架代码会自动设置
+    unsigned            open:1;
+    // 标志位，为1表示使用已有的ngx_cycle_t来初始化新的ngx_cycle_t结构体时，不关闭
+    // 原先打开的监听端口，这对运行中升级程序很有用，remain为0时，表示正常关闭
+    // 曾经打开的监听端口。该标志位框架代码会自动设置
+    unsigned            remain:1;
+    // 标志位，为1时表示跳过设置当前ngx_listening_t结构体中的套接字，为0时正常
+    // 初始化套接字。该标志位框架代码会自动设置
+    unsigned            ignore:1;
+
+    // 表示是否已经绑定。
+    unsigned            bound:1;       /* already bound */
+    // 表示当前监听套接字是否来自前一个进程（如升级Nginx），如果为1，则表示来自前
+    // 一个进程。一般会保留之前已经设置好的套接字，不做改变
+    unsigned            inherited:1;   /* inherited from previous process */
+    unsigned            nonblocking_accept:1;
+    // 标志位，为1时表示当前结构体对应的套接字已经监听
+    unsigned            listen:1;
+    // 表示套接字是否是非阻塞的
+    unsigned            nonblocking:1;
+    unsigned            shared:1;    /* shared between threads or processes */
+    // 标志位，为1时表示Nginx会将网络地址转变为字符串形式的地址
+    unsigned            addr_ntop:1;
+    unsigned            wildcard:1;
+
+#if (NGX_HAVE_INET6)
+    unsigned            ipv6only:1;
+#endif
+    unsigned            reuseport:1;
+    unsigned            add_reuseport:1;
+    unsigned            keepalive:2;
+
+    unsigned            deferred_accept:1;
+    unsigned            delete_deferred:1;
+    unsigned            add_deferred:1;
+#if (NGX_HAVE_DEFERRED_ACCEPT && defined SO_ACCEPTFILTER)
+    char               *accept_filter;
+#endif
+#if (NGX_HAVE_SETFIB)
+    int                 setfib;
+#endif
+
+#if (NGX_HAVE_TCP_FASTOPEN)
+    int                 fastopen;
+#endif
+};
+```
+
+### 启动流程
+
+参考：https://blog.csdn.net/qq_26312651/article/details/89790083
+
+nginx的启动入口位于main函数，位置`/src/core/nginx.c`，其步骤大致如下:
+
+1. **参数解析**
+
+这一步主要是根据用户的输入，类似`/home/nginx/sbin/nginx -c /home/nginx/conf/nginx.conf`，解析命令参数，并根据配置的nginx.conf文件路径，将配置信息预先存入`init_cycle`
+```c
+int ngx_cdecl
+main(int argc, char *const *argv){
+	//变量声明，注意其中的cycle, init_cycle
+    ngx_buf_t        *b;
+    ngx_log_t        *log;
+    ngx_uint_t        i;
+    ngx_cycle_t      *cycle, init_cycle;
+    ngx_conf_dump_t  *cd;
+    ngx_core_conf_t  *ccf;
+
+    ngx_debug_init();
+
+    if (ngx_strerror_init() != NGX_OK) {
+        return 1;
+    }
+	/* ngx_get_options函数主要是解析启动命令，并根据参数来初始化ngx_show_version，ngx_show_help， ngx_show_configure等全局变量。例如，如果执行的是 -v，则将ngx_show_version赋值为1，表示当前的命令是检测nignx的版本；如果执行的是-t，则将ngx_show_configure赋值为1，表示当前的命令是检测nginx配置文件的正确性，后续的启动流程中会根据这些全局变量的值来决定接下来的流程。 */
+    if (ngx_get_options(argc, argv) != NGX_OK) {
+        return 1;
+    }
+
+    if (ngx_show_version) {
+        ngx_show_version_info();
+
+        if (!ngx_test_config) {
+            return 0;
+        }
+    }
+
+    /* TODO */ ngx_max_sockets = -1;
+
+    ngx_time_init();
+
+#if (NGX_PCRE)
+    ngx_regex_init();
+#endif
+    ngx_pid = ngx_getpid();
+    ngx_parent = ngx_getppid();
+	/*ngx_log_init函数用来初始化ngx_log_t类型的log对象，这里log是一个临时的变量，它指向的fd是标准输出，即此时的输出日志是显示到屏幕上。*/
+    log = ngx_log_init(ngx_prefix, ngx_error_log);
+    ...
+
+    /* STUB */
+#if (NGX_OPENSSL)
+    ngx_ssl_init(log);
+#endif
+
+    /*
+     * init_cycle->log is required for signal handlers and
+     * ngx_process_options()
+     */
+	// init_cycle是一个临时变量，用来存储配置文件的路径信息，启动参数，也会用到它的log成员，来临时将日志输出到屏幕
+    ngx_memzero(&init_cycle, sizeof(ngx_cycle_t));
+    init_cycle.log = log;
+    ngx_cycle = &init_cycle;
+
+    init_cycle.pool = ngx_create_pool(1024, log);
+    if (init_cycle.pool == NULL) {
+        return 1;
+    }
+	/*将刚才解析的到的各参数通过ngx_save_argv()等函数保存到该变量的对应成员里。*/
+    if (ngx_save_argv(&init_cycle, argc, argv) != NGX_OK) {
+        return 1;
+    }
+
+    if (ngx_process_options(&init_cycle) != NGX_OK) {
+        return 1;
+    }
+
+    if (ngx_os_init(log) != NGX_OK) {
+        return 1;
+    }
+
+    /*
+     * ngx_crc32_table_init() requires ngx_cacheline_size set in ngx_os_init()
+     */
+
+    if (ngx_crc32_table_init() != NGX_OK) {
+        return 1;
+    }
+
+    /*
+     * ngx_slab_sizes_init() requires ngx_pagesize set in ngx_os_init()
+     */
+
+    ngx_slab_sizes_init();
+```
+
+2. **平滑升级处理**
+```
+	/*当nginx是平滑升级时，旧版本的nginx会通过读取环境变量getenv(NGINX_VAR)来获取相关信息，并在ngx_add_inherited_sockets函数中对旧版本的nginx服务监听的句柄做继承处理。第一次启动nignx的时候或者是执行-s reload时，NGINX_VAR环境变量都没有值，该函数直接返回NGX_OK*/
+    if (ngx_add_inherited_sockets(&init_cycle) != NGX_OK) {
+        return 1;
+    }
+
+    if (ngx_preinit_modules() != NGX_OK) {
+        return 1;
+    }
+
+    cycle = ngx_init_cycle(&init_cycle);
+    if (cycle == NULL) {
+        if (ngx_test_config) {
+            ngx_log_stderr(0, "configuration file %s test failed",
+                           init_cycle.conf_file.data);
+        }
+
+        return 1;
+    }
+
+    if (ngx_test_config) {
+        if (!ngx_quiet_mode) {
+            ngx_log_stderr(0, "configuration file %s test is successful",
+                           cycle->conf_file.data);
+        }
+
+        if (ngx_dump_config) {
+            cd = cycle->config_dump.elts;
+
+            for (i = 0; i < cycle->config_dump.nelts; i++) {
+
+                ngx_write_stdout("# configuration file ");
+                (void) ngx_write_fd(ngx_stdout, cd[i].name.data,
+                                    cd[i].name.len);
+                ngx_write_stdout(":" NGX_LINEFEED);
+
+                b = cd[i].buffer;
+
+                (void) ngx_write_fd(ngx_stdout, b->pos, b->last - b->pos);
+                ngx_write_stdout(NGX_LINEFEED);
+            }
+        }
+
+        return 0;
+    }
+
+    if (ngx_signal) {
+        return ngx_signal_process(cycle, ngx_signal);
+    }
+
+    ngx_os_status(cycle->log);
+
+    ngx_cycle = cycle;
+
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+
+    if (ccf->master && ngx_process == NGX_PROCESS_SINGLE) {
+        ngx_process = NGX_PROCESS_MASTER;
+    }
+
+#if !(NGX_WIN32)
+
+    if (ngx_init_signals(cycle->log) != NGX_OK) {
+        return 1;
+    }
+
+    if (!ngx_inherited && ccf->daemon) {
+        if (ngx_daemon(cycle->log) != NGX_OK) {
+            return 1;
+        }
+
+        ngx_daemonized = 1;
+    }
+
+    if (ngx_inherited) {
+        ngx_daemonized = 1;
+    }
+
+#endif
+
+    if (ngx_create_pidfile(&ccf->pid, cycle->log) != NGX_OK) {
+        return 1;
+    }
+
+    if (ngx_log_redirect_stderr(cycle) != NGX_OK) {
+        return 1;
+    }
+
+    if (log->file->fd != ngx_stderr) {
+        if (ngx_close_file(log->file->fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          ngx_close_file_n " built-in log failed");
+        }
+    }
+
+    ngx_use_stderr = 0;
+
+    if (ngx_process == NGX_PROCESS_SINGLE) {
+        ngx_single_process_cycle(cycle);
+
+    } else {
+        ngx_master_process_cycle(cycle);
+    }
+
+    return 0;
+}
+```
+

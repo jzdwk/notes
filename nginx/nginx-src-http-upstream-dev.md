@@ -275,8 +275,9 @@ static char *ngx_http_mytest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
 
 1) nginx主循环定期调用事件模块，检查是否有网络事件
 2) 接收到HTTP请求后，调用HTTP框架处理。此时比如匹配到了location块，发现其中有mytest配置项，则交给mytest模块。
-**3) 调用mytest的配置项解析函数(即handler方法)，设置upstram限制参数、回调函数(process_header等)与第三方的服务地址(resolved)**
-**4) 调用ngx_http_upstream_init启动upstream**
+3) **调用mytest的配置项解析函数(即handler方法)，设置upstram限制参数、回调函数(process_header等)与第三方的服务地址(resolved)**
+
+4) **调用ngx_http_upstream_init启动upstream**
 5) 如果使用了反向代理文件缓存，则检查，如果有合适响应包，则返回；如果没有，继续。
 6) 回调mytest的create_request方法
 7) mytest设置r->upstream->request_bufs确定要发送给上游服务器的具体信息

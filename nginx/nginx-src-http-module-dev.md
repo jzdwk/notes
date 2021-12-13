@@ -92,7 +92,7 @@ struct ngx_module_s {
 
 ### ngx_http_module_t
 
-当编写的模块为HTTP模块，则ngx_module_t中的ctx指向了ngx_http_module_t。ngx_http_module_t所有的属性都是回调函数，职责为处理各级的conf配置，函数描述了8个阶段，会在HTTP框架在读取/重载配置文件时调用。
+当编写的模块为HTTP模块，则ngx_module_t中的ctx指向了ngx_http_module_t。ngx_http_module_t所有的属性都是回调函数，职责为处理各级的conf配置，函数描述了8个阶段，会在HTTP框架在读取/重载配置文件时调用。具体的调用时机可以参考[ngx-act-main](./ngx-act-main.md)
 
 其定义位于`src/http/ngx_http_config.h`
 

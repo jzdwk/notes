@@ -617,7 +617,8 @@ main(int argc, char *const *argv){
     /*
      * ngx_crc32_table_init() requires ngx_cacheline_size set in ngx_os_init()
      */
-
+	
+	//初始化一致性hash表
     if (ngx_crc32_table_init() != NGX_OK) {
         return 1;
     }
@@ -1071,10 +1072,32 @@ failed:
     return NULL;
 }
 ```
+4. **信号处理**
+当处理完init_cycle_t后，继续返回nginx.c的main函数，如果有类似stop的信号，则处理：
+```c
+	//处理比如 nginx -s stop
+    if (ngx_signal) {
+        return ngx_signal_process(cycle, ngx_signal);
+    }
 
-4. **single/master模式**
+    ngx_os_status(cycle->log);
 
-当处理完init_cyclet后，继续返回nginx.c的main函数，进行单进程模式的判断：
+    ngx_cycle = cycle;
+	//得到核心模块的配置文件
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+
+    if (ccf->master && ngx_process == NGX_PROCESS_SINGLE) {
+        ngx_process = NGX_PROCESS_MASTER;
+    }
+	...
+	//创建pid
+    if (ngx_create_pidfile(&ccf->pid, cycle->log) != NGX_OK) {
+        return 1;
+    }
+```
+5. **single/master模式**
+
+进行单进程模式的判断：
 ```c
 	...
     if (ngx_process == NGX_PROCESS_SINGLE) {

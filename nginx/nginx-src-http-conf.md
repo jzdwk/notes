@@ -28,7 +28,8 @@ struct ngx_module_s {
 };
 
 //2. ngx_http_module_t定义回调函数，在解析http{}等块时，执行回调，主要用于对配置项所占存储进行init操作
-//这里需要注意参数ngx_conf_t cf，该结构用于存储nginx的各配置项，此处猜测为nginx框架调用init后，将其关联到cf，待后续验证
+//这里需要注意参数ngx_conf_t cf，它可以理解为一个中间结构体
+//在解析配置文件的时候，用来暂时存放指令的参数
 typedef struct {  
     ngx_int_t   (*preconfiguration)(ngx_conf_t *cf);
     ngx_int_t   (*postconfiguration)(ngx_conf_t *cf);
@@ -116,7 +117,7 @@ typedef struct
 nginx使用ngx_http_module_t中的回调函数来管理配置项的存储。当nginx解析配置文件时，遇到配置块后(mian/server/location)，便会根据ngx_module_t中引用的ngx_http_module_t，找到其对应的回调函数，完成内存初始化。
 
 ```c
-//1.ngx_http_module_t中定义的回调函数，分别在preconfiguration与解析location时调用
+//1.ngx_http_module_t中定义的回调函数，分别在postconfiguration与解析location时调用。这里主要关注create location处实现
 static ngx_http_module_t  ngx_http_mytest_module_ctx =
 {
     NULL,                              /* preconfiguration */
@@ -283,7 +284,7 @@ static ngx_command_t  ngx_http_mytest_commands[] = {
 
 12. 配置文件解析器继续检查配置项。如果发现server{...}配置项，就会调用ngx_http_core_module模块来处理，该模块主要用于处理server{...}块。
 
-13. ngx_http_core_module模块在解析server{...}之前，也会如第三步一样**建立ngx_http_conf_ctx_t结构**，并调用**每个HTTP模块的create_srv_conf、create_loc_conf回调方法**：注意，与第4不的不同在于，这里**不再调用模块的create_main_conf方法**。此时同样调用上节实现的`ngx_http_mytest_module_ctx`中的`ngx_http_mytest_create_loc_conf`。此处会有疑问，*新建立的ngx_http_conf_ctx_t与在解析http块时建立的ngx_http_conf_ctx_t中，都调用create_srv_conf、create_loc_conf方法，他们之间有什么关系么，为何重复调用* 解答将在下文。
+13. ngx_http_core_module模块在解析server{...}之前，也会如第三步一样**建立ngx_http_conf_ctx_t结构**，并调用**每个HTTP模块的create_srv_conf、create_loc_conf回调方法**：注意，与第4不的不同在于，这里**不再调用模块的create_main_conf方法**。此时同样调用上节实现的`ngx_http_mytest_module_ctx`中的`ngx_http_mytest_create_loc_conf`。此处会有疑问，*新建立的ngx_http_conf_ctx_t与在解析http块时建立的ngx_http_conf_ctx_t中，都调用create_srv_conf、create_loc_conf方法，他们之间有什么关系么，为何重复调用*  ，解答将在下文。
 
 14. 将上一步各HTTP模块返回的指针地址保存到ngx_http_core_module模块建立的ngx_http_conf_ctx_t对应的数组中。
 
@@ -291,13 +292,13 @@ static ngx_command_t  ngx_http_mytest_commands[] = {
 
 16. 继续重复第9步的过程：遍历到了上节定义的HTTP模块，command数组`ngx_http_mytest_commands`中存在对于`test_str`的解析定义，按第10步描述解析之。
 
-17. 配置文件解析器继续解析其他配置项。此时，发现了location{...}块，与之前一样，**建立ngx_http_conf_ctx_t结构，调用模块的create_loc_conf，遍历commands，解析配置项。**如果发现当前server块已经遍历到尾部，则返回ngx_http_core_module模块。
+17. 配置文件解析器继续解析其他配置项。此时，发现了location{...}块，与之前一样，**建立ngx_http_conf_ctx_t结构，调用模块的create_loc_conf，遍历commands，解析配置项。**   如果发现当前server块已经遍历到尾部，则返回ngx_http_core_module模块。
 
 18. 返回配置文件解析器继续解析后面的配置项，流程和前面一样，不再赘述。
 
 19. 配置文件解析器继续解析配置项，如果发现处理到了http{...}的尾部，返回个HTTP框架继续处理。
 
-20. 在第3步、13步以及其他遇到http{...}/server{...}/location{...}块时，nignx都创建了独立的ngx_http_conf_ctx_t数据结构来存储所有HTTP模块的配置项(本质是数组指针)。此时将调用个HTTP模块中ngx_http_module_t中定义的merge_src_conf/merge_loc_conf合并不同块中每个HTTP模块分配的数据结构：在`ngx_http_mytest_module_ctx`中定义了`ngx_http_mytest_merge_loc_conf`，此时将被调用。此处会有疑问，*http块中与server块中存在同名项，server块与location块也有同名项，这个merge调用如何进行的* 解答将在下文
+20. 在第3步、13步以及其他遇到http{...}/server{...}/location{...}块时，nignx都创建了独立的ngx_http_conf_ctx_t数据结构来存储所有HTTP模块的配置项(本质是数组指针)。此时将调用个HTTP模块中ngx_http_module_t中定义的merge_src_conf/merge_loc_conf合并不同块中每个HTTP模块分配的数据结构：在`ngx_http_mytest_module_ctx`中定义了`ngx_http_mytest_merge_loc_conf`，此时将被调用。此处会有疑问，*http块中与server块中存在同名项，server块与location块也有同名项，这个merge调用如何进行的* ,解答将在下文
 
 21. HTTP框架处理完毕http配置项，返回给配置文件解析器继续处理其他http{...}外的配置项。
 
@@ -314,7 +315,7 @@ typedef struct {
 　　/* 指针数组，数组中的每个元素指向所有HTTP模块create_main_conf方法产生的结构体*/
 　　void **main_conf;
 　　/* 指针数组，数组中的每个元素指向所有HTTP模块create_srv_conf方法产生的结构体*/
-　　oid **srv_conf;
+　　void **srv_conf;
 　　/* 指针数组，数组中的每个元素指向所有HTTP模块create_loc_conf方法产生的结构体*/
 　　void **loc_conf;
 } ngx_http_conf_ctx_t;
@@ -340,7 +341,7 @@ loc_conf_loc	= 	{loc_point1,loc_point2,...,loc_pointn}	//loc_point2指向第二�
 3. nginx.conf中，每次解析http时，会调用一次create_main_conf方法，被http块的ngx_http_conf_ctx_t存储
 这种存储设计的原因在于：**nginx配置中，高级别的配置可以对低级别的配置起作用，或提供配置项合并的解决方案**，比如：
 
-*当用户在http{}块中写入一项配置后，希望对http{}块内所有的server{}块都生效，但是当server{}块中定义了同名项，则以server{}块为准。此时，http{}和server{}块对于该配置都进行了独立存储，此时该项只出现在http{}块时，以http块值为准;又出现在server块且与http块值不同时，则执行merge操作*
+*当用户在http{}块中写入一项配置后，希望对http{}块内所有的server{}块都生效，但是当server{}块中定义了同名项，则以server{}块为准。此时，http{}和server{}块对于该配置都进行了独立存储，当该项只出现在http{}块时，以http块值为准;又出现在server块且与http块值不同时，则执行merge操作*
 
 ## merge操作
 

@@ -98,7 +98,7 @@ HTTP过滤模块的顺序也是由configure命令生成的，保存在ngx_module
 ```
 而第三方模块则位于`ngx_http_headers_filter_module`与`ngx_http_userid_filter_module`之间。
 ```c
-ngx_http_headers_filter_module  -> 第三方模块 -> ngx_http_userid_filter_module`
+ngx_http_headers_filter_module  -> 第三方模块 -> ngx_http_userid_filter_module
 ```
 另外需要说明，因为链表为头插法，所以，在顺序定义上**越靠后的模块，在实际执行时则约靠前**。
 

@@ -31,7 +31,7 @@ upstream使用时，本质还是访问第三方服务，那么就需要：
 
 ### ngx_http_upstream_t
 
-首先介绍ngx_http_upstream_t，该结构体是upstream模块的核心，这里指介绍与上文实现mytest相关的项的定义：
+首先介绍ngx_http_upstream_t，该结构体是upstream模块的核心，这里只介绍与上文实现mytest相关的项的定义：
 ```c
 typedef struct ngx_http_upstream_s    ngx_http_upstream_t;
 
@@ -187,10 +187,9 @@ static void* ngx_http_mytest_create_loc_conf(ngx_conf_t *cf)
     return mycf;
 }
 ```
-nginx的hide_headers成员不能为NULL，必须初始化，且nginx提供了ngx_http_upstream_hide_headers_hash方法，但只能在merge中使用“
+nginx的hide_headers成员不能为NULL，必须初始化，且nginx提供了ngx_http_upstream_hide_headers_hash方法，但只能在merge中使用
 ```c
-static char *ngx_http_mytest_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
-{
+static char *ngx_http_mytest_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child){
     ngx_http_mytest_conf_t *prev = (ngx_http_mytest_conf_t *)parent;
     ngx_http_mytest_conf_t *conf = (ngx_http_mytest_conf_t *)child;
 
@@ -214,7 +213,6 @@ nginx中，对于请求的操作是异步的，所以一个请求不会在epoll�
 与上下文相关的宏定义有：
 ```c
 //定义位于ngx_http.h中
-
 //从请求r中返回模块module的上下文，其中r为ngx_http_request的指针，module为HTTP的模块对象
 #define ngx_http_get_module_ctx(r, module)  (r)->ctx[module.ctx_index]
 //将上下文写入请求中，其中r为ngx_http_request的指针，c为上下文结构体的指针，module为HTTP模块

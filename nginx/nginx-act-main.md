@@ -111,6 +111,7 @@ static char *ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
     /* the main http context */
  
     /* 1. 分配一块内存，存放http配置上下文 */
+	//这个ngx_http_conf_ctx_t即用于存储各个http模块main/server/location块配置的数据结构，详看nginx-src-http-conf.md
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_conf_ctx_t));
     ...
     *(ngx_http_conf_ctx_t **) conf = ctx;

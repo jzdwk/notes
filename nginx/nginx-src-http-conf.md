@@ -343,6 +343,8 @@ loc_conf_loc	= 	{loc_point1,loc_point2,...,loc_pointn}	//loc_point2指向第二�
 
 *当用户在http{}块中写入一项配置后，希望对http{}块内所有的server{}块都生效，但是当server{}块中定义了同名项，则以server{}块为准。此时，http{}和server{}块对于该配置都进行了独立存储，当该项只出现在http{}块时，以http块值为准;又出现在server块且与http块值不同时，则执行merge操作*
 
+对于http模块的所有配置，即ngx_http_conf_ctx_t，最后将由ngx_cycle_t中的四级指针**conf_ctx**统一管理，此处的分析请见[nginx-act-main](./nginx-act-main.md)
+
 ## merge操作
 
 1. 按序遍历所有的HTTP模块: 比如遍历到了前文定义的mytest模块

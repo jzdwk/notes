@@ -1215,7 +1215,7 @@ ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last){
     for (i = 0; cf->cycle->modules[i]; i++) {
 		...
         cmd = cf->cycle->modules[i]->commands;
-        ...
+        ...//遍历commands中的每一个数组元素
         for ( /* void */ ; cmd->name.len; cmd++) {
 			//nginx.conf中与commands中某项匹配，省略
 			...
@@ -1251,7 +1251,7 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
 	//...创建http模块存储配置项的结构体ngx_http_conf_ctx_t
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_conf_ctx_t));
     ...
-	//因为conf指向conf_ctx数据中的对应元素，所以此处为conf_ctx数据中的对应元素指向ctx
+	//因为conf指向conf_ctx数据中的对应元素，所以此处为conf_ctx数组中对应位置的元素指向了ctx
     *(ngx_http_conf_ctx_t **) conf = ctx;
     /* count the number of the http modules and set up their indices */
 	//计算http模块个数

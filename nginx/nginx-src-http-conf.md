@@ -118,8 +118,7 @@ nginx使用ngx_http_module_t中的回调函数来管理配置项的存储。当n
 
 ```c
 //1.ngx_http_module_t中定义的回调函数，分别在postconfiguration与解析location时调用。这里主要关注create location处实现
-static ngx_http_module_t  ngx_http_mytest_module_ctx =
-{
+static ngx_http_module_t  ngx_http_mytest_module_ctx ={
     NULL,                              /* preconfiguration */
     ngx_http_mytest_post_conf,      /* postconfiguration */
     NULL,                              /* create main configuration */
@@ -132,8 +131,7 @@ static ngx_http_module_t  ngx_http_mytest_module_ctx =
     ngx_http_mytest_merge_loc_conf   /* merge location configuration */
 };
 //2.解析location时回调的实现，其实是一个内存分配与init
-static void* ngx_http_mytest_create_loc_conf(ngx_conf_t *cf)
-{
+static void* ngx_http_mytest_create_loc_conf(ngx_conf_t *cf){
     ngx_http_mytest_conf_t  *mycf;
     mycf = (ngx_http_mytest_conf_t  *)ngx_pcalloc(cf->pool, sizeof(ngx_http_mytest_conf_t));
     //错误处理...

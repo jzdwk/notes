@@ -111,6 +111,7 @@ static char *ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
     /* the main http context */
  
     /* 1. 分配一块内存，存放http配置上下文 */
+	//这个ngx_http_conf_ctx_t即用于存储各个http模块main/server/location块配置的数据结构，详看nginx-src-http-conf.md
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_conf_ctx_t));
     ...
     *(ngx_http_conf_ctx_t **) conf = ctx;
@@ -162,9 +163,9 @@ static char *ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
 
 3. **http类型模块**
 
-各种http模块的具体工作由`ngx_http_module_t`作为`ngx_module_t`的ctx来完成，即笔记中记录的http模块开发那样。那么http模块与核心模块的联系点在哪？
+各种http模块的具体工作由`ngx_http_module_t`作为`ngx_module_t`的ctx来完成，即笔记中记录的http模块开发那样。那么http模块与核心模块的联系点在哪，或者说，http{}中的关键配置(server/location)由谁处理呢？
 
-nginx为http模块定义了一个`ngx_http_module_t`类型的`ngx_http_core_module_ctx`，作为http模块中的**核心模块**，根据[nginx-src-http-conf.md](./nginx-src-http-conf.md)中描述的解析配置的流程，在第12步，其工作将交给`ngx_http_core_module_ctx`：
+nginx为http模块定义了一个`ngx_http_module_t`类型的`ngx_http_core_module_ctx`，作为http模块中的**核心模块**，该模块是第一个需要执行的http模块。根据[nginx-src-http-conf.md](./nginx-src-http-conf.md)中描述的解析配置的流程，在第12步，其工作将交给`ngx_http_core_module_ctx`：
 ```c
 //http core 处理的配置项
 static ngx_command_t  ngx_http_core_commands[] = {
@@ -409,6 +410,8 @@ struct ngx_cycle_s {
     ngx_str_t                 hostname;
 };
 ```
+这里比较重要的是`void ****conf_ctx`这个数据结构，具体将在下文分析。
+
 2. **ngx_listening_t**
 
 `ngx_cycle_t`对象中有一个动态数组成员叫做`listening`，它的每个数组元素都是`ngx_listening_t`结构体，而每个`ngx_listening_t`结构体又代表着nginx服务器监听的一个端口:
@@ -864,32 +867,7 @@ ngx_init_cycle(ngx_cycle_t *old_cycle){
         ngx_destroy_cycle_pools(&conf);
         return NULL;
     }
-	/**调用ngx_conf_parse解析nginx.conf配置文件
-	* 该函数主要会通过一个for循环，一行行的读取配置文件
-	* 每次读到一个指令，会遍历所有模块的commands数组
-	* 找到对该指令感兴趣的模块
-	* 并调用ngx_command_t中对应的handler方法来处理。
-	* 回忆在http模块开发时的操作
-	*
-	* 注意：因为此时conf中只解析了核心类型的模块	
-	* 各种第三方模块(如http模块)的加载在哪呢？
-	* 看下parse的实现，其中的hanlder函数摘要：
-	*    for (i = 0; cf->cycle->modules[i]; i++) {
-	*		cmd = cf->cycle->modules[i]->commands;
-	*		...
-	*		for ( /* void */ ; cmd->name.len; cmd++) {
-	*			//找到匹配的cmd后，调用set
-	*			rv = cmd->set(cf, cmd, conf);
-	*	 	}
-	*	}
-	* 答案是：
-	* 通过各非核心模块在核心模块中的“代理”的set方法加载。
-	* 例如，当解析遇到"http"字样时
-	* 会找到对应感兴趣的模块是ngx_http_module
-	* 该模块对应的set函数是ngx_http_block
-	* 再这个函数中，会创建存储http配置的结构体ngx_http_conf_ctx_t
-	* 并调用所有http模块的create_main,create_srv,_create_loc等方法。
-	**/
+	//调用ngx_conf_parse解析nginx.conf配置文件，具体将在下节分析
     if (ngx_conf_parse(&conf, &cycle->conf_file) != NGX_CONF_OK) {
         environ = senv;
         ngx_destroy_cycle_pools(&conf);
@@ -1072,7 +1050,374 @@ failed:
     return NULL;
 }
 ```
-4. **信号处理**
+
+4.**conf_ctx**
+
+这里着重解释一下`void ****conf_ctx`这个数据结构以及初始化工作，这是一个四级指针，conf_ctx中保存了所有nginx模块的配置项，这个数组的长度与nginx中模块的个数相同。
+```
+//ngx_cycle.c
+ngx_cycle_t *
+ngx_init_cycle(ngx_cycle_t *old_cycle){
+	...//ngx_max_module及nginx模块数
+    cycle->conf_ctx = ngx_pcalloc(pool, ngx_max_module * sizeof(void *));
+	...
+}
+```
+
+以http模块为例，具体来说：
+
+- conf_ctx指向一个数组，这解释了第一个"\*"
+- 每个数组成员代表了一种nginx模块所创建的配置项的指针，也就是说这是一个指针数组，即第二个"\*"。 需要说明的是，数组中的顺序就是`ngx_modules.c`中的数组：
+```c
+//在Nginx安装完毕，执行./configure后，在同级目录的/objs下可以看到ngx_modules.c，pwd  /root/nginx/nginx-1.20.1/objs
+[root@VM-24-5-centos objs]# cat ngx_modules.c
+#include <ngx_config.h>
+#include <ngx_core.h>
+
+extern ngx_module_t  ngx_core_module;
+extern ngx_module_t  ngx_errlog_module;
+extern ngx_module_t  ngx_conf_module;
+extern ngx_module_t  ngx_regex_module;
+extern ngx_module_t  ngx_events_module;
+extern ngx_module_t  ngx_event_core_module;
+extern ngx_module_t  ngx_epoll_module;
+extern ngx_module_t  ngx_http_module;
+extern ngx_module_t  ngx_http_core_module;
+//...省略
+
+ngx_module_t *ngx_modules[] = {
+    &ngx_core_module,
+    &ngx_errlog_module,
+    &ngx_conf_module,
+    &ngx_regex_module,
+    &ngx_events_module,
+    &ngx_event_core_module,
+    &ngx_epoll_module,
+    &ngx_http_module,
+    &ngx_http_core_module,
+    ...
+    NULL
+};
+
+char *ngx_module_names[] = {
+    "ngx_core_module",
+    "ngx_errlog_module",
+    "ngx_conf_module",
+    "ngx_regex_module",
+    "ngx_events_module",
+    "ngx_event_core_module",
+    "ngx_epoll_module",
+    "ngx_http_module",  //此为核心类型模块
+    "ngx_http_core_module", //此为http类型模块
+    ...
+    NULL
+};
+```
+具体代码实现为：
+```
+//ngx_cycle.c
+ngx_cycle_t *
+ngx_init_cycle(ngx_cycle_t *old_cycle){
+	...
+	for (i = 0; ngx_modules[i]; i++) {
+		//只处理核心模块
+        if (ngx_modules[i]->type != NGX_CORE_MODULE) {
+            continue;
+        }
+        //module指向核心模块上下文
+        module = ngx_modules[i]->ctx;
+		//调用核心模块的create_conf
+        if (module->create_conf) {
+            //即不同的核心模块调用自己的初始化函数
+            rv = module->create_conf(cycle);
+            ...
+            //重点语句
+            //conf_ctx数组的第index位置指向核心模块的上下文配置数组，其中index即核心模块在ngx_modules中的位置
+            cycle->conf_ctx[ngx_modules[i]->index] = rv;
+        }
+	...
+```
+上述代码说明，conf_ctx数组的**第一维只会存储核心模块的create_conf函数返回，否则对应的位置处的数组元素其实是为NULL。**也就是说，比如ngx_http_module这个模块(它是核心类型模块)，那么需要它处理存储的配置项的指针将会存放在conf_ctx这个数组中的第7个位置，同样，ngx_events_moudle模块配置项对应的指针会存在conf_ctx的第4个位置。 而ngx_http_core_module模块(HTTP类型模块)在conf_ctx中对应位置则是NULL。  
+
+接下来看下`rv = module->create_conf(cycle);`，比如遍历到了http的核心模块ngx_http_module
+```
+//核心模块定义
+ngx_module_t  ngx_http_module = {
+    ...
+    &ngx_http_module_ctx,                  /* module context */
+    ngx_http_commands,                     /* module directives */
+    NGX_CORE_MODULE,                       /* module type */
+    ...
+};
+//核心模块的command定义
+static ngx_command_t  ngx_http_commands[] = {
+
+    { ngx_string("http"),
+      NGX_MAIN_CONF|NGX_CONF_BLOCK|NGX_CONF_NOARGS,
+      ngx_http_block,
+      0,
+      0,
+      NULL },
+
+      ngx_null_command
+};
+
+//核心模块的ctx定义
+static ngx_core_module_t  ngx_http_module_ctx = {
+    ngx_string("http"),
+    NULL,
+    NULL
+};
+```
+此时，因为`create_conf`为NULL，所以在conf_ctx中的结构大致为：`conf_ctx = [核心模块指针1，核心模块指针2，...，NULL，核心模块指针n]`，其中NULL就是ngx_http_moudle，在数组第7个位置。接下来是解析nginx.conf文件的逻辑：
+```
+//ngx_cycle.c
+ngx_cycle_t *
+ngx_init_cycle(ngx_cycle_t *old_cycle){
+	...
+    if (ngx_conf_parse(&conf, &cycle->conf_file) != NGX_CONF_OK) {...}
+	...
+}
+//该函数主要会通过一个for循环，一行行的读取配置文件
+char *
+ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename){
+    ...
+    if (filename) {
+        /* open configuration file */
+        fd = ngx_open_file(filename->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+		...
+	}
+    for ( ;; ) {
+        rc = ngx_conf_read_token(cf);
+        ...
+        if (cf->handler) {
+            ...
+            rv = (*cf->handler)(cf, NULL, cf->handler_conf);
+            if (rv == NGX_CONF_OK) {
+                continue;
+            }
+			...
+        }
+		//解析函数
+        rc = ngx_conf_handler(cf, rc);
+        if (rc == NGX_ERROR) {
+            goto failed;
+        }
+    }
+    ...
+    return NGX_CONF_OK;
+}
+//
+static ngx_int_t
+ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last){
+    ....
+	//遍历每个nginx模块中的commands数据中的每一项
+    for (i = 0; cf->cycle->modules[i]; i++) {
+		...
+        cmd = cf->cycle->modules[i]->commands;
+        ...//遍历commands中的每一个数组元素
+        for ( /* void */ ; cmd->name.len; cmd++) {
+			//nginx.conf中与commands中某项匹配，省略
+			...
+			//cf->cycle->modules[i]->index表示了nginx模块的位置顺序，比如ngx_http_module在第7个
+			//cf->ctx[cf->cycle->modules[i]->index]即返回conf_ctx数组中对应下标的元素
+			//最后，根据cmd->type字段的定义，conf的意义不同
+            if (cmd->type & NGX_DIRECT_CONF) {
+                conf = ((void **) cf->ctx)[cf->cycle->modules[i]->index];
+            } else if (cmd->type & NGX_MAIN_CONF) { 
+			    //比如扫描到http配置项后，核心模块ngx_http_module中http字段type为NGX_MAIN_CONF，进入此分支，conf为conf_ctx数组中对应下标的元素的地址
+                conf = &(((void **) cf->ctx)[cf->cycle->modules[i]->index]);
+
+            } else if (cf->ctx) {
+                confp = *(void **) ((char *) cf->ctx + cmd->conf);
+                if (confp) {
+                    conf = confp[cf->cycle->modules[i]->ctx_index];
+                }
+            }
+			//执行set方法，对于ngx_http_module模块，即为ngx_http_block
+            rv = cmd->set(cf, cmd, conf);
+            ...
+            return NGX_ERROR;
+        }
+    }
+	...
+}
+```
+继续查看ngx_http_module模块commands在处理"http"字段时set方法`ngx_http_block`的实现：
+```c
+static char *
+ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
+	
+	//...创建http模块存储配置项的结构体ngx_http_conf_ctx_t
+    ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_conf_ctx_t));
+    ...
+	//因为conf指向conf_ctx数据中的对应元素，所以此处为conf_ctx数组中对应位置的元素指向了ctx
+    *(ngx_http_conf_ctx_t **) conf = ctx;
+    /* count the number of the http modules and set up their indices */
+	//计算http模块个数
+    ngx_http_max_module = ngx_count_modules(cf->cycle, NGX_HTTP_MODULE);
+
+	//为ctx->main_conf、src_conf和loc_conf分配内存，大小即为http模块总数
+    ctx->main_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_http_max_module);
+    ctx->srv_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_http_max_module);
+    ctx->loc_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_http_max_module);
+
+	//核心模块将遍历每个http模块
+    for (m = 0; cf->cycle->modules[m]; m++) {
+        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+		//对应http模块的ctx，即ngx_http_module_t
+        module = cf->cycle->modules[m]->ctx;
+        mi = cf->cycle->modules[m]->ctx_index;
+		//如果这个http模块实现了create_main_conf，调用它，并写入ngx_http_conf_ctx_t的main_conf的指定下标位置，下同
+        if (module->create_main_conf) {
+            ctx->main_conf[mi] = module->create_main_conf(cf);
+            ...
+        }
+        if (module->create_srv_conf) {
+            ctx->srv_conf[mi] = module->create_srv_conf(cf);
+            ...
+        }
+        if (module->create_loc_conf) {
+            ctx->loc_conf[mi] = module->create_loc_conf(cf);
+            ...
+        }
+    }
+   
+    pcf = *cf;
+    cf->ctx = ctx;
+
+    for (m = 0; cf->cycle->modules[m]; m++) {
+        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        module = cf->cycle->modules[m]->ctx;
+
+        if (module->preconfiguration) {
+            if (module->preconfiguration(cf) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    /* parse inside the http{} block */
+
+    cf->module_type = NGX_HTTP_MODULE;
+    cf->cmd_type = NGX_HTTP_MAIN_CONF;
+    rv = ngx_conf_parse(cf, NULL);
+
+    if (rv != NGX_CONF_OK) {
+        goto failed;
+    }
+
+    /*
+     * init http{} main_conf's, merge the server{}s' srv_conf's
+     * and its location{}s' loc_conf's
+     */
+
+    cmcf = ctx->main_conf[ngx_http_core_module.ctx_index];
+    cscfp = cmcf->servers.elts;
+
+    for (m = 0; cf->cycle->modules[m]; m++) {
+        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        module = cf->cycle->modules[m]->ctx;
+        mi = cf->cycle->modules[m]->ctx_index;
+
+        /* init http{} main_conf's */
+
+        if (module->init_main_conf) {
+            rv = module->init_main_conf(cf, ctx->main_conf[mi]);
+            if (rv != NGX_CONF_OK) {
+                goto failed;
+            }
+        }
+
+        rv = ngx_http_merge_servers(cf, cmcf, module, mi);
+        if (rv != NGX_CONF_OK) {
+            goto failed;
+        }
+    }
+
+
+    /* create location trees */
+
+    for (s = 0; s < cmcf->servers.nelts; s++) {
+
+        clcf = cscfp[s]->ctx->loc_conf[ngx_http_core_module.ctx_index];
+
+        if (ngx_http_init_locations(cf, cscfp[s], clcf) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        if (ngx_http_init_static_location_trees(cf, clcf) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+
+    if (ngx_http_init_phases(cf, cmcf) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_http_init_headers_in_hash(cf, cmcf) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+
+    for (m = 0; cf->cycle->modules[m]; m++) {
+        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        module = cf->cycle->modules[m]->ctx;
+
+        if (module->postconfiguration) {
+            if (module->postconfiguration(cf) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    if (ngx_http_variables_init_vars(cf) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    /*
+     * http{}'s cf->ctx was needed while the configuration merging
+     * and in postconfiguration process
+     */
+
+    *cf = pcf;
+
+
+    if (ngx_http_init_phase_handlers(cf, cmcf) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+
+    /* optimize the lists of ports, addresses and server names */
+
+    if (ngx_http_optimize_servers(cf, cmcf, cmcf->ports) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+
+failed:
+
+    *cf = pcf;
+
+    return rv;
+}
+```
+
+
+5. **信号处理**
 当处理完init_cycle_t后，继续返回nginx.c的main函数，如果有类似stop的信号，则处理：
 ```c
 	//处理比如 nginx -s stop
@@ -1095,7 +1440,7 @@ failed:
         return 1;
     }
 ```
-5. **single/master模式**
+6. **single/master模式**
 
 进行单进程模式的判断：
 ```c

@@ -1181,7 +1181,16 @@ ngx_init_cycle(ngx_cycle_t *old_cycle){
 //该函数主要会通过一个for循环，一行行的读取配置文件
 char *
 ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename){
+     ...
+	//因为nginx的conf文件中，有块关键字，比如http{},location{},也有配置项，比如listen, proxy等。所以通过一个enum区分。
+	//ngx_conf_parse将会被递归调用
+    enum {
+        parse_file = 0,
+        parse_block,
+        parse_param
+    } type;
     ...
+	//第一次被ngx_init_cycle调用时，filename不为空
     if (filename) {
         /* open configuration file */
         fd = ngx_open_file(filename->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
@@ -1262,7 +1271,7 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
     ctx->srv_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_http_max_module);
     ctx->loc_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_http_max_module);
 
-	//核心模块将遍历每个http模块
+	//核心模块ngx_http_module将遍历每个http模块
     for (m = 0; cf->cycle->modules[m]; m++) {
         if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
             continue;
@@ -1270,7 +1279,7 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
 		//对应http模块的ctx，即ngx_http_module_t
         module = cf->cycle->modules[m]->ctx;
         mi = cf->cycle->modules[m]->ctx_index;
-		//如果这个http模块实现了create_main_conf，调用它，并写入ngx_http_conf_ctx_t的main_conf的指定下标位置，下同
+		//如果这个http模块实现了create_main_conf，调用它，并写入ngx_http_conf_ctx_t的main_conf的指定下标位置，下同.create_conf用于完成对应http模块的配置项存储初始化工作。
         if (module->create_main_conf) {
             ctx->main_conf[mi] = module->create_main_conf(cf);
             ...
@@ -1303,15 +1312,14 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
     }
 
     /* parse inside the http{} block */
-
+	//当处理完“http”这个字段，进行递归调用，解析http块中的其他配置项，有可能是location等关键字，也有可能是自定义项
+	//此时将再次遍历所有ngx模块，匹配符合条件的command，执行set方法。具体可以参考nginx-src-http-conf.md
     cf->module_type = NGX_HTTP_MODULE;
     cf->cmd_type = NGX_HTTP_MAIN_CONF;
     rv = ngx_conf_parse(cf, NULL);
 
-    if (rv != NGX_CONF_OK) {
-        goto failed;
-    }
-
+	...
+	//merge配置项操作，省略
     /*
      * init http{} main_conf's, merge the server{}s' srv_conf's
      * and its location{}s' loc_conf's
@@ -1321,97 +1329,10 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
     cscfp = cmcf->servers.elts;
 
     for (m = 0; cf->cycle->modules[m]; m++) {
-        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
-            continue;
-        }
-
-        module = cf->cycle->modules[m]->ctx;
-        mi = cf->cycle->modules[m]->ctx_index;
-
-        /* init http{} main_conf's */
-
-        if (module->init_main_conf) {
-            rv = module->init_main_conf(cf, ctx->main_conf[mi]);
-            if (rv != NGX_CONF_OK) {
-                goto failed;
-            }
-        }
-
-        rv = ngx_http_merge_servers(cf, cmcf, module, mi);
-        if (rv != NGX_CONF_OK) {
-            goto failed;
-        }
+        ...
+        rv = ngx_http_merge_servers(cf, cmcf, module, mi);  
     }
-
-
-    /* create location trees */
-
-    for (s = 0; s < cmcf->servers.nelts; s++) {
-
-        clcf = cscfp[s]->ctx->loc_conf[ngx_http_core_module.ctx_index];
-
-        if (ngx_http_init_locations(cf, cscfp[s], clcf) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-
-        if (ngx_http_init_static_location_trees(cf, clcf) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-    }
-
-
-    if (ngx_http_init_phases(cf, cmcf) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-    if (ngx_http_init_headers_in_hash(cf, cmcf) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-
-    for (m = 0; cf->cycle->modules[m]; m++) {
-        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
-            continue;
-        }
-
-        module = cf->cycle->modules[m]->ctx;
-
-        if (module->postconfiguration) {
-            if (module->postconfiguration(cf) != NGX_OK) {
-                return NGX_CONF_ERROR;
-            }
-        }
-    }
-
-    if (ngx_http_variables_init_vars(cf) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-    /*
-     * http{}'s cf->ctx was needed while the configuration merging
-     * and in postconfiguration process
-     */
-
-    *cf = pcf;
-
-
-    if (ngx_http_init_phase_handlers(cf, cmcf) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-
-    /* optimize the lists of ports, addresses and server names */
-
-    if (ngx_http_optimize_servers(cf, cmcf, cmcf->ports) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-    return NGX_CONF_OK;
-
-failed:
-
-    *cf = pcf;
-
+	...
     return rv;
 }
 ```

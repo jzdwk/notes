@@ -602,7 +602,7 @@ INPUT链没有规则，而且在两个表mangle和filter默认规则都是ACCEPT
 
 2. 容器内访问外地：
 
-对于主机的iptables而言，是有数据从docker0过来，想出主机。首先进入PREROUTING 链，由于唯一的规则不匹配，因此执行默认的ACCEPT操作。之后进入到INPUT链。INPUT链也同样默认 ACCEPT。假设根据主机的路由表，发往外地的包都要经过eth0。现在进入FORWARD链。规则从上到下依次匹配。
+对于主机的iptables而言，是有数据从docker0过来，想出主机，这里就使用了上文的**SNAT**技术。首先进入PREROUTING 链，由于唯一的规则不匹配，因此执行默认的ACCEPT操作。之后进入到INPUT链。INPUT链也同样默认 ACCEPT。假设根据主机的路由表，发往外地的包都要经过eth0。现在进入FORWARD链。规则从上到下依次匹配。
 ```
 //1. 第一条，直接跳到DOCKER-USER，继续看
 -A FORWARD -j DOCKER-USER
@@ -652,7 +652,7 @@ INPUT链没有规则，而且在两个表mangle和filter默认规则都是ACCEPT
 
 3. 主机访问容器内：
 
-对于主机的iptables而言，是有数据从内部过来，想出主机。前面的规则与`1. 容器内访问主机`一致，但是接下来，通过主机的路由表发现，这种包应该发送给网卡docker0。因此进入OUTPUT 链，有一条规则：
+对于主机的iptables而言，是有数据从内部过来，想出主机。前面的规则与`1. 容器内访问主机`一致，但是接下来，通过主机的路由表发现，这种包应该发送给网卡docker0。因此进入OUTPUT链，它有一条规则：
 ```
 //1. 如果目标不是127.0.0.0/8网段，但目标是本地地址的，跳到DOCKER链。但我们访问的是一个容器的地址，不是docker0的地址，因此并不满足本地地址的要求。OUTPUT 链结束
 -A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
@@ -662,19 +662,26 @@ INPUT链没有规则，而且在两个表mangle和filter默认规则都是ACCEPT
 ```
 
 4. 外地访问容器内：
-
-对于主机的iptables而言，是有数据从eth0过来，要去docker0，从外地发往外地。前面的规则与`1. 容器内访问主机`一致，PREROUTING链和INPUT链都会放行，经过路由表判断后，进入 FORWARD 链：
+  
+外网访问容器时使用的是宿主的ip，以及容器与宿主的端口映射，因此主要使用的是nat表，和**DNAT**。首先是匹配PREROUTING链，转到DOCKER链，这个前文一致，接下来，因为数据不是来自docker0，因此继续匹配DOCKER链，可以看到：
 ```
-//FORWARD一直会匹配到这条规则了，允许目标为docker0，且这些包如果是 RELATED 状态或者 ESTABLISHED 状态连接中的一部分，那么就接受。
--A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-
-//我们在建立 TCP 连接时，要经历三次握手。客户端发出了 SYN 包到服务器，此时 iptables 检测到了这个包，根据之前的说法，它会放行，并判断有一个新连接要产生，连接便为 NEW 状态；服务器将返回 SYN/ACK 包，通过 iptables 后，它判断这个包是为 NEW 状态的连接的一个响应，该连接状态即为 ESTABLISHED，规则匹配成功，放行。之后服务端于该连接发送给客户端的数据都会放行。RELATED 状态则是由一个已经处于 ESTABLISHED 状态的连接产生的一个额外连接，比如 FTP 协议的 FTP-data 连接的产生就会于 FTP-control 连接后成为 RELATED 状态的连接，而不仅仅是 NEW 状态。一些 ICMP 应答也是如此。这种情况，防火墙也会放行。
-
-如果包不属于这两种状态，比如外界向本机发起了连接，那么继续下一行，下一行表示目的地为docker0跳到 DOCKER 链。DOCKER 链直接返回。继续下面的规则，两条规则都要求来自docker0，不满足，因此不匹配，所有 FORWARD 链的规则都被匹配过了，执行默认动作 DROP（:FORWARD DROP），该包被丢弃。这样外网便无法访问容器内的服务。
-
+//1. 目标地址是本主机
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+...
+//2. 根据docker配置的端口映射，在DOCKER链上执行了DNAT，将请求的目标地址指向了172.17网段(以下的5432等端口为测试机上映射的端口)
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 65432 -j DNAT --to-destination 172.17.0.2:5432
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 65300 -j DNAT --to-destination 172.17.0.4:36790
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 65299 -j DNAT --to-destination 172.17.0.4:36789
 ```
+接下来便根据宿主的路由表route进行路由，172的流量指向了docker0网桥，接下来FORWARD链、POSTROUTING链的处理与之前一致，不再赘述。
 
 5. 容器内访问容器内
 
-对于 iptables ，是从外到外，从docker0到docker0。同样，PREROUTING 和 INPUT 链放行，进入 FORWARD 链。它首先进入 DOCKER-USER 链，然后直接 RETURN，然后直接进入 DOCKER-ISOLATION-STAGE-1 链，第一条不满足，第二条直接 RETURN，第三条在上一个情况进行了描述，如果不满足，进入第四条，也不满足，看第五条-A FORWARD -i docker0 -o docker0 -j ACCEPT，满足，执行动作ACCEPT，因此容器内访问容器内畅通无阻
+对于iptables ，是从docker0到docker0。两个容器间互通时，源和目的地址都是172网段，PREROUTING 和INPUT 链放行，进入FORWARD链。它首先进入DOCKER-USER链，然后直接RETURN，然后直接进入 DOCKER-ISOLATION-STAGE-1 链，第一条不满足，第二条直接 RETURN，继续看FORWARD，直到：
+```
+-A FORWARD -i docker0 -o docker0 -j ACCEPT，满足，执行动作ACCEPT，因此容器内访问容器内畅通无阻。
+```
+
+
+
 

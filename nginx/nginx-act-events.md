@@ -1,7 +1,6 @@
 # nginx event 
 nginx事件学习与epoll模块解析
 
-
 ## nginx event相关结构体
 
 ### nginx event
@@ -396,11 +395,20 @@ struct ngx_connection_s {
 
 当nginx拉起后，会依次拉起核心模块ngx_events_module与第一个事件模块ngx_event_core_module。在初始化的全局ngx_cycle_t中，存储了连接池对象和事件池对象。事件模块ngx_event_core_module通过执行ngx_event_process_init，遍历要listen的端口，从空闲连接池中获取连接对象，拿到对应连接的读写事件，并添加给具体的事件处理module。
 
-## nginx event 启动
+## nginx event 初始化
+
+参考：https://segmentfault.com/a/1190000016856346
+
+与http模块类似，nginx的事件模块初始化同样由`ngx_init_cycle()`发起，在其流程中，`ngx_init_cycle()`中和事件相关流程的包括了：
+- 调用core模块的create_conf方法
+- 解析配置文件
+- 调用core模块的init_conf方法
+- 监听socket
+- 调用各个模块的init_module方法
 
 ### 核心模块 ngx_events_module
 
-与http模块类似，nginx解析事件时，也是通过core类型模块的ngx_events_module与事件类型模块的ngx_event_core_module配合完成。在初始化时，首先初始化核心模块，其流程与http相同：
+首先是配置解析，与http模块类似，nginx解析事件时，也是通过core类型模块的ngx_events_module与事件类型模块的ngx_event_core_module配合完成。在初始化时，首先初始化核心模块，其流程与http相同：
 ```c
 ngx_module_t  ngx_events_module = {
     NGX_MODULE_V1,
@@ -416,6 +424,13 @@ ngx_module_t  ngx_events_module = {
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
+//event核心模块的ctx定义
+static ngx_core_module_t  ngx_events_module_ctx = {
+    ngx_string("events"),
+    NULL,
+    ngx_event_init_conf
+};
+
 //commands中为nginx配置中events{}块的解析
 static ngx_command_t  ngx_events_commands[] = {
 
@@ -427,16 +442,21 @@ static ngx_command_t  ngx_events_commands[] = {
       NULL },
       ngx_null_command
 };
+```
+首先是加载核心模块，当从配置文件中读取到events后，会调用ngx_events_block函数。下面是ngx_events_block函数的主要工作
+```
 //ngx_events_block会初始化每一个event类型的模块，首先将会是ngx_event_core_module
 static char *
 ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ...
+	//统计事件类型模块数量
     ngx_event_max_module = ngx_count_modules(cf->cycle, NGX_EVENT_MODULE);
     ctx = ngx_pcalloc(cf->pool, sizeof(void *));
     ...
     *ctx = ngx_pcalloc(cf->pool, ngx_event_max_module * sizeof(void *));
     ...
+	//让cycle->conf_ctx数组中“事件槽”对应的指针指向用于存储事件配置的ctx
     *(void **) conf = ctx;
 	//调用每个events模块的create_conf，初始化每个模块的存储配置项结构体
     for (i = 0; cf->cycle->modules[i]; i++) {
@@ -483,7 +503,7 @@ ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 ### 事件模块 ngx_event_core_module
 
-nginx对事件模块的定义如下：
+在初始化时，`ngx_event_core_module`是事件模块中需要首先加载的第一个模块，因此将首先调用`ngx_event_core_module`中上文提到的create_conf、init_conf。nginx对事件模块的定义如下：
 ```c
 //位于src/event/modules/ngx_event.c，https://blog.csdn.net/m0_46125280/article/details/103885012
 typedef struct {
@@ -583,13 +603,16 @@ static ngx_command_t  ngx_event_core_commands[] = {
       ngx_null_command
 };
 ```
+
 上述内容比较重要的是`ngx_event_module_t`类型以及其中的actions，由于`ngx_event_core_module_ctx`的主要工作是启动events，所以actions为`{ NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }`。但是在后续的事件模块中，会实现这些接口，从而完成事件的处理工作。
 
-另外，在ngx_event_core_module中，定义了两个接口`ngx_event_module_init`和`ngx_event_process_init`，其中前者主要是完成了一些全局变量的初始化工作：
+另外，在ngx_event_core_module中，定义了两个接口`ngx_event_module_init`和`ngx_event_process_init`，对于前者，在nignx启动阶段，ngx_init_cycle函数监听完端口，并提交新的cycle后，便会调用ngx_init_modules函数，该方法会遍历所有模块并调用其init_module方法。在这一阶段，和事件驱动模块有关系的只有ngx_event_core_module的ngx_event_module_init方法。它主要是完成了以下工作：
 ```c
 //ngx_event.c
-//全局变量声明，这里省略
-...
+
+ //   （1）获取core模块配置结构体中的时间精度timer_resolution，用在epoll里更新缓存时间
+ //   （2）调用getrlimit方法，检查连接数是否超过系统的资源限制
+ //   （3）利用 mmap 分配一块共享内存，存储负载均衡锁（ngx_accept_mutex）、连接计数器（ngx_connection_counter）
 
 static ngx_int_t
 ngx_event_module_init(ngx_cycle_t *cycle)
@@ -625,7 +648,11 @@ ngx_event_module_init(ngx_cycle_t *cycle)
     return NGX_OK;
 }
 ```
-主要看下`ngx_event_process_init`的实现，它完成了`ngx_event_core_module`在启动过程中的主要工作：
+
+nginx进程在完成一系列操作后，会fork出master进程，并自我关闭，让master进程继续完成初始化工作。master进程会在ngx_spawn_process函数中fork出worker进程，并让worker进程调用ngx_worker_process_cycle函数。ngx_worker_process_cycle函数是worker进程的主循环函数，该函数首先会调用ngx_worker_process_init函数完成worker的初始化，然后就会进入到一个循环中，持续监听处理请求。事件模块的初始化就发生在ngx_worker_process_init函数中。
+
+其调用关系：main() ---> ngx_master_process_cycle() ---> ngx_start_worker_processes() ---> ngx_spawn_process() ---> ngx_worker_process_cycle() ---> ngx_worker_process_init()。
+对于ngx_worker_process_init函数，会调用各个模块的init_process方法，而事件模块中，则会调用`ngx_event_process_init`：
 ```
 static ngx_int_t
 ngx_event_process_init(ngx_cycle_t *cycle)
@@ -865,6 +892,21 @@ ngx_event_process_init(ngx_cycle_t *cycle)
     }
     return NGX_OK;
 }
+```
+
+## ngx_epoll_module
+
+上文中，在`ngx_event_process_init`中根据use的配置项，调用具体的事件驱动模块，这里主要分析epoll的实现。
+
+### epoll 基础
+
+epoll的使用是三个函数：
+```
+//epoll_create函数会在内核中创建一块独立的内存存储一个eventpoll结构体，该结构体包括一颗红黑树rbr和一个链表rdllist
+int epoll_create(int size);
+//
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
 ```
 
 

@@ -1549,9 +1549,77 @@ nginx里面通过一个变量ngx_accept_disabled来实施进程间获取客户�
 
 ![nginx worker lb](../nginx-act-event-lb.png)
 
-1.ngx_process_events_and_timers函数中，通过ngx_accept_disabled的正负判断当前进程负载高低（大于0，高负载；小于0，低负载）。如果低负载时，不做处理，进程去申请accept锁，监听并接受新的连接。
+1. ngx_process_events_and_timers函数中，通过ngx_accept_disabled的正负判断当前进程负载高低（大于0，高负载；小于0，低负载）。如果低负载时，不做处理，进程去申请accept锁，监听并接受新的连接。
 
-2.如果是高负载时，ngx_accept_disabled就发挥作用了。这时，不去申请accept锁，让出监听和接受新连接的机会。同时ngx_accept_disabled减1，表示通过让出一次accept申请的机会，该进程的负载将会稍微减轻，直到ngx_accept_disabled最后小于0，重新进入低负载的状态，开始新的accept锁竞争。
+2. 如果是高负载时，ngx_accept_disabled就发挥作用了。这时，不去申请accept锁，让出监听和接受新连接的机会。同时ngx_accept_disabled减1，表示通过让出一次accept申请的机会，该进程的负载将会稍微减轻，直到ngx_accept_disabled最后小于0，重新进入低负载的状态，开始新的accept锁竞争。
+
+## 事件处理整体流程
+
+回顾[nginx master worker](../nginx-act-master-worker.md)笔记，当fork出worker进程后，worker执行`ngx_worker_process_cycle`：
+```
+static void
+ngx_worker_process_cycle(ngx_cycle_t *cycle, void *data)
+{
+	...
+    for ( ;; ) {
+		...
+		//【4】还有未处理完事件时，调用ngx_process_events_and_timers处理
+        ngx_process_events_and_timers(cycle);
+	}
+```
+事件处理的入口函数即为`ngx_process_events_and_timers`，该函数用于处理Nginx中所有的事件，既包括了网络事件，也包括了定时器事件：
+```
+void
+ngx_process_events_and_timers(ngx_cycle_t *cycle)
+{
+    ngx_uint_t  flags;
+    ngx_msec_t  timer, delta;
+    ...
+	//上节中的负载均衡阈值，如果小于0，说明该进程可以accept
+    if (ngx_use_accept_mutex) {
+        if (ngx_accept_disabled > 0) {
+            ngx_accept_disabled--;
+
+        } else {
+            if (ngx_trylock_accept_mutex(cycle) == NGX_ERROR) {
+                return;
+            }
+
+            if (ngx_accept_mutex_held) {
+                flags |= NGX_POST_EVENTS;
+
+            } else {
+                if (timer == NGX_TIMER_INFINITE
+                    || timer > ngx_accept_mutex_delay)
+                {
+                    timer = ngx_accept_mutex_delay;
+                }
+            }
+        }
+    }
+
+    if (!ngx_queue_empty(&ngx_posted_next_events)) {
+        ngx_event_move_posted_next(cycle);
+        timer = 0;
+    }
+    delta = ngx_current_msec;
+	//1. 调用事件驱动模块实现的process_events方法处理网络事件
+	// 其中，nginx定义了#define ngx_process_events   ngx_event_actions.process_events
+    (void) ngx_process_events(cycle, timer, flags);
+    delta = ngx_current_msec - delta;
+    //2. 处理accept延时队列中的accept事件，并释放锁
+    ngx_event_process_posted(cycle, &ngx_posted_accept_events);
+    if (ngx_accept_mutex_held) {
+        ngx_shmtx_unlock(&ngx_accept_mutex);
+    }
+    ngx_event_expire_timers();
+	//3. 处理普通延时队列事件
+    ngx_event_process_posted(cycle, &ngx_posted_events);
+}
+```
+
+
+
 
 
 

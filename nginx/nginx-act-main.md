@@ -1069,7 +1069,8 @@ ngx_init_cycle(ngx_cycle_t *old_cycle){
 - conf_ctx指向一个数组，这解释了第一个"\*"
 - 每个数组成员代表了一种nginx模块所创建的配置项的指针，也就是说这是一个指针数组，即第二个"\*"。 需要说明的是，数组中的顺序就是`ngx_modules.c`中的数组：
 ```c
-//在Nginx安装完毕，执行./configure后，在同级目录的/objs下可以看到ngx_modules.c，pwd  /root/nginx/nginx-1.20.1/objs
+//在Nginx安装完毕，执行./configure后，在同级目录的/objs下可以看到ngx_modules.c，
+// pwd  /root/nginx/nginx-1.20.1/objs
 [root@VM-24-5-centos objs]# cat ngx_modules.c
 #include <ngx_config.h>
 #include <ngx_core.h>

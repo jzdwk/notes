@@ -1337,19 +1337,20 @@ static ngx_int_t ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, 
 ngx_epoll_process_events 方法中一旦判断 instance 发生了变化，就认为是过期事件而不予处理。
 ```
 
-## 事件处理 
+## 建立连接 
 
-以上就是epoll处理事件的实现。这里注意，根据`ngx_event_process_init`的分析:
+nginx对于建立连接的整体调用逻辑[参考](https://www.cnblogs.com/NerdWill/p/4992345.html)
+
+图例如下：
+![nginx accept流程](./nginx-act-event-accept.png)
+
+这里注意，根据`ngx_event_process_init`的分析:
 ```
 		//重要，定义事件的handler为ngx_event_accept
         rev->handler = (c->type == SOCK_STREAM) ? ngx_event_accept
                                                 : ngx_event_recvmsg;
 ```
-events事件的handler方法会根据连接的状态被赋值为`ngx_event_accept`。 因此，`ngx_epoll_process_events`最终的处理将调用该方法。
-
-### 建立连接
-
-ngx_event_accept作为
+events事件的handler方法会根据连接的状态被赋值为`ngx_event_accept`或者`ngx_event_recvmsg`。 因此，`ngx_epoll_process_events`最终的处理将调用该方法。其中，ngx_event_accept实现了连接建立的处理逻辑，具体如下：
 
 ```
 void
@@ -1365,34 +1366,19 @@ ngx_event_accept(ngx_event_t *ev)
     ngx_listening_t   *ls;
     ngx_connection_t  *c, *lc;
     ngx_event_conf_t  *ecf;
-#if (NGX_HAVE_ACCEPT4)
-    static ngx_uint_t  use_accept4 = 1;
-#endif
-
-    if (ev->timedout) {
-        if (ngx_enable_accept_events((ngx_cycle_t *) ngx_cycle) != NGX_OK) {
-            return;
-        }
-
-        ev->timedout = 0;
-    }
-
+    ...
     ecf = ngx_event_get_conf(ngx_cycle->conf_ctx, ngx_event_core_module);
-
-    if (!(ngx_event_flags & NGX_USE_KQUEUE_EVENT)) {
-        ev->available = ecf->multi_accept;
-    }
+    ...
 
     lc = ev->data;
     ls = lc->listening;
     ev->ready = 0;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, ev->log, 0,
-                   "accept on %V, ready: %d", &ls->addr_text, ev->available);
-
+    ...
+	//根据avaliabce标志位，循环处理accept事件
     do {
         socklen = sizeof(ngx_sockaddr_t);
-
+		
+	//1. 调用accept方法建立新连接	
 #if (NGX_HAVE_ACCEPT4)
         if (use_accept4) {
             s = accept4(lc->fd, &sa.sockaddr, &socklen, SOCK_NONBLOCK);
@@ -1402,136 +1388,45 @@ ngx_event_accept(ngx_event_t *ev)
 #else
         s = accept(lc->fd, &sa.sockaddr, &socklen);
 #endif
-
-        if (s == (ngx_socket_t) -1) {
-            err = ngx_socket_errno;
-
-            if (err == NGX_EAGAIN) {
-                ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, err,
-                               "accept() not ready");
-                return;
-            }
-
-            level = NGX_LOG_ALERT;
-
-            if (err == NGX_ECONNABORTED) {
-                level = NGX_LOG_ERR;
-
-            } else if (err == NGX_EMFILE || err == NGX_ENFILE) {
-                level = NGX_LOG_CRIT;
-            }
-
-#if (NGX_HAVE_ACCEPT4)
-            ngx_log_error(level, ev->log, err,
-                          use_accept4 ? "accept4() failed" : "accept() failed");
-
-            if (use_accept4 && err == NGX_ENOSYS) {
-                use_accept4 = 0;
-                ngx_inherited_nonblocking = 0;
-                continue;
-            }
-#else
-            ngx_log_error(level, ev->log, err, "accept() failed");
-#endif
-
-            if (err == NGX_ECONNABORTED) {
-                if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
-                    ev->available--;
-                }
-
-                if (ev->available) {
-                    continue;
-                }
-            }
-
-            if (err == NGX_EMFILE || err == NGX_ENFILE) {
-                if (ngx_disable_accept_events((ngx_cycle_t *) ngx_cycle, 1)
-                    != NGX_OK)
-                {
-                    return;
-                }
-
-                if (ngx_use_accept_mutex) {
-                    if (ngx_accept_mutex_held) {
-                        ngx_shmtx_unlock(&ngx_accept_mutex);
-                        ngx_accept_mutex_held = 0;
-                    }
-
-                    ngx_accept_disabled = 1;
-
-                } else {
-                    ngx_add_timer(ev, ecf->accept_mutex_delay);
-                }
-            }
-
-            return;
-        }
-
-#if (NGX_STAT_STUB)
-        (void) ngx_atomic_fetch_add(ngx_stat_accepted, 1);
-#endif
-
+		
+		...	
+		//2. 设置负载均衡阈值，即总连接*1/8 - 空闲连接
         ngx_accept_disabled = ngx_cycle->connection_n / 8
                               - ngx_cycle->free_connection_n;
-
+		//获取空闲连接，连接的fd字段指向了s
         c = ngx_get_connection(s, ev->log);
-
-        if (c == NULL) {
-            if (ngx_close_socket(s) == -1) {
-                ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                              ngx_close_socket_n " failed");
-            }
-
-            return;
-        }
+		//...
 
         c->type = SOCK_STREAM;
 
-#if (NGX_STAT_STUB)
-        (void) ngx_atomic_fetch_add(ngx_stat_active, 1);
-#endif
-
+		...
+		//3. 建立连接的内存池pool，当连接释放到空闲连接池时，释放pool
         c->pool = ngx_create_pool(ls->pool_size, ev->log);
-        if (c->pool == NULL) {
-            ngx_close_accepted_connection(c);
-            return;
-        }
+        ...
 
         if (socklen > (socklen_t) sizeof(ngx_sockaddr_t)) {
             socklen = sizeof(ngx_sockaddr_t);
         }
 
         c->sockaddr = ngx_palloc(c->pool, socklen);
-        if (c->sockaddr == NULL) {
-            ngx_close_accepted_connection(c);
-            return;
-        }
-
+        ...
         ngx_memcpy(c->sockaddr, &sa, socklen);
 
         log = ngx_palloc(c->pool, sizeof(ngx_log_t));
-        if (log == NULL) {
-            ngx_close_accepted_connection(c);
-            return;
-        }
+        ...
 
         /* set a blocking mode for iocp and non-blocking mode for others */
-
+		//4. 设置套接字属性
         if (ngx_inherited_nonblocking) {
             if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
-                if (ngx_blocking(s) == -1) {
-                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                                  ngx_blocking_n " failed");
-                    ngx_close_accepted_connection(c);
-                    return;
-                }
+				...
+                ngx_close_accepted_connection(c);
             }
 
         } else {
             if (!(ngx_event_flags & NGX_USE_IOCP_EVENT)) {
                 if (ngx_nonblocking(s) == -1) {
-                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                                  ngx_nonblocking_n " failed");
+                    ...
                     ngx_close_accepted_connection(c);
                     return;
                 }
@@ -1539,7 +1434,7 @@ ngx_event_accept(ngx_event_t *ev)
         }
 
         *log = ls->log;
-
+		//连接对象赋值，略过
         c->recv = ngx_recv;
         c->send = ngx_send;
         c->recv_chain = ngx_recv_chain;
@@ -1566,23 +1461,10 @@ ngx_event_accept(ngx_event_t *ev)
 
         rev = c->read;
         wev = c->write;
-
         wev->ready = 1;
-
-        if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
-            rev->ready = 1;
-        }
-
-        if (ev->deferred_accept) {
-            rev->ready = 1;
-#if (NGX_HAVE_KQUEUE || NGX_HAVE_EPOLLRDHUP)
-            rev->available = 1;
-#endif
-        }
-
+		...
         rev->log = log;
         wev->log = log;
-
         /*
          * TODO: MT: - ngx_atomic_fetch_add()
          *             or protection by critical section or light mutex
@@ -1593,48 +1475,11 @@ ngx_event_accept(ngx_event_t *ev)
          */
 
         c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
-
         c->start_time = ngx_current_msec;
-
-#if (NGX_STAT_STUB)
-        (void) ngx_atomic_fetch_add(ngx_stat_handled, 1);
-#endif
-
-        if (ls->addr_ntop) {
-            c->addr_text.data = ngx_pnalloc(c->pool, ls->addr_text_max_len);
-            if (c->addr_text.data == NULL) {
-                ngx_close_accepted_connection(c);
-                return;
-            }
-
-            c->addr_text.len = ngx_sock_ntop(c->sockaddr, c->socklen,
-                                             c->addr_text.data,
-                                             ls->addr_text_max_len, 0);
-            if (c->addr_text.len == 0) {
-                ngx_close_accepted_connection(c);
-                return;
-            }
-        }
-
-#if (NGX_DEBUG)
-        {
-        ngx_str_t  addr;
-        u_char     text[NGX_SOCKADDR_STRLEN];
-
-        ngx_debug_accepted_connection(ecf, c);
-
-        if (log->log_level & NGX_LOG_DEBUG_EVENT) {
-            addr.data = text;
-            addr.len = ngx_sock_ntop(c->sockaddr, c->socklen, text,
-                                     NGX_SOCKADDR_STRLEN, 1);
-
-            ngx_log_debug3(NGX_LOG_DEBUG_EVENT, log, 0,
-                           "*%uA accept: %V fd:%d", c->number, &addr, s);
-        }
-
-        }
-#endif
-
+		...
+		//6. 重要，调用事件驱动模块的action函数
+		//这里即调用epoll的add_connection将连接的读事件添加到事件驱动模块
+		//
         if (ngx_add_conn && (ngx_event_flags & NGX_USE_EPOLL_EVENT) == 0) {
             if (ngx_add_conn(c) == NGX_ERROR) {
                 ngx_close_accepted_connection(c);
@@ -1644,16 +1489,137 @@ ngx_event_accept(ngx_event_t *ev)
 
         log->data = NULL;
         log->handler = NULL;
-
+		//7. 调用监听对象ngx_listening_t中的handler回调，即TCP连接刚刚建立完成时的调用
         ls->handler(c);
-
+		
         if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
             ev->available--;
         }
-
+	//available标志位对应事件的 multi_accept配置项，表示尽可能多的建立连接
     } while (ev->available);
 }
 ```
+建立连接的实现本质，**是根据listening配置，调用tcp的accept建立新连接。如果有，则想空闲连接池总申请空闲连接做赋值，并将这个连接通过add_connection添加进epoll**。
+
+### 惊群
+
+惊群简单来说就是多个进程或者线程在等待同一个事件，当事件发生时，所有线程和进程都会被内核唤醒。唤醒后通常只有一个进程获得了该事件并进行处理，其他进程发现获取事件失败后又继续进入了等待状态，在一定程度上降低了系统性能。
+
+对于nginx来说，其采用的是多进程的模式。假设Linux系统是2.6版本以前，在某一时刻，所有的worker子进程都在休眠且等待新连接的系统条用，比如epoll_wait。当内核收到TCP的SYN包，就会激活所有休眠的worker进程，但是，只有最先开始执行accept的子进程可以成功创建连接，其他worker则会失败，他们的唤醒会额外增加系统开销，是不必要的。
+
+因此，解决的核心思路是处理进程间的通信问题，即使用进程锁.Nginx 事件处理的入口函数是 ngx_process_events_and_timers()，可以看到其加锁的过程：
+```
+if (ngx_use_accept_mutex) {
+        if (ngx_accept_disabled > 0) {
+                ngx_accept_disabled--;
+
+        } else {
+				//如果没有获取到锁，事件驱动模块的process_events只能处理已有连接上的事件
+                if (ngx_trylock_accept_mutex(cycle) == NGX_ERROR) {
+                        return;
+                }
+				//如果获取到了锁，则process_events即可以处理已有连接上的事件，也可以处理新连接
+				//注意这个标志位，它表明了释放锁的逻辑并不是将连接上的事件都处理完之后，
+				//而是通过两个队列
+                if (ngx_accept_mutex_held) {
+                        flags |= NGX_POST_EVENTS;
+
+                } else {
+                        if (timer == NGX_TIMER_INFINITE
+                                || timer > ngx_accept_mutex_delay)
+                        {
+                                timer = ngx_accept_mutex_delay;
+                        }
+                }
+        }
+}
+```
+在 ngx_trylock_accept_mutex()函数里面，如果拿到了锁，Nginx 会把 listen 的端口读事件加入 event 处理，该进程在有新连接进来时就可以进行 accept 了。
+
+对于事件的处理优先级和锁的释放，通过两个队列完成，并在前文的`ngx_epoll_process_events`中，根据flag标志位，直接调用handler处理还是调用`ngx_posted_accept_events`等进行入队操作：
+```
+ngx_posted_accept_events: accept 延迟事件队列,该队列里面处理的都是 accept 事件，它会一口气把内核 backlog 里等待的连接都 accept 进来，注册到读写事件里。
+
+ngx_posted_events:普通延迟事件队列
+```
+
+### 负载均衡
+
+nginx里面通过一个变量ngx_accept_disabled来实施进程间获取客户端连接请求的负载均衡策略。其使用位于上文的`ngx_event_accept`中。
+
+![nginx worker lb](../nginx-act-event-lb.png)
+
+1. ngx_process_events_and_timers函数中，通过ngx_accept_disabled的正负判断当前进程负载高低（大于0，高负载；小于0，低负载）。如果低负载时，不做处理，进程去申请accept锁，监听并接受新的连接。
+
+2. 如果是高负载时，ngx_accept_disabled就发挥作用了。这时，不去申请accept锁，让出监听和接受新连接的机会。同时ngx_accept_disabled减1，表示通过让出一次accept申请的机会，该进程的负载将会稍微减轻，直到ngx_accept_disabled最后小于0，重新进入低负载的状态，开始新的accept锁竞争。
+
+## 事件处理整体流程
+
+回顾[nginx master worker](../nginx-act-master-worker.md)笔记，当fork出worker进程后，worker执行`ngx_worker_process_cycle`：
+```
+static void
+ngx_worker_process_cycle(ngx_cycle_t *cycle, void *data)
+{
+	...
+    for ( ;; ) {
+		...
+		//【4】还有未处理完事件时，调用ngx_process_events_and_timers处理
+        ngx_process_events_and_timers(cycle);
+	}
+```
+事件处理的入口函数即为`ngx_process_events_and_timers`，该函数用于处理Nginx中所有的事件，既包括了网络事件，也包括了定时器事件：
+```
+void
+ngx_process_events_and_timers(ngx_cycle_t *cycle)
+{
+    ngx_uint_t  flags;
+    ngx_msec_t  timer, delta;
+    ...
+	//上节中的负载均衡阈值，如果小于0，说明该进程可以accept
+    if (ngx_use_accept_mutex) {
+        if (ngx_accept_disabled > 0) {
+            ngx_accept_disabled--;
+
+        } else {
+            if (ngx_trylock_accept_mutex(cycle) == NGX_ERROR) {
+                return;
+            }
+
+            if (ngx_accept_mutex_held) {
+                flags |= NGX_POST_EVENTS;
+
+            } else {
+                if (timer == NGX_TIMER_INFINITE
+                    || timer > ngx_accept_mutex_delay)
+                {
+                    timer = ngx_accept_mutex_delay;
+                }
+            }
+        }
+    }
+
+    if (!ngx_queue_empty(&ngx_posted_next_events)) {
+        ngx_event_move_posted_next(cycle);
+        timer = 0;
+    }
+    delta = ngx_current_msec;
+	//1. 调用事件驱动模块实现的process_events方法处理网络事件
+	// 其中，nginx定义了#define ngx_process_events   ngx_event_actions.process_events
+    (void) ngx_process_events(cycle, timer, flags);
+    delta = ngx_current_msec - delta;
+    //2. 处理accept延时队列中的accept事件，并释放锁
+    ngx_event_process_posted(cycle, &ngx_posted_accept_events);
+    if (ngx_accept_mutex_held) {
+        ngx_shmtx_unlock(&ngx_accept_mutex);
+    }
+    ngx_event_expire_timers();
+	//3. 处理普通延时队列事件
+    ngx_event_process_posted(cycle, &ngx_posted_events);
+}
+```
+
+
+
 
 
 

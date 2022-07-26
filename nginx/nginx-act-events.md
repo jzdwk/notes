@@ -34,7 +34,7 @@ struct ngx_event_s {
     ptr地址时，先把最后一位instance取出来，再把ptr还原成正常的地址赋给ngx_connection_t连接。这样，instance究竟放在何处的问题也就解决了。
     那么，过期事件又是怎么回事呢？举个例子，假设epoll_wait -次返回3个事件，在第
         1个事件的处理过程中，由于业务的需要，所以关闭了一个连接，而这个连接恰好对应第3个事件。这样的话，在处理到第3个事件时，这个事件就
-    已经是过期辜件了，一旦处理必然出错。既然如此，把关闭的这个连接的fd套接字置为一1能解决问题吗？答案是不能处理所有情况。
+    已经是过期事件了，一旦处理必然出错。既然如此，把关闭的这个连接的fd套接字置为一1能解决问题吗？答案是不能处理所有情况。
         下面先来看看这种貌似不可能发生的场景到底是怎么发生的：假设第3个事件对应的ngx_connection_t连接中的fd套接字原先是50，处理第1个事件
     时把这个连接的套接字关闭了，同时置为一1，并且调用ngx_free_connection将该连接归还给连接池。在ngx_epoll_process_events方法的循环中开始处
     理第2个事件，恰好第2个事件是建立新连接事件，调用ngx_get_connection从连接池中取出的连接非常可能就是刚刚释放的第3个事件对应的连接。由于套
@@ -889,7 +889,7 @@ ngx_event_process_init(ngx_cycle_t *cycle)
         }
 #endif
 		//#define ngx_add_event        ngx_event_actions.add
-		//执行actions中的add操作，将读事件添加到事件驱动模块
+		//执行actions中的add操作，将读事件添加到事件驱动模块，比如使用epll，则调用epoll_add
         if (ngx_add_event(rev, NGX_READ_EVENT, 0) == NGX_ERROR) {
             return NGX_ERROR;
         }
@@ -1276,7 +1276,7 @@ static ngx_int_t ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, 
                 ngx_post_event(rev, queue);
 
             } else {
-                /* 立即调用读事件的回调方法来处理这个事件 */
+                /* 立即调用读事件的回调方法来处理这个事件。注意这里的handler方法是在ngx_event_process_init处被设置 */
                 rev->handler(rev);
             }
         }
@@ -1311,7 +1311,7 @@ static ngx_int_t ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, 
                 ngx_post_event(wev, &ngx_posted_events);
 
             } else {
-                /* 立即调用这个写事件的回调方法来处理这个事件 */
+                /* 立即调用这个写事件的回调方法来处理这个事件，注意这里的handler方法是在ngx_event_process_init处被设置 */
                 wev->handler(wev);
             }
         }

@@ -2,11 +2,11 @@
 
 定制资源与聚合api都是扩展kubernetes API的一种方式。
 
-(CustomResourceDefinition)[https://kubernetes.io/zh-cn/docs/concepts/extend-kubernetes/api-extension/custom-resources/] API通过**设定名字和Schema**，来自定义创建一个新的k8s资源。Kubernetes API负责为你的定制资源提供存储和访问服务。CRD使得在扩展k8s api时，不必编写自己的 API 服务器来处理定制资源，不过其背后实现的通用性也意味着，其所获得的灵活性要比 API 服务器聚合少很多。
+[CustomResourceDefinition](https://kubernetes.io/zh-cn/docs/concepts/extend-kubernetes/api-extension/custom-resources/) API通过**设定名字和Schema**，来自定义创建一个新的k8s资源。Kubernetes API负责为你的定制资源提供存储和访问服务。CRD使得在扩展k8s api时，不必编写自己的 API 服务器来处理定制资源，不过其背后实现的通用性也意味着，其所获得的灵活性要比 API 服务器聚合少很多。
 
 通常，Kubernetes API 中的每个资源都需要处理 REST请求和管理对象持久性存储的代码。 Kubernetes API主服务器能够处理诸如pods和services这些内置资源，也可以按通用的方式通过CRD来处理定制资源。
 
-而(API聚合)[https://kubernetes.io/zh-cn/docs/concepts/extend-kubernetes/api-extension/apiserver-aggregation/] 使得你可以通过编写和部署你自己的 API 服务器来为定制资源提供特殊的实现。 主API 服务器将**针对你要处理的定制资源的请求全部委托给你自己的API服务器来处理，同时将这些资源提供给其所有客户端**。
+而[API聚合](https://kubernetes.io/zh-cn/docs/concepts/extend-kubernetes/api-extension/apiserver-aggregation/) 使得你可以通过编写和部署你自己的 API 服务器来为定制资源提供特殊的实现。 主API 服务器将**针对你要处理的定制资源的请求全部委托给你自己的API服务器来处理，同时将这些资源提供给其所有客户端**。
 
 因此，当需要扩展k8s api时，需要从易用性、灵活性等方面考虑，去选择使用CRD还是API聚合，官方给出的比较建议如下：
 
@@ -587,7 +587,7 @@ func (c *Controller) syncHandler(key string) error {
 4. Foo与Deployment的动态平衡
 
 从上文分析中可以看到，当创建一个foo资源对象，会执行以下动作：
-[!image](../images/k8s/k8s-sample-controller.jpg)
+![image](../images/k8s/k8s-sample-controller.jpg)
 
 这里有一个**环**：当创建foo后，会联动创建deployment对象，而deploy-informer监听到deployment被创建后，又会从etcd中读取foo对象使其重新入队。
 

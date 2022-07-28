@@ -410,7 +410,7 @@ controller创建完成后，启动informer:
 
 3. Controller的实现
 
-Controller的定义如下：
+main函数中分别调用了NewController和其实现的Run函数，首先Controller的定义如下：
 ```
 type Controller struct {
 	//k8s client set，用于后续的deployment对象处理
@@ -426,7 +426,7 @@ type Controller struct {
 
 	//work queue, 
 	workqueue workqueue.RateLimitingInterface
-	// 调用k8s api 的事件记录
+	//记录器是一个事件记录器，用于将事件资源记录到Kubernetes API。
 	recorder record.EventRecorder
 }
 ```
@@ -587,7 +587,11 @@ func (c *Controller) syncHandler(key string) error {
 4. Foo与Deployment的动态平衡
 
 从上文分析中可以看到，当创建一个foo资源对象，会执行以下动作：
-- 
+[!image](../images/k8s/k8s-sample-controller.jpg)
+
+这里有一个**环**：当创建foo后，会联动创建deployment对象，而deploy-informer监听到deployment被创建后，又会从etcd中读取foo对象使其重新入队。
+
+试想单独删除一个deployment，deploy-informer watch到后，会重新入队foo，而controller读取队列中的foo后，会判断是否存在deploy，没有则重新创建。
 
 
 

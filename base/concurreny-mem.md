@@ -242,7 +242,9 @@ func main() {
 
 ### 锁
 
-- 对于任何互斥锁或者读写锁来说，解锁前必须先加锁，相应的加锁后必须先解锁。For any sync.Mutex or sync.RWMutex variable l and n < m, call n of l.Unlock() happens before call m of l.Lock() returns.
+- 对于任何互斥锁sync.Mutex或者读写锁sync.RWMutex来说，加锁后必须先解锁，相应的解锁前必须先加锁(否则会报错)。For any sync.Mutex or sync.RWMutex variable l and n < m, call n of l.Unlock() happens before call m of l.Lock() returns.
+
+- 对于读写锁sync.RWMutex来说，释放写锁Unlock()操作happens-before加读锁RLock()，同样，释放读锁RUlock()happens-before加写锁lock()：简单来说，就是读写锁的写锁lock()只能锁定一次，解锁前不能再进行读锁定RLock()或写锁定Lock()；读锁RLock()可以多次，每次读解锁RUlock()时，次数-1。
 
 ### Once
 
@@ -254,3 +256,8 @@ func main() {
 内存模型上，java的jmm与真实cpu内存模型相对应，java线程可映射为操作系统线程(取决于jvm，hotspot是这样)；golang为协程调度，因此屏蔽了线程的概念，无需关注线程内存模型。
 
 java与golang的并发都涉及happens-before规则，java通过volitile/synchronized语义、锁等实现规则，golang通过channel,sync包实现规则。
+
+# 参考
+
+1. https://gohalo.me/post/golang-concept-memory-module-introduce.html
+2. https://javaguide.cn/java/concurrent/jmm.html

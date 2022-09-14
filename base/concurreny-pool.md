@@ -132,12 +132,14 @@ ThreadPoolExecutor针对线程池一共维护了五种状态，实现上**用高
 public class ThreadPoolExecutor extends AbstractExecutorService {
 	//使用原子变量标记状态，注意这里不是volatile，因为后者只能保证可见性，不能保证原子性
     private final AtomicInteger ctl = new AtomicInteger(ctlOf(RUNNING, 0));
-    // Integer.SIZE=32,Integer.SIZE-3=29,COUNT_BITS=29
+    
+	// Integer.SIZE=32, Integer.SIZE-3=29, COUNT_BITS=29， 用来表示线程池数量的位数是29
     private static final int COUNT_BITS = Integer.SIZE - 3;
-    // 线程池最大线程数=536870911（2^29-1）,CAPACITY二进制中低29为1，高3位为0，即00011111111111111111111111111111
+    
+	// 线程池最大线程数=536870911（2^29-1）,CAPACITY二进制中低29为1，高3位为0，即00011111111111111111111111111111
     private static final int CAPACITY   = (1 << COUNT_BITS) - 1;
 
-    // 用高3位表示ThreadPoolExecutor的执行状态
+    // 线程池有5种runState状态，所以需要3位来表示，即高3位表示ThreadPoolExecutor的执行状态
     // RUNNING=111
     private static final int RUNNING    = -1 << COUNT_BITS;
     // SHUTDOWN=000
@@ -154,20 +156,141 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
     private static int runStateOf(int c)     { return c & ~CAPACITY; }
     // 获取低29位的值，即线程数量
     private static int workerCountOf(int c)  { return c & CAPACITY; }
-	
-    private static int ctlOf(int rs, int wc) { return rs | wc; }
+	...
+```
 
-	
-    private static boolean runStateLessThan(int c, int s) {
-        return c < s;
-    }
-    private static boolean runStateAtLeast(int c, int s) {
-        return c >= s;
+**这里注意，只有RUNNING状态对应的int值为负数，即RUNNING<SHUTDOWN<STOP<TIDYING<TERMINATED**
+
+核心方法`public void execute(Runnable command){...}`的分析如下，首先整体流程上：
+![java thread pool](./java-thread-pool.png)
+
+具体看实现：
+```java
+public void execute(Runnable command) {
+		...
+        //执行的流程实际上分为三步：
+		
+        //1. 获取当前【线程状态-线程数量】信息，即c，workerCountOf取低29位，即线程数量，如果运行的线程小于corePoolSize，以用户给定的Runable对象新开一个线程去执行
+        int c = ctl.get();
+        if (workerCountOf(c) < corePoolSize) {
+            if (addWorker(command, true))
+                return;
+            c = ctl.get();
+        }				
+		//2. 如果当前线程数量>=coolPoolSize，则判断线程池状态是否为running，如果为running，则进入阻塞队列workQueue
+        if (isRunning(c) && workQueue.offer(command)) {
+			//当入队成功后，再次获取ctl，在并发环境下，可能之前获取的ctl状态已经发生改变
+			//当然，此处获取也未必是线程池的最新状态(比如在后面的if(xxx)之前状态又发生变化了)，只是尽最大努力判断
+            int recheck = ctl.get();
+			//如果线程池非running，则回滚
+            if (! isRunning(recheck) && remove(command))
+				//回滚后执行reject策略
+                reject(command);
+			//否则，即线程池还在running或者回滚失败，判断当前线程池中线程数，如果==0，则添加一个null的command
+            else if (workerCountOf(recheck) == 0)
+                addWorker(null, false);
+        }
+		//3. 如果线程池不为running，或队满无法入队，则调用addWorker
+		// 后者会判断当前线程数是否<=maximumPoolSize，如果是，则创建线程
+        else if (!addWorker(command, false))
+			//否则，执行拒绝策略
+            reject(command);
     }
 
-    private static boolean isRunning(int c) {
-        return c < SHUTDOWN;
+```
+其中的addWorker方法实现如下:
+```java
+
+    private boolean addWorker(Runnable firstTask, boolean core) {
+        retry:
+        for (;;) {
+			//获取当前的线程池状态
+            int c = ctl.get();
+            int rs = runStateOf(c);
+
+            // Check if queue empty only if necessary.
+			// 约束检查，以下情况返回addWorker添加任务失败：
+			// 1. rs >= SHUTDOWN ,即线程池不是RUNNING状态，如果为RUNNING状态，则直接返回失败
+			// 2. 子句!(rs == SHUTDOWN &&firstTask == null &&!workQueue.isEmpty())，即3个子条件有一个不满足，则整个语句为true，即添加失败，具体为：
+			// 	  2.1 如果rs不等于SHUTDOWN，则不能再添加任务，返回失败
+			// 	  2.2 如果rs等于SHUTDOWN，但传入的task不为空，代表线程池已经关闭了还在传任务进来，返回失败
+			//    2.3 如果rs等于SHUTDOWN，传入的task为空，且队列是为空，此时就不需要往线程池添加任务了，返回失败
+            if (rs >= SHUTDOWN &&
+                ! (rs == SHUTDOWN &&
+                   firstTask == null &&
+                   ! workQueue.isEmpty()))
+                return false;
+            for (;;) {
+				//获取线程池的workerCount数量
+                int wc = workerCountOf(c);
+				//如果workerCount超出最大值或者大于corePoolSize/maximumPoolSize，返回false
+                if (wc >= CAPACITY ||
+                    wc >= (core ? corePoolSize : maximumPoolSize))
+                    return false;
+				//通过CAS操作，使workerCount数量+1，如果成功，跳出循环，回到retry标记
+                if (compareAndIncrementWorkerCount(c))
+                    break retry;
+				//如果CAS操作失败，说明在从ctl.get()到刚才的执行过程中，线程池状态发生改变了，则再次获取线程池的控制状态
+                c = ctl.get();  // Re-read ctl
+				//如果当前runState不等于刚开始获取的runState，则跳出内层循环，继续外层循环
+                if (runStateOf(c) != rs)
+                    continue retry;
+                // else CAS failed due to workerCount change; retry inner loop
+            }
+        }
+		//通过以上循环，当执行以下语句时，说明线程池数量成功+1
+		
+		
+        boolean workerStarted = false;
+        boolean workerAdded = false;
+        Worker w = null;
+        try {
+			//初始化一个当前Runnable对象的worker对象，后者调用factory的newThread()方法创建一个线程，作为自身的成员变量
+            w = new Worker(firstTask);
+			//获取刚才factory创建的线程
+            final Thread t = w.thread;
+            if (t != null) {
+				//加锁
+                final ReentrantLock mainLock = this.mainLock;
+                mainLock.lock();
+                try {
+                    // Recheck while holding lock.
+                    // Back out on ThreadFactory failure or if
+                    // shut down before lock acquired.
+					//获取锁后再次检查，获取线程池runState
+                    int rs = runStateOf(ctl.get());
+					//当:
+					//1. runState小于SHUTDOWN，即为RUNNING状态
+					//2. 或者runState等于SHUTDOWN并且firstTask为null时，将worker对象加入集合，并更新集合大小
+                    if (rs < SHUTDOWN ||
+                        (rs == SHUTDOWN && firstTask == null)) {
+						//此时线程还没有启动，如果alive，就报错
+                        if (t.isAlive()) // precheck that t is startable
+                            throw new IllegalThreadStateException();
+                        workers.add(w);
+                        int s = workers.size();
+                        if (s > largestPoolSize)
+                            largestPoolSize = s;
+                        workerAdded = true;
+                    }
+                } finally {
+                    mainLock.unlock();
+                }
+				//如果worker添加成功，启动线程并标记已经启动
+                if (workerAdded) {
+                    t.start();
+                    workerStarted = true;
+                }
+            }
+        } finally {
+			//如果worker没有启动成功，执行workerCount-1的操作
+            if (! workerStarted)
+                addWorkerFailed(w);
+        }
+		//返回worker是否启动的标记
+        return workerStarted;
     }
+
 
 ```
 

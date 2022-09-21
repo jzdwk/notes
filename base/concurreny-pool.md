@@ -553,7 +553,7 @@ public static void main() {
 ```
 processWorkerExit方法会销毁当前线程对应的Worker对象，并执行一些累加总处理任务数等辅助操作，但在线程池当前状态小于STOP的情况下会创建一个新的Worker来替换被销毁的Worker
 
-
+参考:  https://www.cnblogs.com/zjfjava/p/13909285.html
 ### golang协程池
 
 ## DB连接池

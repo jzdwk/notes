@@ -18,7 +18,8 @@ initDB(){
 	//dataSourceName define
 	dataSourceName := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s timezone=%s sslmode=disable",
 		dbUser, dbPwd, dbName, dbHost, dbPort, dbTimeZone)
-	//Open db	
+	//Open db
+	//postgres.Open(dataSourceName)封装一个&Dialector{&Config{DSN: dsn}} Dialector对象，即DB的初始化委托给了dialector创建
 	db, err := gorm.Open(postgres.Open(dataSourceName), &gorm.Config{
 		NamingStrategy: schema.NamingStrategy{SingularTable: true},
 	})
@@ -47,6 +48,7 @@ func Open(dialector Dialector, config *Config) (db *DB, err error) {
 func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 	// register callbacks
 	...
+	//dialector尚未赋值Conn以及DriverName
 	if dialector.Conn != nil {
 		db.ConnPool = dialector.Conn
 	} else if dialector.DriverName != "" {
@@ -63,16 +65,27 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 }
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~	
 func OpenDB(config pgx.ConnConfig, opts ...OptionOpenDB) *sql.DB {
+	c := GetConnector(config, opts...)
+	return sql.OpenDB(c)
+}
+
+func GetConnector(config pgx.ConnConfig, opts ...OptionOpenDB) driver.Connector {
 	c := connector{
-		ConnConfig:   config,
-		AfterConnect: func(context.Context, *pgx.Conn) error { return nil }, // noop after connect by default
-		driver:       pgxDriver,
+		ConnConfig:    config,
+		BeforeConnect: func(context.Context, *pgx.ConnConfig) error { return nil }, // noop before connect by default
+		AfterConnect:  func(context.Context, *pgx.Conn) error { return nil },       // noop after connect by default
+		ResetSession:  func(context.Context, *pgx.Conn) error { return nil },       // noop reset session by default
+		//pgxDriver 来自init()
+		//	pgxDriver = &Driver{
+		//     configs: make(map[string]*pgx.ConnConfig),
+	    //  }
+		driver:        pgxDriver,
 	}
 
 	for _, opt := range opts {
 		opt(&c)
 	}
-	return sql.OpenDB(c)
+	return c
 }
 ```
 以上逻辑比较清晰，总的来说就是根据dataSource描述，封装为sql的connect对象，调用sql的OpenDB函数，继续看sql.OpenDB：
@@ -98,7 +111,6 @@ func OpenDB(c driver.Connector) *DB {
 	db := &DB{
 		connector:    c,	//连接信息
 		openerCh:     make(chan struct{}, connectionRequestQueueSize),	//开启新连接的请求channel
-		resetterCh:   make(chan *driverConn, 50),
 		lastPut:      make(map[*driverConn]string),		
 		connRequests: make(map[uint64]chan connRequest), //当连接数超过连接池的最大值时，连接请求将被放入connRequests
 		stop:         cancel,
@@ -123,21 +135,60 @@ func (db *DB) connectionOpener(ctx context.Context) {
 		}
 	}
 }
-
-// connectionResetter runs in a separate goroutine to reset connections async
-// to exported API.
-func (db *DB) connectionResetter(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			close(db.resetterCh)
-			for dc := range db.resetterCh {
-				dc.Unlock()
-			}
-			return
-		case dc := <-db.resetterCh:
-			dc.resetSession(ctx)
+// Open one new connection
+func (db *DB) openNewConnection(ctx context.Context) {
+	// maybeOpenNewConnections has already executed db.numOpen++ before it sent
+	// on db.openerCh. This function must execute db.numOpen-- if the
+	// connection fails or is closed before returning.
+	//db.connector 即上文中GetConnector函数的返回
+	ci, err := db.connector.Connect(ctx)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		if err == nil {
+			ci.Close()
 		}
+		db.numOpen--
+		return
+	}
+	if err != nil {
+		db.numOpen--
+		db.putConnDBLocked(nil, err)
+		db.maybeOpenNewConnections()
+		return
+	}
+	dc := &driverConn{
+		db:         db,
+		createdAt:  nowFunc(),
+		returnedAt: nowFunc(),
+		ci:         ci,
+	}
+	if db.putConnDBLocked(dc, err) {
+		db.addDepLocked(dc, dc)
+	} else {
+		db.numOpen--
+		ci.Close()
+	}
+}
+
+// Assumes db.mu is locked.
+// If there are connRequests and the connection limit hasn't been reached,
+// then tell the connectionOpener to open new connections.
+func (db *DB) maybeOpenNewConnections() {
+	numRequests := len(db.connRequests)
+	if db.maxOpen > 0 {
+		numCanOpen := db.maxOpen - db.numOpen
+		if numRequests > numCanOpen {
+			numRequests = numCanOpen
+		}
+	}
+	for numRequests > 0 {
+		db.numOpen++ // optimistically
+		numRequests--
+		if db.closed {
+			return
+		}
+		db.openerCh <- struct{}{}
 	}
 }
 ```

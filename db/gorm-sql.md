@@ -22,43 +22,53 @@ golang的持久层框架，比如gorm，beego的orm，其底层都引用了官�
 	pgsqlDB, err := gdb.DB()
 	...
 	//配置连接池的最大idle数、最大可打开的连接数以及连接的ttl
-	pgsqlDB.SetMaxIdleConns(4)
 	pgsqlDB.SetMaxOpenConns(10)
-	pgsqlDB.SetConnMaxLifetime(time.Second * time.Duration(4))
 	
 ```
-2. postgres的连接参数相关配置
+2. postgres的连接参数配置
 ```
 //位于/var/lib/postgresql/data/postgresql.conf
 // pg的最大连接数
 max_connections = 20                    # (change requires restart)
-//传输层的tcp配置
-tcp_keepalives_idle = 10                # TCP_KEEPIDLE, in seconds;
-tcp_keepalives_interval = 5             # TCP_KEEPINTVL, in seconds;
-tcp_keepalives_count = 3                # TCP_KEEPCNT;
 ```
 
 那么，两者有何关系？答案是，**gorm连接池配置主要用于在client调用db时，对连接进行复用，而pg的连接配置则是pg真实的连接数**，测试如下
-
-- 连接数的测试：
 ```
 //1. gorm连接数>pg连接数，pgsqlDB.SetMaxOpenConns(50)，max_connections = 20   
 pg日志： 2022-09-27 15:18:06.432 CST [8056] FATAL:  sorry, too many clients already
 gorm日志： ailed to connect to `host=xxx user=postgres database=test`: server error (FATAL: sorry, too many clients already (SQLSTATE 53300))
 	
 //2. gorm连接数<=pg连接数
-在pg上查询： select count(*), usename from pg_stat_activity group by usename;
+通过并发查询将gorm池连接打满后，在pg上查询： select count(*), usename from pg_stat_activity group by usename;   得到结果 pg的连接数=gorm池定义的连接数
 注： 由于除了client代码，其他client(比如监控、navicat)也需要连接db，因此应该是pg连接数<=gorm连接数+其他连接数，否则将too many clients already
 ```
-- 连接状态的测试
+3. 空闲连接处理
+
+在gorm池或pg中，对于空闲连接的处理有以下参数
+
+- gorm池：
 ```
-//1. gorm设置的idle时间<pg设置的tcp保活时间
-
-//2. gorm设置的idle时间>pg设置的tcp保活时间
+	pgsqlDB.SetMaxIdleConns(4)
+	pgsqlDB.SetMaxOpenConns(10)
+	pgsqlDB.SetConnMaxLifetime(time.Second)
+	pgsqlDB.SetConnMaxIdleTime(time.Second)
 ```
 
+- pg参数：
+```
+//session
+idle_in_transaction_session_timeout = 2000      # in milliseconds, 0 is disabled
+//tcp
+tcp_keepalives_idle = 60                # TCP_KEEPIDLE, in seconds;
+tcp_keepalives_interval = 5             # TCP_KEEPINTVL, in seconds;
+tcp_keepalives_count = 3                # TCP_KEEPCNT;
+```
+那么，池中的空闲参数与pg设置的空闲参数有何相关？
 
-## 连接池初始化
+
+## 连接池代码分析
+
+### 初始化
 
 gorm的初始化执行类似如下代码：
 ```go
@@ -113,8 +123,11 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 	}
 	return
 }
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~	
+```
+因此，OpenDB将由golang的sql包完成：
+```	
 func OpenDB(config pgx.ConnConfig, opts ...OptionOpenDB) *sql.DB {
+	//封装 driver.Connector对象，
 	c := GetConnector(config, opts...)
 	return sql.OpenDB(c)
 }
@@ -138,7 +151,7 @@ func GetConnector(config pgx.ConnConfig, opts ...OptionOpenDB) driver.Connector 
 	return c
 }
 ```
-以上逻辑比较清晰，总的来说就是根据dataSource描述，封装为sql的connect对象，调用sql的OpenDB函数，继续看sql.OpenDB：
+以上逻辑比较清晰，总的来说就是根据dataSource描述，封装为sql的connector对象，它实现了sql driver包的Connector接口，该接口用于定义如何获取连接。接着调用sql的OpenDB函数，继续看sql.OpenDB：
 ```go
 // OpenDB opens a database using a Connector, allowing drivers to
 // bypass a string based data source name.
@@ -159,41 +172,114 @@ func GetConnector(config pgx.ConnConfig, opts ...OptionOpenDB) driver.Connector 
 func OpenDB(c driver.Connector) *DB {
 	ctx, cancel := context.WithCancel(context.Background())
 	db := &DB{
-		connector:    c,	//连接信息
-		openerCh:     make(chan struct{}, connectionRequestQueueSize),	//开启新连接的请求channel
+		connector:    c,
+		
+		//开启新连接的请求channel，注意这里的队列长度connectionRequestQueueSize并不是池的最大连接数pgsqlDB.SetMaxOpenConns设置
+		openerCh:     make(chan struct{}, connectionRequestQueueSize),	
+		
 		lastPut:      make(map[*driverConn]string),		
-		connRequests: make(map[uint64]chan connRequest), //当连接数超过连接池的最大值时，连接请求将被放入connRequests
+		connRequests: make(map[uint64]chan connRequest),//当连接数超过连接池的最大值时，连接请求将被放入connRequests 
 		stop:         cancel,
 	}
-	//两个永真的协程，维护连接池中的连接数量
 	//当openerCh中有新消息，说明可以新建连接，调用db.openNewConnection(ctx)
 	go db.connectionOpener(ctx)
-	//当resetterCh中有新消息，说明可以释放该连接，调用dc.resetSession(ctx)
-	go db.connectionResetter(ctx)
-
+	
 	return db
 }
+```
 
+### DB数据类型
+
+OpenDB函数创建了一个DB类型的对象，该对象在使用时定义为全局单例，维护了连接池的信息，它的完整定义如下：
+```go
+// DB is a database handle representing a pool of zero or more
+// underlying connections. It's safe for concurrent use by multiple
+// goroutines.
+//
+// The sql package creates and frees connections automatically; it
+// also maintains a free pool of idle connections. If the database has
+// a concept of per-connection state, such state can be reliably observed
+// within a transaction (Tx) or connection (Conn). Once DB.Begin is called, the
+// returned Tx is bound to a single connection. Once Commit or
+// Rollback is called on the transaction, that transaction's
+// connection is returned to DB's idle connection pool. The pool size
+// can be controlled with SetMaxIdleConns.
+type DB struct {
+
+	// Atomic access only. At top of struct to prevent mis-alignment
+	// on 32-bit platforms. Of type time.Duration.
+	waitDuration int64 // Total time waited for new connections.
+	
+
+	connector driver.Connector	 // 数据库连接作为一个对象，需要实现的接口
+	// numClosed is an atomic counter which represents a total number of
+	// closed connections. Stmt.openStmt checks it before cleaning closed
+	// connections in Stmt.css.
+	
+	//维护连接池中连接操作的容器集合
+	numClosed uint64
+	mu           sync.Mutex // protects following fields  //一个全局的互斥锁，保证操作db中属性的线程安全
+	freeConn     []*driverConn	//用一个切片，而不是channel来保存空闲连接，why？
+	
+	connRequests map[uint64]chan connRequest	//连接请求队列，当池中没有空闲连接时，对于新的连接请求将被放入这个connRequests列表中
+	nextRequest  uint64 // Next key to use in connRequests.
+	numOpen      int    // number of opened and pending open connections	//已打开的连接数量
+	// Used to signal the need for new connections
+	// a goroutine running connectionOpener() reads on this chan and
+	// maybeOpenNewConnections sends on the chan (one send per needed connection)
+	// It is closed during db.Close(). The close tells the connectionOpener
+	// goroutine to exit.
+	openerCh          chan struct{}		// 通知channel，当需要创建新的连接时会写入值
+	resetterCh        chan *driverConn
+	closed            bool
+	dep               map[finalCloser]depSet
+	lastPut           map[*driverConn]string // stacktrace of last conn's put; debug only
+	
+	//连接池基本参数配置
+	maxIdle           int                    // zero means defaultMaxIdleConns; negative means 0	
+	maxOpen           int                    // <= 0 means unlimited
+	maxLifetime       time.Duration          // maximum amount of time a connection may be reused
+	cleanerCh         chan struct{} 		// 用于通知清理过期的连接，maxlife时间改变或者连接被关闭时会通过该channel通知
+	waitCount         int64 // Total number of connections waited for.
+	maxIdleClosed     int64 // Total number of connections closed due to idle.
+	maxLifetimeClosed int64 // Total number of connections closed due to max free limit.
+
+	stop func() // stop cancels the connection opener and the session resetter.
+}
+```
+
+### 连接的创建
+
+回到之前的函数调用，继续看连接处理函数：
+```go
 // Runs in a separate goroutine, opens new connections when requested.
 func (db *DB) connectionOpener(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		//每当有值被写入openerCh时，即有连接到来时的处理
 		case <-db.openerCh:
 			db.openNewConnection(ctx)
 		}
 	}
 }
+
+
 // Open one new connection
 func (db *DB) openNewConnection(ctx context.Context) {
 	// maybeOpenNewConnections has already executed db.numOpen++ before it sent
 	// on db.openerCh. This function must execute db.numOpen-- if the
 	// connection fails or is closed before returning.
+	
 	//db.connector 即上文中GetConnector函数的返回
+	//如果执行成功，将返回一条真实的连接对象
 	ci, err := db.connector.Connect(ctx)
+	
+	//后续通过加锁去维护db中连接池的数量信息
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	//如果db关闭，关闭相应的连接
 	if db.closed {
 		if err == nil {
 			ci.Close()
@@ -201,18 +287,24 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		db.numOpen--
 		return
 	}
+	//如果连接创建失败，则进行一次补偿操作
 	if err != nil {
 		db.numOpen--
+		//向连接请求队列中connRequest放入一条连接信息为nil，错误为err的连接请求
 		db.putConnDBLocked(nil, err)
+		//遍历连接请求队列connRequest，调用db.openerCh <- struct{}{}去触发新建连接的请求
 		db.maybeOpenNewConnections()
 		return
 	}
+	
+	//如果db.connector.Connect(ctx)执行成功了
 	dc := &driverConn{
 		db:         db,
 		createdAt:  nowFunc(),
 		returnedAt: nowFunc(),
 		ci:         ci,
 	}
+	//
 	if db.putConnDBLocked(dc, err) {
 		db.addDepLocked(dc, dc)
 	} else {
@@ -220,7 +312,90 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		ci.Close()
 	}
 }
+```
+首先是第一句`ci, err := db.connector.Connect(ctx)`，这里返回的`driver.Conn`即代表了一个真实的db连接封装，它封装了不同db的真实连接实现。其实现如下:
+```
+// Connect implement driver.Connector interface
+func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
+	...
+	// Create a shallow copy of the config, so that BeforeConnect can safely modify it
+	connConfig := c.ConnConfig
+	//Before、AfterConnect均为空定义
+	if err = c.BeforeConnect(ctx, &connConfig);...
+	
+	//调用pg库，"github.com/jackc/pgx/v4"，的连接实现
+	if conn, err = pgx.ConnectConfig(ctx, &connConfig); err != nil {
+		return nil, err
+	}
+	if err = c.AfterConnect(ctx, conn); ...
 
+	return &Conn{conn: conn, driver: c.driver, connConfig: connConfig, resetSessionFunc: c.ResetSession}, nil
+}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//conn, err = pgx.ConnectConfig(ctx, &connConfig)的实现如下
+func connect(ctx context.Context, config *ConnConfig) (c *Conn, err error) {
+	// Default values are set in ParseConfig. Enforce initial creation by ParseConfig rather than setting defaults from
+	// zero values.
+	...
+	//保存原始config
+	originalConfig := config
+
+	// This isn't really a deep copy. But it is enough to avoid the config.Config.OnNotification mutation from affecting
+	// other connections with the same config. See https://github.com/jackc/pgx/issues/618.
+	{
+		configCopy := *config
+		config = &configCopy
+	}
+
+	//定义Connector对象
+	c = &Conn{
+		config:   originalConfig,
+		connInfo: pgtype.NewConnInfo(),
+		logLevel: config.LogLevel,
+		logger:   config.Logger,
+	}
+
+	// Only install pgx notification system if no other callback handler is present.
+	if config.Config.OnNotification == nil {
+		config.Config.OnNotification = c.bufferNotifications
+	} else {
+		if c.shouldLog(LogLevelDebug) {
+			c.log(ctx, LogLevelDebug, "pgx notification handler disabled by application supplied OnNotification", map[string]interface{}{"host": config.Config.Host})
+		}
+	}
+	//...log 
+	//调用"github.com/jackc/pgconn"库去创建一个pg的连接
+	c.pgConn, err = pgconn.ConnectConfig(ctx, &config.Config)
+	....
+
+	c.preparedStatements = make(map[string]*pgconn.StatementDescription)
+	c.doneChan = make(chan struct{})
+	c.closedChan = make(chan error)
+	c.wbuf = make([]byte, 0, 1024)
+
+	if c.config.BuildStatementCache != nil {
+		c.stmtcache = c.config.BuildStatementCache(c.pgConn)
+	}
+
+	// Replication connections can't execute the queries to
+	// populate the c.PgTypes and c.pgsqlAfInet
+	if _, ok := config.Config.RuntimeParams["replication"]; ok {
+		return c, nil
+	}
+
+	return c, nil
+}
+```
+可以看到`pgconn.ConnectConfig(ctx, &config.Config)`将最终调用pg的连接库去创建一条真正的和pg server的tcp连接，其具体实现不再展开。
+
+### 创建连接的触发条件
+
+上节展示了一条pg连接的创建过程，总的来说是**在sql.Open()后开启个无限循环协程db.connectionOpener(ctx)去监听db.openerCh信道，每当有请求到达，便调用后续去创建连接**。因此，触发连接的创建并在Open时执行。
+
+
+
+
+```
 // Assumes db.mu is locked.
 // If there are connRequests and the connection limit hasn't been reached,
 // then tell the connectionOpener to open new connections.
@@ -242,61 +417,7 @@ func (db *DB) maybeOpenNewConnections() {
 	}
 }
 ```
-OpenDB中，创建了一个db对象，该对象是全局唯一的，既包括基本的连接信息，也包括了连接池相关的参数，DB的具体定义如下：
-```go
-// DB is a database handle representing a pool of zero or more
-// underlying connections. It's safe for concurrent use by multiple
-// goroutines.
-//
-// The sql package creates and frees connections automatically; it
-// also maintains a free pool of idle connections. If the database has
-// a concept of per-connection state, such state can be reliably observed
-// within a transaction (Tx) or connection (Conn). Once DB.Begin is called, the
-// returned Tx is bound to a single connection. Once Commit or
-// Rollback is called on the transaction, that transaction's
-// connection is returned to DB's idle connection pool. The pool size
-// can be controlled with SetMaxIdleConns.
-type DB struct {
 
-	// Atomic access only. At top of struct to prevent mis-alignment
-	// on 32-bit platforms. Of type time.Duration.
-	waitDuration int64 // Total time waited for new connections.
-	
-	//连接的基本信息
-	connector driver.Connector	 // 数据库驱动接口
-	// numClosed is an atomic counter which represents a total number of
-	// closed connections. Stmt.openStmt checks it before cleaning closed
-	// connections in Stmt.css.
-	
-	//维护连接池中连接操作的容器集合
-	numClosed uint64
-	mu           sync.Mutex // protects following fields  //一个全局的互斥锁，保证操作db中属性的线程安全
-	freeConn     []*driverConn	//用一个切片，而不是channel来保存空闲连接，why？
-	connRequests map[uint64]chan connRequest	//连接请求，当连接数大于最大值时写入
-	nextRequest  uint64 // Next key to use in connRequests.
-	numOpen      int    // number of opened and pending open connections	//已打开的连接数量
-	// Used to signal the need for new connections
-	// a goroutine running connectionOpener() reads on this chan and
-	// maybeOpenNewConnections sends on the chan (one send per needed connection)
-	// It is closed during db.Close(). The close tells the connectionOpener
-	// goroutine to exit.
-	openerCh          chan struct{}		// 通知需要创建新的连接
-	resetterCh        chan *driverConn
-	closed            bool
-	dep               map[finalCloser]depSet
-	lastPut           map[*driverConn]string // stacktrace of last conn's put; debug only
-	
-	//连接池基本参数配置
-	maxIdle           int                    // zero means defaultMaxIdleConns; negative means 0	
-	maxOpen           int                    // <= 0 means unlimited
-	maxLifetime       time.Duration          // maximum amount of time a connection may be reused
-	cleanerCh         chan struct{} 		// 用于通知清理过期的连接，maxlife时间改变或者连接被关闭时会通过该channel通知
-	waitCount         int64 // Total number of connections waited for.
-	maxIdleClosed     int64 // Total number of connections closed due to idle.
-	maxLifetimeClosed int64 // Total number of connections closed due to max free limit.
-
-	stop func() // stop cancels the connection opener and the session resetter.
-}
 ```
 **需要注意的是，在OpenDB后，并没有真正的创建任何连接**，只是开启了两个协程，通过channel维护池中连接数量。**真正的创建连接操作在具体的query处**
 

@@ -554,8 +554,69 @@ public static void main() {
 processWorkerExit方法会销毁当前线程对应的Worker对象，并执行一些累加总处理任务数等辅助操作，但在线程池当前状态小于STOP的情况下会创建一个新的Worker来替换被销毁的Worker
 
 参考:  https://www.cnblogs.com/zjfjava/p/13909285.html
+
 ### golang协程池
 
+由于golang的并发使用协程实现，协程的创建与销毁均在用户态，因此不存在开销问题，故不存在单纯的协程池。以是简化的协程池的实现：
+```go
+type Pool struct {
+	timeout time.Duration	//核心协程超时
+	core  chan struct{}		//核心协程数
+	queue chan Task			//任务队列， 生产者消费者模型，核心协程从该队列不断取任务执行
+}
+
+func NewPool(coreSize, queueSize uint32, timeout time.Duration) *Pool {
+	//队列总长度（可处理任务数） = 核心协程数  + 等待任务队列长度
+	return &Pool{core: make(chan struct{}, coreSize), queue: make(chan Task, queueSize+coreSize),timeout:timeout}
+}
+
+func (p *Pool) Execute(t *Task) {
+	//任务直接入队，队满则拒绝
+	select {
+	case p.queue <- *t:
+		select {
+		//如果协程数没有达到core，则创建，否则仅仅入队
+		case p.core <- struct{}{}:
+			logs.Debug("task %s enter core goroutine", t.Name)
+			worker := NewWorker(p)
+			worker.run()
+			return
+		default:
+			logs.Warning("core routine is full")
+		}
+	default:
+		logs.Error("queue is full. reject")
+	}
+}
+
+type Worker interface {
+	run()
+}
+
+func (p *Pool) run() {
+	to := time.NewTimer(p.timeout)
+	go func() {
+		//协程实体，不停从queue中取出任务执行
+		for {
+			select {
+			case task := <-p.queue:
+				logs.Debug("get %s from queue", task.Name)
+				task.run()
+				logs.Debug("%s finished", task.Name)
+				to.Reset(p.timeout)
+			//如果timeout时间内取不到任务，就退出了
+			case <-to.C:
+				logs.Warning("time out")
+				<-p.core
+				return
+			}
+		}
+	}()
+}
+```
+
 ## DB连接池
+
+
 
 ## http连接池

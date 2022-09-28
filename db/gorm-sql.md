@@ -8,6 +8,56 @@ golang的持久层框架，比如gorm，beego的orm，其底层都引用了官�
 2. 使用完这个连接后，将连接放回池中，`releaseConn`
 3. 关闭连接池，同时关闭池中的所有连接，`poolClose`
 
+## 连接池相关的测试
+
+在搞清楚连接池的工作之前，考虑一个场景：*多个client端代码执行sql查询，访问pg数据库*，此时涉及连接池的配置参数包括了：
+1. gorm的连接池参数配置
+```golang
+	dataSourceName := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s timezone=%s sslmode=disable",
+		DBUSER,DBPASSWD,DBNAME,HOST,PORT,TIMEZONE)
+	gdb, err = gorm.Open(postgres.Open(dataSourceName), &gorm.Config{
+		NamingStrategy: schema.NamingStrategy{SingularTable: true},
+	})
+
+	pgsqlDB, err := gdb.DB()
+	...
+	//配置连接池的最大idle数、最大可打开的连接数以及连接的ttl
+	pgsqlDB.SetMaxIdleConns(4)
+	pgsqlDB.SetMaxOpenConns(10)
+	pgsqlDB.SetConnMaxLifetime(time.Second * time.Duration(4))
+	
+```
+2. postgres的连接参数相关配置
+```
+//位于/var/lib/postgresql/data/postgresql.conf
+// pg的最大连接数
+max_connections = 20                    # (change requires restart)
+//传输层的tcp配置
+tcp_keepalives_idle = 10                # TCP_KEEPIDLE, in seconds;
+tcp_keepalives_interval = 5             # TCP_KEEPINTVL, in seconds;
+tcp_keepalives_count = 3                # TCP_KEEPCNT;
+```
+
+那么，两者有何关系？答案是，**gorm连接池配置主要用于在client调用db时，对连接进行复用，而pg的连接配置则是pg真实的连接数**，测试如下
+
+- 连接数的测试：
+```
+//1. gorm连接数>pg连接数，pgsqlDB.SetMaxOpenConns(50)，max_connections = 20   
+pg日志： 2022-09-27 15:18:06.432 CST [8056] FATAL:  sorry, too many clients already
+gorm日志： ailed to connect to `host=xxx user=postgres database=test`: server error (FATAL: sorry, too many clients already (SQLSTATE 53300))
+	
+//2. gorm连接数<=pg连接数
+在pg上查询： select count(*), usename from pg_stat_activity group by usename;
+注： 由于除了client代码，其他client(比如监控、navicat)也需要连接db，因此应该是pg连接数<=gorm连接数+其他连接数，否则将too many clients already
+```
+- 连接状态的测试
+```
+//1. gorm设置的idle时间<pg设置的tcp保活时间
+
+//2. gorm设置的idle时间>pg设置的tcp保活时间
+```
+
+
 ## 连接池初始化
 
 gorm的初始化执行类似如下代码：

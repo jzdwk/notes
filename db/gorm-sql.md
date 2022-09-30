@@ -219,7 +219,7 @@ type DB struct {
 	//维护连接池中连接操作的容器集合
 	numClosed uint64
 	mu           sync.Mutex // protects following fields  //一个全局的互斥锁，保证操作db中属性的线程安全
-	freeConn     []*driverConn	//用一个切片，而不是channel来保存空闲连接，why？
+	freeConn     []*driverConn	//用一个切片来保存空闲连接
 	
 	connRequests map[uint64]chan connRequest	//连接请求队列，当池中没有空闲连接时，对于新的连接请求将被放入这个connRequests列表中
 	nextRequest  uint64 // Next key to use in connRequests.
@@ -258,7 +258,7 @@ func (db *DB) connectionOpener(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		//每当有值被写入openerCh时，即有连接到来时的处理
+		//每当有值被写入openerCh时，即接收到连接创建信号后，调用openNewConnection
 		case <-db.openerCh:
 			db.openNewConnection(ctx)
 		}
@@ -276,7 +276,7 @@ func (db *DB) openNewConnection(ctx context.Context) {
 	//如果执行成功，将返回一条真实的连接对象
 	ci, err := db.connector.Connect(ctx)
 	
-	//后续通过加锁去维护db中连接池的数量信息
+	//后续通过加锁去维护db中连接池的信息
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	//如果db关闭，关闭相应的连接
@@ -292,7 +292,7 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		db.numOpen--
 		//向连接请求队列中connRequest放入一条连接信息为nil，错误为err的连接请求
 		db.putConnDBLocked(nil, err)
-		//遍历连接请求队列connRequest，调用db.openerCh <- struct{}{}去触发新建连接的请求
+		//遍历连接请求队列connRequest中的所有值，逐个调用db.openerCh <- struct{}{}去触发新建连接的请求
 		db.maybeOpenNewConnections()
 		return
 	}
@@ -304,15 +304,20 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		returnedAt: nowFunc(),
 		ci:         ci,
 	}
-	//
+	//处理新连接成功
 	if db.putConnDBLocked(dc, err) {
 		db.addDepLocked(dc, dc)
 	} else {
+		//如果连接没有处理成功，将连接数-1，并将连接减一
 		db.numOpen--
 		ci.Close()
 	}
 }
 ```
+这里关注2个调用，`db.putConnDBLocked(nil, err)`与`ci, err := db.connector.Connect(ctx)`。
+
+1. **connector.Connect**
+
 首先是第一句`ci, err := db.connector.Connect(ctx)`，这里返回的`driver.Conn`即代表了一个真实的db连接封装，它封装了不同db的真实连接实现。其实现如下:
 ```
 // Connect implement driver.Connector interface
@@ -388,51 +393,108 @@ func connect(ctx context.Context, config *ConnConfig) (c *Conn, err error) {
 ```
 可以看到`pgconn.ConnectConfig(ctx, &config.Config)`将最终调用pg的连接库去创建一条真正的和pg server的tcp连接，其具体实现不再展开。
 
+2. **putConnDBLocked**
+
+该函数用于将创建的连接放入连接池，这里首先看数据connRequest的数据定义，上文中说明了当池中没有idle连接是，会将连接请求放入这个队列：
+```go
+// connRequest represents one request for a new connection
+// When there are no idle connections available, DB.conn will create
+// a new connRequest and put it on the db.connRequests list.
+type connRequest struct {
+	//连接信息即为封装的driver.Conn
+	conn *driverConn
+	err  error
+}
+```
+回到具体的实现，返回值代表连接是否正确处理了，true 代表正确处理成功，false 代表处理失败:
+```go
+// Satisfy a connRequest or put the driverConn in the idle pool and return true
+// or return false.
+// putConnDBLocked will satisfy a connRequest if there is one, or it will
+// return the *driverConn to the freeConn list if err == nil and the idle
+// connection limit will not be exceeded.
+// If err != nil, the value of dc is ignored.
+// If err == nil, then dc must not equal nil.
+// If a connRequest was fulfilled or the *driverConn was placed in the
+// freeConn list, then true is returned, otherwise false is returned.
+
+func (db *DB) putConnDBLocked(dc *driverConn, err error) bool {
+	//数据库实例已经关闭，返回false
+	if db.closed {
+		return false 
+	}
+	//如果设置打开最大连接数，并且目前连接数超过最大连接数返回
+	if db.maxOpen > 0 && db.numOpen > db.maxOpen {
+		return false
+	}
+	//如果连接队列中有连接请求，则随机取一个，并将创建的连接写入req
+	if c := len(db.connRequests); c > 0 {
+		var req chan connRequest
+		var reqKey uint64
+		for reqKey, req = range db.connRequests {
+			break
+		}
+		delete(db.connRequests, reqKey) // Remove from pending requests.
+		if err == nil {
+			dc.inUse = true
+		}
+		//将连接发给请求的req 管道，并且附带传进来的err
+		req <- connRequest{
+			conn: dc,
+			err:  err,
+		}
+		return true
+	} else if err == nil && !db.closed {
+		//没有连接请求，并且数据库没有关闭
+		//空闲连接没有超过最大空闲连接数，将连接添加到空闲连接列表，并且开始清理
+		if db.maxIdleConnsLocked() > len(db.freeConn) {
+			db.freeConn = append(db.freeConn, dc)
+			//开启一个协程去处理定时任务，任务为根据设置的最大空闲连接时间，去close掉超期的连接
+			db.startCleanerLocked()
+			return true
+		}
+		db.maxIdleClosed++
+	}
+	return false
+}
+```
+这里注意区分2个channel,**chan Opener**和**chan connRequest**。前者的作用是通知去创建一个连接，后者的作用是维护一个请求队列，将创建好的连接发给请求者。那么，这两个chan如何配合使用呢？
+
 ### 创建连接的触发条件
 
-上节展示了一条pg连接的创建过程，总的来说是**在sql.Open()后开启个无限循环协程db.connectionOpener(ctx)去监听db.openerCh信道，每当有请求到达，便调用后续去创建连接**。因此，触发连接的创建并在Open时执行。
+上节展示了一条pg连接的创建过程，总的来说是**在sql.Open()后开启个无限循环协程db.connectionOpener(ctx)去监听db.openerCh信道，每当有信号到达，便调用具体pg库去创建连接。创建成功后，将这个连接放入池中。具体来说，如果请求队列有值，则放入某个请求的connRequest chan，否则，则直接放入池中的空闲连接队列freeConn**。
 
-
-
-
-```
-// Assumes db.mu is locked.
-// If there are connRequests and the connection limit hasn't been reached,
-// then tell the connectionOpener to open new connections.
-func (db *DB) maybeOpenNewConnections() {
-	numRequests := len(db.connRequests)
-	if db.maxOpen > 0 {
-		numCanOpen := db.maxOpen - db.numOpen
-		if numRequests > numCanOpen {
-			numRequests = numCanOpen
-		}
-	}
-	for numRequests > 0 {
-		db.numOpen++ // optimistically
-		numRequests--
-		if db.closed {
-			return
-		}
-		db.openerCh <- struct{}{}
+上述过程中的起点是触发一个连接信息，而该信号位于query处。以`tx.callbacks.Query().Execute(tx)`代码为例，gorm的查询最终调用了`processor`中的fns，processor对象维护了CRUD场景中需要的各个执行函数
+```go
+// callbacks gorm callbacks manager
+type callbacks struct {
+	processors map[string]*processor
+}
+func initializeCallbacks(db *DB) *callbacks {
+	return &callbacks{
+		processors: map[string]*processor{
+			"create": {db: db},
+			"query":  {db: db},
+			"update": {db: db},
+			"delete": {db: db},
+			"row":    {db: db},
+			"raw":    {db: db},
+		},
 	}
 }
 ```
-
-```
-**需要注意的是，在OpenDB后，并没有真正的创建任何连接**，只是开启了两个协程，通过channel维护池中连接数量。**真正的创建连接操作在具体的query处**
-
-## get connection
-
-以`	tx.callbacks.Query().Execute(tx)`代码为例，gorm的查询最终调用了`processor`中的fns，processor对象维护了CRUD场景中需要的各个执行函数，所以函数以有序数组的形式在初始化时被注册，具体内容和参考后文的**transaction与connection**。以Query的为例：
+所有函数以有序数组的形式在初始化时被注册，执行函数的注册将在后文**transaction与connection**章节分析。以Query的为例：
 ```go
 func (p *processor) Execute(db *DB) {
 	...
-	//执行业务链
+	//执行CRUD业务链
 	for _, f := range p.fns {
 		f(db)
 	}
 	...
 }
+
+//位于/gorm/callbacks/query.go
 
 func Query(db *gorm.DB) {
 	if db.Error == nil {
@@ -502,7 +564,7 @@ func (s *Stmt) connStmt(ctx context.Context, strategy connReuseStrategy) (dc *dr
 	
 	s.removeClosedStmtLocked()
 	s.mu.Unlock()
-	//调用sql的conn
+	//调用sql的conn去获取连接
 	dc, err = s.db.conn(ctx, strategy)
 	...
 	s.mu.Lock()
@@ -524,22 +586,23 @@ func (s *Stmt) connStmt(ctx context.Context, strategy connReuseStrategy) (dc *dr
 	return dc, dc.releaseConn, ds, nil
 }
 ```
-继续进入`conn`函数内部，这里对连接的处理主要分为了3中情况:
+继续进入`conn`函数内部，这里对连接的处理主要分为了3种情况:
 
-1. 连接池中有可用连接，直接返回
-2. 连接池已满，需要进行连接请求的缓存操作
+1. 连接池中有可用空闲连接，直接返回，**对应了在创建连接时，putConnDBLocked函数中connRequest队列为空的情况**
+2. 连接池已满，即连接池中的连接数量已经大于最大值，此时该请求被加入等待队列connRequest，**对应了在创建连接时，putConnDBLocked函数中connRequest队列不为空的情况**
 3. 连接池不满，但也没有可用连接，此时需要创建新的连接，并入池
 
 ```go
 // conn returns a newly-opened or cached *driverConn.
 func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn, error) {
-	//判断是否关闭时，加锁？这里疑问 为何不使用cas原子变量操作？
+	//判断是否关闭时，加锁
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
 		return nil, errDBClosed
 	}
 	// Check if the context is expired.
+	// 如果context已经过期了，直接返回，通常context为设置了超时的cancelctx, 因为请求不可能一直请求，影响正常业务
 	select {
 	default:
 	case <-ctx.Done():
@@ -582,7 +645,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 	if db.maxOpen > 0 && db.numOpen >= db.maxOpen {
 		// Make the connRequest channel. It's buffered so that the
 		// connectionOpener doesn't block while waiting for the req to be read.
-		//创建一个容量为1的channel，作为请求通知，当channle中有值时，说明可以池中有新的连接了，直接返回
+		//创建一个容量为1的channel，作为请求通知，当channle中有值时，说明池中有新的连接了，直接返回
 		req := make(chan connRequest, 1)
 		//生成请求索引
 		reqKey := db.nextRequestKeyLocked()
@@ -594,7 +657,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		waitStart := time.Now()
 
 		// Timeout the connection request with the context.
-		// select执行阻塞调用，当req的
+		// select执行阻塞调用，要么超时返回，要么拿到了新的连接
 		select {
 		case <-ctx.Done():
 			//上下文结束时，清空请求map
@@ -614,28 +677,46 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 				}
 			}
 			return nil, ctx.Err()
-		// ok，说明连接请求中已经被放入可用的连接
+		// ok，说明连接请求中已经被放入可用的连接，即在上文中收到了Opener信号，创建了新的链接
 		case ret, ok := <-req:
 			//检测一下获得连接的状况，是否过期等等
-			atomic.AddInt64(&db.waitDuration, int64(time.Since(waitStart)))
-			...
-			if ret.err == nil && ret.conn.expired(lifetime) {
+						atomic.AddInt64(&db.waitDuration, int64(time.Since(waitStart)))
+
+			if !ok {
+				return nil, errDBClosed
+			}
+			// Only check if the connection is expired if the strategy is cachedOrNewConns.
+			// If we require a new connection, just re-use the connection without looking
+			// at the expiry time. If it is expired, it will be checked when it is placed
+			// back into the connection pool.
+			// This prioritizes giving a valid connection to a client over the exact connection
+			// lifetime, which could expire exactly after this point anyway.
+			if strategy == cachedOrNewConn && ret.err == nil && ret.conn.expired(lifetime) {
+				db.mu.Lock()
+				db.maxLifetimeClosed++
+				db.mu.Unlock()
 				ret.conn.Close()
 				return nil, driver.ErrBadConn
 			}
-			...
-			// Lock around reading lastErr to ensure the session resetter finished.
-			ret.conn.Lock()
-			err := ret.conn.lastErr
-			ret.conn.Unlock()
-			if err == driver.ErrBadConn {
+			//对应在创建连接是出错，然后向req赋值nil的逻辑
+			//req <- connRequest{
+			//	conn: nil,
+			//	err:  err,
+			//}
+			//
+			if ret.conn == nil {
+				return nil, ret.err
+			}
+
+			// Reset the session if required.
+			if err := ret.conn.resetSession(ctx); err == driver.ErrBadConn {
 				ret.conn.Close()
 				return nil, driver.ErrBadConn
 			}
 			return ret.conn, ret.err
 		}
 	}
-	//3. 如果既没有可用连接，连接池中的连接数量又没有满，则新建连接
+	//3. 如果没有空闲的可用连接，连接池中的连接数量又没有满，则此时新建连接，db.connector.Connect调用pg库的新建连接操作
 	db.numOpen++ // optimistically
 	db.mu.Unlock()
 	//执行真正的连接发起操作，封装并返回
@@ -659,6 +740,109 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 	return dc, nil
 }
 ```
+
+### 连接的释放
+
+当通过freeConn或connRequest获取到连接后，执行对应的sql查询，查询后连接的释放即释放到池中，具体见：
+```go
+
+// QueryContext executes a prepared query statement with the given arguments
+// and returns the query results as a *Rows.
+func (s *Stmt) QueryContext(ctx context.Context, args ...interface{}) (*Rows, error) {
+	...
+	for i := 0; i < maxBadConnRetries+1; i++ {
+		...
+		//releaseConn即链接释放的实现
+		dc, releaseConn, ds, err := s.connStmt(ctx, strategy)
+		...
+		}
+		releaseConn(err)
+		...
+	}
+	return nil, driver.ErrBadConn
+}
+~~~~~~~~~~~~~~~~~~~~
+func (dc *driverConn) releaseConn(err error) {
+	dc.db.putConn(dc, err, true)
+}
+```
+其实现如下：
+```go
+// putConn adds a connection to the db's free pool.
+// err is optionally the last error that occurred on this connection.
+func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
+
+	if err != driver.ErrBadConn {
+		if !dc.validateConnection(resetSession) {
+			err = driver.ErrBadConn
+		}
+	}
+	db.mu.Lock()
+	if !dc.inUse { //db 没有使用则panic,因为放回来的连接都是在使用的
+		db.mu.Unlock()
+		if debugGetPut {
+			fmt.Printf("putConn(%v) DUPLICATE was: %s\n\nPREVIOUS was: %s", dc, stack(), db.lastPut[dc])
+		}
+		panic("sql: connection returned that was never out")
+	}
+	
+	//连接已经过期
+	if err != driver.ErrBadConn && dc.expired(db.maxLifetime) {
+		db.maxLifetimeClosed++
+		err = driver.ErrBadConn
+	}
+	if debugGetPut {
+		db.lastPut[dc] = stack()
+	}
+	dc.inUse = false
+	dc.returnedAt = nowFunc()
+
+	for _, fn := range dc.onPut {
+		fn()
+	}
+	dc.onPut = nil
+
+	//处理过期连接的逻辑
+	if err == driver.ErrBadConn {
+		// Don't reuse bad connections.
+		// Since the conn is considered bad and is being discarded, treat it
+		// as closed. Don't decrement the open count here, finalClose will
+		// take care of that.
+		// 有坏连接，激活申请连接的信号，尝试创建一个新连接，放在池子里面
+		db.maybeOpenNewConnections()
+		db.mu.Unlock()
+		//关闭这个连接
+		dc.Close()
+		return
+	}
+	if putConnHook != nil {
+		putConnHook(db, dc)
+	}
+	//这里依然调用putConnDBLocked，即将连接入池
+	added := db.putConnDBLocked(dc, nil)
+	db.mu.Unlock()
+	if !added {
+		dc.Close()
+		return
+	}
+}
+
+```
+
+### 总结
+
+综上，连接的创建、使用与回收的整体流程如下：
+
+1. DB初始化时，调用stdlib库中OpenDB(c driver.Connector)函数开启一个**永真协程connectionOpener**在信道openerCh接收新建链接信号
+2. 当信道到达，调用openNewConnection(ctx context.Context)去创建一条连接
+3. 如果创建失败，调用putConnDBLocked写入错误信息到connRequest，并执行maybeOpenNewConnections补偿逻辑，去重新发送opener信号到openerCh
+4. 如果创建成功，调用putConnDBLocked将连接放入池中，在放入的过程中，如果连接请求队列connRequest有值，则随机取出一请求，将连接放入对应req chan；否则，将连接放入空闲队列freeConn
+5. 执行某个CRUD操作，调用conn从池中获取链接
+6. 连接池中有可用空闲连接，直接返回
+7. 连接池已满，即连接池中的连接数量已经大于最大值，此时该请求被加入等待队列connRequest，并select等待创建连接逻辑将新连接放入对应的req，即步骤4
+8. 连接池不满，但也没有可用连接，调用对应db的库函数创建新的连接并返回
+9. 链接使用后，调用releaseConn释放连接，即调用putConnDBLocked，即将连接入池
+
 
 ## transaction 与 connection
 

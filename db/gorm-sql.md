@@ -843,6 +843,8 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 8. 连接池不满，但也没有可用连接，调用对应db的库函数创建新的连接并返回
 9. 链接使用后，调用releaseConn释放连接，即调用putConnDBLocked，即将连接入池
 
+![pool](./gorm-pool.jpg)
+
 
 ## transaction 与 connection
 

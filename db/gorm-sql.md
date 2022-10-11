@@ -8,6 +8,13 @@ golang的持久层框架，比如gorm，beego的orm，其底层都引用了官�
 2. 使用完这个连接后，将连接放回池中，`releaseConn`
 3. 关闭连接池，同时关闭池中的所有连接，`poolClose`
 
+## 为什么需要连接池
+
+1. 复用tcp连接，减少系统开销
+2. gorm作为客户端，连接的db作为服务端，考虑tcp 4次挥手场景下，减少客户端主动关闭时的**TIME_WAIT状态过多**问题。
+
+具体[参考此处笔记](../base/concurrency-pool.md)
+
 ## 连接池相关的测试
 
 在搞清楚连接池的工作之前，考虑一个场景：*多个client端代码执行sql查询，访问pg数据库*，此时涉及连接池的配置参数包括了：
@@ -845,6 +852,8 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 
 ![pool](./gorm-pool.jpg)
 
+另外，从程序实现角度上来说，连接池中的连接即对应了一个conn的对象。使用连接与释放连接，都是将这个对象放入对应的容器。
+
 
 ## transaction 与 connection
 
@@ -1120,7 +1129,7 @@ func (db *DB) Begin(opts ...*sql.TxOptions) *DB {
 ```
 相应的，当在事务中的函数执行具体操作，比如示例代码中的:
 ```
-dao.ServiceDao.Create(tx, &svcInfo)`:
+dao.ServiceDao.Create(tx, &svcInfo):
 func (s service) Create(tx *gorm.DB, svc *apigwmd.Service) error {
 	if tx == nil {
 		tx = models.PostgresDB

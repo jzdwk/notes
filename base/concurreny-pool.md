@@ -621,4 +621,11 @@ func (p *Pool) run() {
 
 [参考此处笔记](https://github.com/jzdwk/notes/blob/master/db/gorm-sql.md#%E8%BF%9E%E6%8E%A5%E6%B1%A0%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90)
 
+### druid
+
+*TODO*
+
 ## http连接池
+
+
+

@@ -589,11 +589,15 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 }
 ```
 
-
-
 2. **新建连接**
 
-如果没有从连接池中获取到可用连接，则需要新建一个，进入函数`t.queueForDial(w)`：
+如果没有从连接池中获取到可用连接，则需要新建一个，其整体流程如图所示:
+
+![get conn by new](./go-http-get-new.jpg)
+
+其中注意，**创建连接后分别开启了一个读/写协程readLoop和writeLoop**，将在下节分析
+
+进入函数`t.queueForDial(w)`：
 ```go
 // queueForDial queues w to wait for permission to begin dialing.
 // Once w receives permission to dial, it will do so in a separate goroutine.
@@ -635,8 +639,9 @@ func (t *Transport) queueForDial(w *wantConn) {
 // If the dial is cancelled or unsuccessful, dialConnFor decrements t.connCount[w.cm.key()].
 func (t *Transport) dialConnFor(w *wantConn) {
 	defer w.afterDial()
-	//创建连接，并调用tryDeliver将新建的连接赋值给连接请求对象wantConn
+	//创建连接，创建连接后分别开启了一个读/写协程readLoop和writeLoop
 	pc, err := t.dialConn(w.ctx, w.cm)
+	//并调用tryDeliver将新建的连接赋值给连接请求对象wantConn
 	delivered := w.tryDeliver(pc, err)
 	if err == nil && (!delivered || pc.alt != nil) {
 		// pconn was not passed to w,
@@ -741,5 +746,188 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 	pconn.idleAt = time.Now()
 	return nil
 }
+```
+
+### 处理连接
+
+回到Transport对于roundTrip的实现，当获取到连接后，会调用连接对象的roundTrip方法异步处理请求：
+```go
+//Transport的roundTrip实现
+func (t *Transport) roundTrip(req *Request) (*Response, error) {
+	...
+	for {
+		...
+		pconn, err := t.getConn(treq, cm)
+		...
+		var resp *Response
+		if pconn.alt != nil {
+			// HTTP/2 path.
+			...
+		} else {
+			//调用连接对象persistConn的roundTrip，处理请求的返回
+			resp, err = pconn.roundTrip(treq)
+		}
+		...
+	}
+}
+//persistConn的roundTrip实现，请求与响应处理的重点
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+	...
+	// 对请求的处理将通过writech和reqch异步读写
+	// Write the request concurrently with waiting for a response,
+	// in case the server decides to reply before reading our full
+	// request body.
+	startBytesWritten := pc.nwrite
+	writeErrCh := make(chan error, 1)
+	//首先，将请求写入writech，这个channel将会由writeLoop读取，后者将请求内容写入TCP的输入流
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+	//接着，reqch定义了TCP的响应，将会由readLoop读取，它会从TCP的输出流中读取响应，并将其写入resc
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:        req.Request,
+		cancelKey:  req.cancelKey,
+		ch:         resc,			//响应写入resc
+		addedGzip:  requestedGzip,
+		continueCh: continueCh,
+		callerGone: gone,
+	}
+	
+	var respHeaderTimer <-chan time.Time
+	cancelChan := req.Request.Cancel
+	ctxDoneChan := req.Context().Done()
+	pcClosed := pc.closech
+	canceled := false
+	//异步读取返回
+	for {
+		testHookWaitResLoop()
+		select {
+		case err := <-writeErrCh:
+			...
+		case <-pcClosed:
+			...
+		case <-respHeaderTimer:
+			...
+		case re := <-resc:
+			//读取返回内容
+			return re.res, nil
+		case <-cancelChan:
+			...
+		case <-ctxDoneChan:
+			...
+		}
+	}
+}
+```
+
+因此，请求的处理是由2个goroutine配合roundTrip函数，通过channel互相协作的过程。整体流程为： 
+
+1. **TCP请求写入**
+
+roundTrip函数封装请求至writeRequest，并**写入writeCh**，新建连接中的**写循环writeLoop协程，读取writeCh**，然后写入tcp输入流，如果出错了，channel通知调用者 
+```
+//persistConn的roundTrip实现，请求与响应处理的重点
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+	...
+	//将请求写入writech，这个channel将会由writeLoop读取，后者将请求内容写入TCP的输入流
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+	...
+}
+//读取请求并写入TCP
+//net/http/transport.go
+func (pc *persistConn) writeLoop() {
+	defer close(pc.writeLoopDone)
+	for {
+		select {
+		case wr := <-pc.writech:
+			startBytesWritten := pc.nwrite
+			//解析req请求，写入TCP流
+			err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.continueCh))
+			...
+			pc.writeErrCh <- err // to the body reader, which might recycle us
+			//通知写入完成
+			wr.ch <- err         // to the roundTrip function
+			if err != nil {
+				pc.close(err)
+				return
+			}
+		case <-pc.closech:
+			return
+		}
+	}
+}
+```
+
+2. **TCP响应读取**
+
+roundTrip函数封装响应至requestAndChan结构体，并写入**reqCh，新建连接中的读循环readLoop读取reqCh后，从tcp输出流中读取response**，然后反序列化到结构体中，最后通过requestAndChan的channel  ch返给roundTrip
+
+```go
+//persistConn的roundTrip实现，请求与响应处理的重点
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+	...
+	//reqch定义了TCP的响应，将会由readLoop读取，它会从TCP的输出流中读取响应，并将其写入resc
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:        req.Request,
+		cancelKey:  req.cancelKey,
+		ch:         resc,			//响应写入resc
+		addedGzip:  requestedGzip,
+		continueCh: continueCh,
+		callerGone: gone,
+	}
+	
+	var respHeaderTimer <-chan time.Time
+	cancelChan := req.Request.Cancel
+	ctxDoneChan := req.Context().Done()
+	pcClosed := pc.closech
+	canceled := false
+	//异步读取返回
+	for {
+		testHookWaitResLoop()
+		select {
+		case err := <-writeErrCh:
+			...
+		case <-pcClosed:
+			...
+		case <-respHeaderTimer:
+			...
+		case re := <-resc:
+			//读取返回内容
+			return re.res, nil
+		case <-cancelChan:
+			...
+		case <-ctxDoneChan:
+			...
+		}
+	}
+}
+// net/http/transport.go
+func (pc *persistConn) readLoop() {
+	...
+	alive := true
+	for alive {
+		//接收到响应通知
+		rc := <-pc.reqch
+		trace := httptrace.ContextClientTrace(rc.req.Context())
+		//从TCP读取响应
+		var resp *Response
+		if err == nil {
+			resp, err = pc.readResponse(rc, trace)
+		} else {
+			err = transportReadFromServerError{err}
+			closeErr = err
+		}
+		...
+	    //写入返回
+		select {
+		case rc.ch <- responseAndError{res: resp}:
+		case <-rc.callerGone:
+			return
+		}
+		...
+	}
+}
 
 ```
+
+
